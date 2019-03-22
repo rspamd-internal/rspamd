@@ -24,8 +24,8 @@ struct rspamd_client_connection;
 struct rspamd_http_message;
 
 struct rspamd_http_client_header {
-	const gchar *name;
-	const gchar *value;
+	gchar *name;
+	gchar *value;
 };
 
 /**
@@ -47,6 +47,7 @@ typedef void (*rspamd_client_callback) (
 		gdouble send_time,
 		GError *err);
 
+struct rspamd_http_context;
 /**
  * Start rspamd worker or controller command
  * @param ev_base event base
@@ -56,11 +57,12 @@ typedef void (*rspamd_client_callback) (
  * @return
  */
 struct rspamd_client_connection * rspamd_client_init (
-	struct event_base *ev_base,
-	const gchar *name,
-	guint16 port,
-	gdouble timeout,
-	const gchar *key);
+		struct rspamd_http_context *http_ctx,
+		struct event_base *ev_base,
+		const gchar *name,
+		guint16 port,
+		gdouble timeout,
+		const gchar *key);
 
 /**
  *

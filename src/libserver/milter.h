@@ -43,12 +43,14 @@ enum rspamd_milter_reply {
 struct rspamd_email_address;
 struct event_base;
 struct rspamd_http_message;
+struct rspamd_config;
 
 struct rspamd_milter_context {
 	const gchar *spam_header;
 	const gchar *client_ca_name;
 	const gchar *reject_message;
 	void *sessions_cache;
+	struct rspamd_config *cfg;
 	gboolean discard_on_reject;
 	gboolean quarantine_on_reject;
 };
@@ -96,14 +98,14 @@ void * rspamd_milter_update_userdata (struct rspamd_milter_session *session,
 /**
  * Sets SMTP reply string
  * @param session
- * @param xcode
  * @param rcode
+ * @param xcode
  * @param reply
  * @return
  */
 gboolean rspamd_milter_set_reply (struct rspamd_milter_session *session,
-		rspamd_fstring_t *xcode,
 		rspamd_fstring_t *rcode,
+		rspamd_fstring_t *xcode,
 		rspamd_fstring_t *reply);
 
 /**

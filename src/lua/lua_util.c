@@ -22,6 +22,7 @@
 #include "libmime/email_addr.h"
 #include "libmime/content_type.h"
 #include "libmime/mime_headers.h"
+#include "libutil/hash.h"
 #include "linenoise.h"
 #include <math.h>
 #include <glob.h>
@@ -218,15 +219,6 @@ LUA_FUNCTION_DEF (util, parse_mail_address);
  */
 LUA_FUNCTION_DEF (util, strlen_utf8);
 
-/***
- * @function util.strcasecmp(str1, str2)
- * Compares two utf8 strings regardless of their case. Return value >0, 0 and <0
- * if `str1` is more, equal or less than `str2`
- * @param {string} str1 utf8 encoded string
- * @param {string} str2 utf8 encoded string
- * @return {number} result of comparison
- */
-LUA_FUNCTION_DEF (util, strcasecmp_utf8);
 
 /***
  * @function util.strcasecmp(str1, str2)
@@ -401,12 +393,36 @@ LUA_FUNCTION_DEF (util, normalize_prob);
  */
 LUA_FUNCTION_DEF (util, is_utf_spoofed);
 
+/**
+* @function util.is_utf_outside_range(str, range_start, range_end)
+* Returns true if a string contains chars outside range
+* @param {string} String to check
+* @param {number} start of character range similar to uset_addRange
+* @param {number} end of character range similar to uset_addRange
+* @return {boolean} true if a string contains chars outside selected utf range
+*/
+LUA_FUNCTION_DEF (util, is_utf_outside_range);
+
+/***
+* @function util.get_string_stats(str)
+* Returns table with number of letters and digits in string
+* @return {table} with string stats keys are "digits" and "letters"
+*/
+LUA_FUNCTION_DEF (util, get_string_stats);
+
 /***
  * @function util.is_valid_utf8(str)
  * Returns true if a string is valid UTF8 string
  * @return {boolean} true if a string is spoofed
  */
 LUA_FUNCTION_DEF (util, is_valid_utf8);
+
+/***
+ * @function util.has_obscured_unicode(str)
+ * Returns true if a string has obscure UTF symbols (zero width spaces, order marks), ignores invalid utf characters
+ * @return {boolean} true if a has obscured unicode characters (+ character and offset if found)
+ */
+LUA_FUNCTION_DEF (util, has_obscured_unicode);
 
 /***
  * @function util.readline([prompt])
@@ -597,7 +613,6 @@ static const struct luaL_reg utillib_f[] = {
 	LUA_INTERFACE_DEF (util, glob),
 	LUA_INTERFACE_DEF (util, parse_mail_address),
 	LUA_INTERFACE_DEF (util, strlen_utf8),
-	LUA_INTERFACE_DEF (util, strcasecmp_utf8),
 	LUA_INTERFACE_DEF (util, strcasecmp_ascii),
 	LUA_INTERFACE_DEF (util, strequal_caseless),
 	LUA_INTERFACE_DEF (util, get_ticks),
@@ -618,7 +633,10 @@ static const struct luaL_reg utillib_f[] = {
 	LUA_INTERFACE_DEF (util, caseless_hash),
 	LUA_INTERFACE_DEF (util, caseless_hash_fast),
 	LUA_INTERFACE_DEF (util, is_utf_spoofed),
+	LUA_INTERFACE_DEF (util, is_utf_outside_range),
+	LUA_INTERFACE_DEF (util, get_string_stats),
 	LUA_INTERFACE_DEF (util, is_valid_utf8),
+	LUA_INTERFACE_DEF (util, has_obscured_unicode),
 	LUA_INTERFACE_DEF (util, readline),
 	LUA_INTERFACE_DEF (util, readpassphrase),
 	LUA_INTERFACE_DEF (util, file_exists),
@@ -760,7 +778,7 @@ lua_util_config_from_ucl (lua_State *L)
 			int_options = parse_config_options(str_options);
 		}
 		else {
-			msg_err_config ("config_from_ucl: second parameter is expected to be string");
+			msg_err ("config_from_ucl: second parameter is expected to be string");
 			ucl_object_unref (obj);
 			lua_pushnil (L);
 		}
@@ -775,7 +793,7 @@ lua_util_config_from_ucl (lua_State *L)
 		top = rspamd_rcl_config_init (cfg, NULL);
 
 		if (!rspamd_rcl_parse (top, cfg, cfg, cfg->cfg_pool, cfg->rcl_obj, &err)) {
-			msg_err_config ("rcl parse error: %s", err->message);
+			msg_err ("rcl parse error: %s", err->message);
 			ucl_object_unref (obj);
 			lua_pushnil (L);
 		}
@@ -1179,7 +1197,7 @@ lua_util_tokenize_text (lua_State *L)
 {
 	LUA_TRACE_POINT;
 	const gchar *in = NULL;
-	gsize len, pos, ex_len, i;
+	gsize len = 0, pos, ex_len, i;
 	GList *exceptions = NULL, *cur;
 	struct rspamd_lua_text *t;
 	struct rspamd_process_exception *ex;
@@ -1631,34 +1649,6 @@ lua_util_strlen_utf8 (lua_State *L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	return 1;
-}
-
-static gint
-lua_util_strcasecmp_utf8 (lua_State *L)
-{
-	LUA_TRACE_POINT;
-	const gchar *str1, *str2;
-	gsize len1, len2;
-	gint ret = -1;
-
-	str1 = lua_tolstring (L, 1, &len1);
-	str2 = lua_tolstring (L, 2, &len2);
-
-	if (str1 && str2) {
-
-		if (len1 == len2) {
-			ret = rspamd_lc_cmp (str1, str2, len1);
-		}
-		else {
-			ret = len1 - len2;
-		}
-	}
-	else {
-		return luaL_error (L, "invalid arguments");
-	}
-
-	lua_pushinteger (L, ret);
 	return 1;
 }
 
@@ -2273,6 +2263,8 @@ lua_util_gzip_decompress (lua_State *L)
 		return luaL_error (L, "invalid arguments");
 	}
 
+	sz = t->len;
+
 	memset (&strm, 0, sizeof (strm));
 	/* windowBits +16 to decode gzip, zlib 1.2.0.4+ */
 	rc = inflateInit2 (&strm, MAX_WBITS + 16);
@@ -2457,13 +2449,6 @@ lua_util_is_utf_spoofed (lua_State *L)
 	else if (s1) {
 		/* We have just s1, not s2 */
 		if (spc_sgl == NULL) {
-			USet *allowed = uset_openEmpty ();
-
-#if U_ICU_VERSION_MAJOR_NUM >= 51
-			uset_addAll (allowed, uspoof_getRecommendedSet (&uc_err));
-			uset_addAll (allowed, uspoof_getInclusionSet (&uc_err));
-#endif
-
 			spc_sgl = uspoof_open (&uc_err);
 
 			if (uc_err != U_ZERO_ERROR) {
@@ -2474,12 +2459,14 @@ lua_util_is_utf_spoofed (lua_State *L)
 			}
 
 			uspoof_setChecks (spc_sgl,
-					USPOOF_ALL_CHECKS & ~USPOOF_WHOLE_SCRIPT_CONFUSABLE,
+					USPOOF_INVISIBLE | USPOOF_MIXED_SCRIPT_CONFUSABLE | USPOOF_ANY_CASE,
 					&uc_err);
-#if U_ICU_VERSION_MAJOR_NUM >= 51
-			uspoof_setAllowedChars (spc_sgl, allowed, &uc_err);
-			uspoof_setRestrictionLevel (spc_sgl, USPOOF_MODERATELY_RESTRICTIVE);
-#endif
+			if (uc_err != U_ZERO_ERROR) {
+				msg_err ("Cannot set proper checks for uspoof: %s", u_errorName (uc_err));
+				lua_pushboolean (L, false);
+				uspoof_close(spc);
+				return 1;
+			}
 		}
 
 		ret = uspoof_checkUTF8 (spc_sgl, s1, l1, NULL, &uc_err);
@@ -2510,6 +2497,109 @@ lua_util_is_utf_spoofed (lua_State *L)
 
 	return nres;
 }
+
+static gint
+lua_util_get_string_stats (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	gsize len_of_string;
+	gint num_of_digits = 0, num_of_letters = 0;
+	const gchar *string_to_check = lua_tolstring (L, 1, &len_of_string);
+
+	if (string_to_check) {
+		while (*string_to_check != '\0') {
+			if (g_ascii_isdigit(*string_to_check)) {
+				num_of_digits++;
+			} else if (g_ascii_isalpha(*string_to_check)) {
+				num_of_letters++;
+			}
+			string_to_check++;
+		}
+	}
+	else {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	lua_createtable(L, 0, 2);
+	lua_pushstring(L, "digits");
+	lua_pushinteger(L, num_of_digits);
+	lua_settable(L, -3);
+	lua_pushstring(L, "letters");
+	lua_pushinteger(L, num_of_letters);
+	lua_settable(L, -3);
+
+	return 1;
+}
+
+
+static gint
+lua_util_is_utf_outside_range(lua_State *L)
+{
+	LUA_TRACE_POINT;
+	gsize len_of_string;
+	gint ret;
+	const gchar *string_to_check = lua_tolstring (L, 1, &len_of_string);
+	guint32 range_start = lua_tointeger (L, 2);
+	guint32 range_end = lua_tointeger (L, 3);
+
+	static rspamd_lru_hash_t *validators;
+
+	if (validators == NULL) {
+		validators = rspamd_lru_hash_new_full(16, g_free, (GDestroyNotify)uspoof_close, g_int64_hash, g_int64_equal);
+	}
+
+	if (string_to_check) {
+		guint64 hash_key = (guint64)range_end << 32 || range_start;
+
+		USpoofChecker *validator = rspamd_lru_hash_lookup(validators, &hash_key, 0);
+
+		UErrorCode uc_err = U_ZERO_ERROR;
+
+		if (validator == NULL) {
+			USet * allowed_chars;
+			guint64 * creation_hash_key = g_malloc(sizeof(guint64));
+			*creation_hash_key = hash_key;
+
+			validator = uspoof_open (&uc_err);
+			if (uc_err != U_ZERO_ERROR) {
+				msg_err ("cannot init spoof checker: %s", u_errorName (uc_err));
+				lua_pushboolean (L, false);
+				uspoof_close(validator);
+				g_free(creation_hash_key);
+				return 1;
+			}
+
+			allowed_chars = uset_openEmpty();
+			uset_addRange(allowed_chars, range_start, range_end);
+			uspoof_setAllowedChars(validator, allowed_chars, &uc_err);
+
+			uspoof_setChecks (validator,
+				USPOOF_CHAR_LIMIT | USPOOF_ANY_CASE, &uc_err);
+
+			uset_close(allowed_chars);
+
+			if (uc_err != U_ZERO_ERROR) {
+				msg_err ("Cannot configure uspoof: %s", u_errorName (uc_err));
+				lua_pushboolean (L, false);
+				uspoof_close(validator);
+				g_free(creation_hash_key);
+				return 1;
+			}
+
+			rspamd_lru_hash_insert(validators, creation_hash_key, validator, 0, 0);
+		}
+
+		ret = uspoof_checkUTF8 (validator, string_to_check, len_of_string, NULL, &uc_err);
+	}
+	else {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	lua_pushboolean (L, !!(ret != 0));
+
+	return 1;
+}
+
 
 static gint
 lua_util_get_hostname (lua_State *L)
@@ -2643,6 +2733,37 @@ lua_util_is_valid_utf8 (lua_State *L)
 	else {
 		return luaL_error (L, "invalid arguments");
 	}
+
+	return 1;
+}
+
+static gint
+lua_util_has_obscured_unicode (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	const gchar *str;
+	gsize len;
+	gint32 i = 0, prev_i;
+	UChar32 uc;
+
+	str = lua_tolstring (L, 1, &len);
+
+	while (i < len) {
+		prev_i = i;
+		U8_NEXT (str, i, len, uc);
+
+		if (uc > 0) {
+			if (IS_OBSCURED_CHAR (uc)) {
+				lua_pushboolean (L, true);
+				lua_pushnumber (L, uc); /* Character */
+				lua_pushnumber (L, prev_i); /* Offset */
+
+				return 3;
+			}
+		}
+	}
+
+	lua_pushboolean (L, false);
 
 	return 1;
 }

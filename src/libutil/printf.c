@@ -60,14 +60,14 @@ rspamd_humanize_number (gchar *buf, gchar *last, gint64 num, gboolean bytes)
 
 	if (!bytes) {
 		divisor = 1000;
-		prefixes = "\0\0\0k\0\0M\0\0G\0\0T\0\0P\0\0E";
+		prefixes = "\0\0\0\0k\0\0\0M\0\0\0G\0\0\0T\0\0\0P\0\0\0E";
 	}
 	else {
 		divisor = 1024;
-		prefixes = "B\0\0k\0\0M\0\0G\0\0T\0\0P\0\0E";
+		prefixes = "B\0\0\0KiB\0MiB\0GiB\0TiB\0PiB\0EiB";
 	}
 
-#define SCALE2PREFIX(scale)     (&prefixes[(scale) * 3])
+#define SCALE2PREFIX(scale)     (&prefixes[(scale) * 4])
 
 	if (num < 0) {
 		sign = -1;
@@ -979,7 +979,17 @@ rspamd_vprintf_common (rspamd_printf_append_func func,
 			case 'c':
 				c = va_arg (args, gint);
 				c &= 0xff;
-				RSPAMD_PRINTF_APPEND (&c, 1);
+				if (G_UNLIKELY (hex)) {
+					gchar hexbuf[2];
+					hexbuf[0] = hex == 2 ? _HEX[(c >> 4) & 0xf] :
+								_hex[(c >> 4) & 0xf];
+					hexbuf[1] = hex == 2 ? _HEX[c & 0xf] : _hex[c & 0xf];
+
+					RSPAMD_PRINTF_APPEND (hexbuf, 2);
+				}
+				else {
+					RSPAMD_PRINTF_APPEND (&c, 1);
+				}
 
 				continue;
 

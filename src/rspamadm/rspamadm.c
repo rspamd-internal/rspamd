@@ -420,7 +420,7 @@ main (gint argc, gchar **argv, gchar **env)
 	/* Setup logger */
 	if (verbose) {
 		cfg->log_level = G_LOG_LEVEL_DEBUG;
-		cfg->log_flags |= RSPAMD_LOG_FLAG_USEC;
+		cfg->log_flags |= RSPAMD_LOG_FLAG_USEC|RSPAMD_LOG_FLAG_ENFORCED;
 	}
 	else {
 		cfg->log_level = G_LOG_LEVEL_MESSAGE;
@@ -436,6 +436,8 @@ main (gint argc, gchar **argv, gchar **env)
 	(void) dns_resolver_init (rspamd_main->logger,
 			rspamd_main->ev_base,
 			cfg);
+	rspamd_main->http_ctx = rspamd_http_context_create (cfg, rspamd_main->ev_base,
+			NULL);
 
 	g_log_set_default_handler (rspamd_glib_log_function, rspamd_main->logger);
 	g_set_printerr_handler (rspamd_glib_printerr_function);

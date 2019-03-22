@@ -30,7 +30,7 @@ end
 local data_rows = {}
 local custom_rows = {}
 local nrows = 0
-local schema_version = 2 -- Current schema version
+local schema_version = 3 -- Current schema version
 
 local settings = {
   limit = 1000,
@@ -54,6 +54,11 @@ local settings = {
   use_https = false,
   use_gzip = true,
   allow_local = false,
+  insert_subject = false,
+  subject_privacy = false, -- subject privacy is off
+  subject_privacy_alg = 'blake2', -- default hash-algorithm to obfuscate subject
+  subject_privacy_prefix = 'obf', -- prefix to show it's obfuscated
+  subject_privacy_length = 16, -- cut the length of the hash
   user = nil,
   password = nil,
   no_ssl_verify = false,
@@ -91,6 +96,7 @@ CREATE TABLE rspamd
     RcptUser String,
     RcptDomain String,
     ListId String,
+    Subject String,
     `Attachments.FileName` Array(String),
     `Attachments.ContentType` Array(String),
     `Attachments.Length` Array(UInt32),
@@ -132,6 +138,13 @@ local migrations = {
     -- Add explicit version
     [[CREATE TABLE rspamd_version ( Version UInt32) ENGINE = TinyLog]],
     [[INSERT INTO rspamd_version (Version) Values (2)]],
+  },
+  [2] = {
+    -- Add `Subject` column
+    [[ALTER TABLE rspamd
+      ADD COLUMN Subject String AFTER ListId]],
+    -- New version
+    [[INSERT INTO rspamd_version (Version) Values (3)]],
   }
 }
 
@@ -159,7 +172,8 @@ local function clickhouse_main_row(res)
     'RcptUser',
     'RcptDomain',
     'ListId',
-    'Digest'
+    'Subject',
+    'Digest',
   }
 
   for _,v in ipairs(fields) do table.insert(res, v) end
@@ -228,13 +242,14 @@ local function clickhouse_check_symbol(task, symbols, need_score)
   return false
 end
 
-local function clickhouse_send_data(task)
+local function clickhouse_send_data(task, ev_base)
+  local log_object = task or rspamd_config
   local upstream = settings.upstream:get_upstream_round_robin()
   local ip_addr = upstream:get_addr():to_string(true)
 
   local function gen_success_cb(what, how_many)
     return function (_, _)
-      rspamd_logger.infox(task, "sent %s rows of %s to clickhouse server %s",
+      rspamd_logger.infox(log_object, "sent %s rows of %s to clickhouse server %s",
           how_many, what, ip_addr)
       upstream:ok()
     end
@@ -242,23 +257,27 @@ local function clickhouse_send_data(task)
 
   local function gen_fail_cb(what, how_many)
     return function (_, err)
-      rspamd_logger.errx(task, "cannot send %s rows of %s data to clickhouse server %s: %s",
+      rspamd_logger.errx(log_object, "cannot send %s rows of %s data to clickhouse server %s: %s",
           how_many, what, ip_addr, err)
       upstream:fail()
     end
   end
 
   local function send_data(what, tbl, query)
-    local ch_params = {
-      task = task,
-    }
+    local ch_params = {}
+    if task then
+      ch_params.task = task
+    else
+      ch_params.config = rspamd_config
+      ch_params.ev_base = ev_base
+    end
 
     local ret = lua_clickhouse.insert(upstream, settings, ch_params,
         query, tbl,
         gen_success_cb(what, #tbl),
         gen_fail_cb(what, #tbl))
     if not ret then
-      rspamd_logger.errx(task, "cannot send %s rows of %s data to clickhouse server %s: %s",
+      rspamd_logger.errx(log_object, "cannot send %s rows of %s data to clickhouse server %s: %s",
           #tbl, what, ip_addr, 'cannot make HTTP request')
     end
   end
@@ -435,6 +454,11 @@ local function clickhouse_collect(task)
   local action = task:get_metric_action('default')
   local digest = task:get_digest()
 
+  local subject = ''
+  if settings.insert_subject then
+    subject = lua_util.maybe_obfuscate_subject(task:get_subject() or '', settings)
+  end
+
   local row = {
     today(timestamp),
     timestamp,
@@ -457,6 +481,7 @@ local function clickhouse_collect(task)
     rcpt_user,
     rcpt_domain,
     list_id,
+    subject,
     digest
   }
 
@@ -905,11 +930,11 @@ if opts then
         type = 'idempotent',
         callback = clickhouse_collect,
         priority = 10,
-        flags = 'empty',
+        flags = 'empty,explicit_disable,ignore_passthrough',
       })
-      rspamd_config:register_finish_script(function(task)
+      rspamd_config:register_finish_script(function(_, ev_base, _)
         if nrows > 0 then
-          clickhouse_send_data(task)
+          clickhouse_send_data(nil, ev_base)
         end
       end)
       -- Create tables on load

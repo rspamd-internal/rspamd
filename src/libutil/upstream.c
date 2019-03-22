@@ -289,7 +289,7 @@ rspamd_upstream_update_addrs (struct upstream *up)
 			rspamd_inet_address_set_port (cur->addr, port);
 
 			PTR_ARRAY_FOREACH (up->addrs.addr, i, addr_elt) {
-				if (rspamd_inet_address_compare (addr_elt->addr, cur->addr) == 0) {
+				if (rspamd_inet_address_compare (addr_elt->addr, cur->addr, FALSE) == 0) {
 					naddr = g_malloc0 (sizeof (*naddr));
 					naddr->addr = cur->addr;
 					naddr->errors = reset_errors ? 0 : addr_elt->errors;
@@ -630,7 +630,7 @@ rspamd_upstream_dtor (struct upstream *up)
 }
 
 rspamd_inet_addr_t*
-rspamd_upstream_addr (struct upstream *up)
+rspamd_upstream_addr_next (struct upstream *up)
 {
 	guint idx, next_idx;
 	struct upstream_addr_elt *e1, *e2;
@@ -644,6 +644,16 @@ rspamd_upstream_addr (struct upstream *up)
 	} while (e2->errors > e1->errors);
 
 	return e2->addr;
+}
+
+rspamd_inet_addr_t*
+rspamd_upstream_addr_cur (const struct upstream *up)
+{
+	struct upstream_addr_elt *elt;
+
+	elt = g_ptr_array_index (up->addrs.addr, up->addrs.cur);
+
+	return elt->addr;
 }
 
 const gchar*
@@ -778,51 +788,45 @@ rspamd_upstream_add_addr (struct upstream *up, rspamd_inet_addr_t *addr)
 	return TRUE;
 }
 
+#define LEN_CHECK_STARTS_WITH(s, len, lit) \
+	((len) >= sizeof(lit) - 1 && g_ascii_strncasecmp ((s), (lit), sizeof(lit) - 1) == 0)
 gboolean
-rspamd_upstreams_parse_line (struct upstream_list *ups,
-		const gchar *str, guint16 def_port, void *data)
+rspamd_upstreams_parse_line_len (struct upstream_list *ups,
+		const gchar *str, gsize len, guint16 def_port, void *data)
 {
-	const gchar *end = str + strlen (str), *p = str;
+	const gchar *end = str + len, *p = str;
 	const gchar *separators = ";, \n\r\t";
 	gchar *tmp;
-	guint len;
+	guint span_len;
 	gboolean ret = FALSE;
 
-	if (g_ascii_strncasecmp (p, "random:", sizeof ("random:") - 1) == 0) {
+	if (LEN_CHECK_STARTS_WITH(p, len, "random:")) {
 		ups->rot_alg = RSPAMD_UPSTREAM_RANDOM;
 		p += sizeof ("random:") - 1;
 	}
-	else if (g_ascii_strncasecmp (p,
-			"master-slave:",
-			sizeof ("master-slave:") - 1) == 0) {
+	else if (LEN_CHECK_STARTS_WITH(p, len, "master-slave:")) {
 		ups->rot_alg = RSPAMD_UPSTREAM_MASTER_SLAVE;
 		p += sizeof ("master-slave:") - 1;
 	}
-	else if (g_ascii_strncasecmp (p,
-			"round-robin:",
-			sizeof ("round-robin:") - 1) == 0) {
+	else if (LEN_CHECK_STARTS_WITH(p, len, "round-robin:")) {
 		ups->rot_alg = RSPAMD_UPSTREAM_ROUND_ROBIN;
 		p += sizeof ("round-robin:") - 1;
 	}
-	else if (g_ascii_strncasecmp (p,
-			"hash:",
-			sizeof ("hash:") - 1) == 0) {
+	else if (LEN_CHECK_STARTS_WITH(p, len, "hash:")) {
 		ups->rot_alg = RSPAMD_UPSTREAM_HASHED;
 		p += sizeof ("hash:") - 1;
 	}
-	else if (g_ascii_strncasecmp (p,
-			"sequential:",
-			sizeof ("sequential:") - 1) == 0) {
+	else if (LEN_CHECK_STARTS_WITH(p, len, "sequential:")) {
 		ups->rot_alg = RSPAMD_UPSTREAM_SEQUENTIAL;
 		p += sizeof ("sequential:") - 1;
 	}
 
 	while (p < end) {
-		len = strcspn (p, separators);
+		span_len = rspamd_memcspn (p, separators, end - p);
 
-		if (len > 0) {
-			tmp = g_malloc (len + 1);
-			rspamd_strlcpy (tmp, p, len + 1);
+		if (span_len > 0) {
+			tmp = g_malloc (span_len + 1);
+			rspamd_strlcpy (tmp, p, span_len + 1);
 
 			if (rspamd_upstreams_add_upstream (ups, tmp, def_port,
 					RSPAMD_UPSTREAM_PARSE_DEFAULT,
@@ -833,12 +837,24 @@ rspamd_upstreams_parse_line (struct upstream_list *ups,
 			g_free (tmp);
 		}
 
-		p += len;
+		p += span_len;
 		/* Skip separators */
-		p += strspn (p, separators);
+		if (p < end) {
+			p += rspamd_memspn (p, separators, end - p);
+		}
 	}
 
 	return ret;
+}
+
+#undef LEN_CHECK_STARTS_WITH
+
+gboolean
+rspamd_upstreams_parse_line (struct upstream_list *ups,
+							 const gchar *str, guint16 def_port, void *data)
+{
+	return rspamd_upstreams_parse_line_len (ups, str, strlen (str),
+			def_port, data);
 }
 
 gboolean

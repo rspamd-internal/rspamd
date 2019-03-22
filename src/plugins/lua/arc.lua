@@ -91,6 +91,7 @@ local settings = {
 }
 
 local function parse_arc_header(hdr, target)
+  -- Split elements by ';' and trim spaces
   local arr = fun.totable(fun.map(
     function(val)
       return fun.totable(fun.map(lua_util.rspamd_str_trim,
@@ -102,8 +103,9 @@ local function parse_arc_header(hdr, target)
   -- Now we have two tables in format:
   -- [sigs] -> [{sig1_elts}, {sig2_elts}...]
   for i,elts in ipairs(arr) do
+    if not target[i] then target[i] = {} end
+    -- Split by kv pair, like k=v
     fun.each(function(v)
-      if not target[i] then target[i] = {} end
       if v[1] and v[2] then
         target[i][v[1]] = v[2]
       end
@@ -508,11 +510,14 @@ end
 local function arc_signing_cb(task)
   local arc_seals = task:cache_get('arc-seals')
 
-  local ret,p = dkim_sign_tools.prepare_dkim_signing(N, task, settings)
+  local ret, selectors = dkim_sign_tools.prepare_dkim_signing(N, task, settings)
 
   if not ret then
     return
   end
+
+  -- TODO: support multiple signatures here
+  local p = selectors[1]
 
   p.arc_cv = 'none'
   p.arc_idx = 1

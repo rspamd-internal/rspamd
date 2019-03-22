@@ -36,6 +36,7 @@
 #include "libutil/http_private.h"
 #include "libmime/lang_detection.h"
 #include <math.h>
+#include <src/libserver/cfg_file_private.h>
 #include "unix-std.h"
 
 #include "lua/lua_common.h"
@@ -144,11 +145,15 @@ rspamd_task_timeout (gint fd, short what, gpointer ud)
 		msg_info_task ("processing of task timed out, forced processing");
 
 		if (task->cfg->soft_reject_on_timeout) {
-			struct rspamd_metric_result *res = task->result;
+			struct rspamd_action *action, *soft_reject;
 
-			if (rspamd_check_action_metric (task, res) != METRIC_ACTION_REJECT) {
+			action = rspamd_check_action_metric (task);
+
+			if (action->action_type != METRIC_ACTION_REJECT) {
+				soft_reject = rspamd_config_get_action_by_type (task->cfg,
+						METRIC_ACTION_SOFT_REJECT);
 				rspamd_add_passthrough_result (task,
-						METRIC_ACTION_SOFT_REJECT,
+						soft_reject,
 						0,
 						NAN,
 						"timeout processing message",
@@ -326,9 +331,7 @@ rspamd_worker_error_handler (struct rspamd_http_connection *conn, GError *err)
 				NULL,
 				"application/json",
 				task,
-				task->http_conn->fd,
-				&task->tv,
-				task->ev_base);
+				&task->tv);
 	}
 }
 
@@ -409,13 +412,13 @@ accept_socket (gint fd, short what, void *arg)
 		http_opts = RSPAMD_HTTP_REQUIRE_ENCRYPTION;
 	}
 
-	task->http_conn = rspamd_http_connection_new (rspamd_worker_body_handler,
+	task->http_conn = rspamd_http_connection_new_server (
+			ctx->http_ctx,
+			nfd,
+			rspamd_worker_body_handler,
 			rspamd_worker_error_handler,
 			rspamd_worker_finish_handler,
-			http_opts,
-			RSPAMD_HTTP_SERVER,
-			ctx->keys_cache,
-			NULL);
+			http_opts);
 	rspamd_http_connection_set_max_size (task->http_conn, task->cfg->max_message);
 	worker->nconns++;
 	rspamd_mempool_add_destructor (task->task_pool,
@@ -431,9 +434,7 @@ accept_socket (gint fd, short what, void *arg)
 
 	rspamd_http_connection_read_message (task->http_conn,
 			task,
-			nfd,
-			&ctx->io_tv,
-			ctx->ev_base);
+			&ctx->io_tv);
 }
 
 #ifdef WITH_HYPERSCAN
@@ -691,8 +692,8 @@ start_worker (struct rspamd_worker *worker)
 	rspamd_upstreams_library_config (worker->srv->cfg, ctx->cfg->ups_ctx,
 			ctx->ev_base, ctx->resolver->r);
 
-	/* XXX: stupid default */
-	ctx->keys_cache = rspamd_keypair_cache_new (256);
+	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->ev_base,
+			ctx->cfg->ups_ctx);
 	rspamd_worker_init_scanner (worker, ctx->ev_base, ctx->resolver,
 			&ctx->lang_det);
 	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->ev_base,
@@ -702,8 +703,9 @@ start_worker (struct rspamd_worker *worker)
 	rspamd_worker_block_signals ();
 
 	rspamd_stat_close ();
-	rspamd_keypair_cache_destroy (ctx->keys_cache);
+	struct rspamd_http_context *http_ctx = ctx->http_ctx;
 	REF_RELEASE (ctx->cfg);
+	rspamd_http_context_free (http_ctx);
 	rspamd_log_close (worker->srv->logger, TRUE);
 
 	exit (EXIT_SUCCESS);

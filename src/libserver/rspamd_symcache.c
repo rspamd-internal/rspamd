@@ -23,6 +23,7 @@
 #include "unix-std.h"
 #include "contrib/t1ha/t1ha.h"
 #include "libserver/worker_util.h"
+#include "khash.h"
 #include <math.h>
 
 #if defined(__STDC_VERSION__) &&  __STDC_VERSION__ >= 201112L
@@ -81,51 +82,6 @@ struct symcache_order {
 	ref_entry_t ref;
 };
 
-struct rspamd_symcache {
-	/* Hash table for fast access */
-	GHashTable *items_by_symbol;
-	GPtrArray *items_by_id;
-	struct symcache_order *items_by_order;
-	GPtrArray *filters;
-	GPtrArray *prefilters;
-	GPtrArray *postfilters;
-	GPtrArray *composites;
-	GPtrArray *idempotent;
-	GPtrArray *virtual;
-	GPtrArray *squeezed;
-	GList *delayed_deps;
-	GList *delayed_conditions;
-	rspamd_mempool_t *static_pool;
-	guint64 cksum;
-	gdouble total_weight;
-	guint used_items;
-	guint stats_symbols_count;
-	guint64 total_hits;
-	guint id;
-	struct rspamd_config *cfg;
-	gdouble reload_time;
-	gint peak_cb;
-};
-
-struct item_stat {
-	struct rspamd_counter_data time_counter;
-	gdouble avg_time;
-	gdouble weight;
-	guint hits;
-	guint64 total_hits;
-	struct rspamd_counter_data frequency_counter;
-	gdouble avg_frequency;
-	gdouble stddev_frequency;
-};
-
-struct rspamd_symcache_dynamic_item {
-	guint16 start_msec; /* Relative to task time */
-	unsigned started:1;
-	unsigned finished:1;
-	/* unsigned pad:14; */
-	guint32 async_events;
-};
-
 struct rspamd_symcache_item {
 	/* This block is likely shared */
 	struct item_stat *st;
@@ -164,6 +120,53 @@ struct rspamd_symcache_item {
 	GPtrArray *deps;
 	GPtrArray *rdeps;
 };
+
+struct item_stat {
+	struct rspamd_counter_data time_counter;
+	gdouble avg_time;
+	gdouble weight;
+	guint hits;
+	guint64 total_hits;
+	struct rspamd_counter_data frequency_counter;
+	gdouble avg_frequency;
+	gdouble stddev_frequency;
+};
+
+struct rspamd_symcache {
+	/* Hash table for fast access */
+	GHashTable *items_by_symbol;
+	GPtrArray *items_by_id;
+	struct symcache_order *items_by_order;
+	GPtrArray *filters;
+	GPtrArray *prefilters;
+	GPtrArray *postfilters;
+	GPtrArray *composites;
+	GPtrArray *idempotent;
+	GPtrArray *virtual;
+	GPtrArray *squeezed;
+	GList *delayed_deps;
+	GList *delayed_conditions;
+	rspamd_mempool_t *static_pool;
+	guint64 cksum;
+	gdouble total_weight;
+	guint used_items;
+	guint stats_symbols_count;
+	guint64 total_hits;
+	guint id;
+	struct rspamd_config *cfg;
+	gdouble reload_time;
+	gint peak_cb;
+};
+
+struct rspamd_symcache_dynamic_item {
+	guint16 start_msec; /* Relative to task time */
+	unsigned started:1;
+	unsigned finished:1;
+	/* unsigned pad:14; */
+	guint32 async_events;
+};
+
+
 
 struct cache_dependency {
 	struct rspamd_symcache_item *item;
@@ -235,8 +238,6 @@ static void rspamd_symcache_disable_symbol_checkpoint (struct rspamd_task *task,
 		struct rspamd_symcache *cache, const gchar *symbol);
 static void rspamd_symcache_enable_symbol_checkpoint (struct rspamd_task *task,
 		struct rspamd_symcache *cache, const gchar *symbol);
-static void rspamd_symcache_disable_all_symbols (struct rspamd_task *task,
-		struct rspamd_symcache *cache);
 
 static void
 rspamd_symcache_order_dtor (gpointer p)
@@ -531,24 +532,31 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 			dit = rspamd_symcache_find_filter (cache, dep->sym);
 
 			if (dit != NULL) {
-				if (dit->id == i) {
-					msg_err_cache ("cannot add dependency on self: %s -> %s "
-							"(resolved to %s)",
-							it->symbol, dep->sym, dit->symbol);
+				if (!dit->is_filter) {
+					msg_err_cache ("cannot depend on non filter symbol "
+								   "(%s wants to add dependency on %s)",
+							dep->sym, dit->symbol);
 				}
 				else {
-					rdep = rspamd_mempool_alloc (cache->static_pool,
-							sizeof (*rdep));
+					if (dit->id == i) {
+						msg_err_cache ("cannot add dependency on self: %s -> %s "
+									   "(resolved to %s)",
+								it->symbol, dep->sym, dit->symbol);
+					} else {
+						rdep = rspamd_mempool_alloc (cache->static_pool,
+								sizeof (*rdep));
 
-					rdep->sym = dep->sym;
-					rdep->item = it;
-					rdep->id = i;
-					g_ptr_array_add (dit->rdeps, rdep);
-					dep->item = dit;
-					dep->id = dit->id;
+						rdep->sym = dep->sym;
+						rdep->item = it;
+						rdep->id = i;
+						g_assert (dit->rdeps != NULL);
+						g_ptr_array_add (dit->rdeps, rdep);
+						dep->item = dit;
+						dep->id = dit->id;
 
-					msg_debug_cache ("add dependency from %d on %d", it->id,
-							dit->id);
+						msg_debug_cache ("add dependency from %d on %d", it->id,
+								dit->id);
+					}
 				}
 			}
 			else {
@@ -923,6 +931,8 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 		 */
 		if (item->type & SYMBOL_TYPE_COMPOSITE) {
 			item->specific.normal.condition_cb = -1;
+			item->specific.normal.user_data = user_data;
+			g_assert (user_data != NULL);
 			g_ptr_array_add (cache->composites, item);
 
 			item->id = cache->items_by_id->len;
@@ -1382,7 +1392,8 @@ rspamd_symcache_check_symbol (struct rspamd_task *task,
 	SET_START_BIT (checkpoint, dyn_item);
 
 	if (!item->enabled ||
-		(RSPAMD_TASK_IS_EMPTY (task) && !(item->type & SYMBOL_TYPE_EMPTY))) {
+		(RSPAMD_TASK_IS_EMPTY (task) && !(item->type & SYMBOL_TYPE_EMPTY)) ||
+		(item->type & SYMBOL_TYPE_MIME_ONLY && !RSPAMD_TASK_IS_MIME(task))) {
 		check = FALSE;
 	}
 	else if (item->specific.normal.condition_cb != -1) {
@@ -1569,7 +1580,6 @@ rspamd_symcache_make_checkpoint (struct rspamd_task *task,
 	checkpoint->pass = RSPAMD_CACHE_PASS_INIT;
 	task->checkpoint = checkpoint;
 
-	task->result = task->result;
 
 	return checkpoint;
 }
@@ -1597,7 +1607,8 @@ rspamd_symcache_process_settings (struct rspamd_task *task,
 
 	if (enabled) {
 		/* Disable all symbols but selected */
-		rspamd_symcache_disable_all_symbols (task, cache);
+		rspamd_symcache_disable_all_symbols (task, cache,
+				SYMBOL_TYPE_EXPLICIT_DISABLE);
 		already_disabled = TRUE;
 		it = NULL;
 
@@ -1614,7 +1625,8 @@ rspamd_symcache_process_settings (struct rspamd_task *task,
 		it = NULL;
 
 		if (!already_disabled) {
-			rspamd_symcache_disable_all_symbols (task, cache);
+			rspamd_symcache_disable_all_symbols (task, cache,
+					SYMBOL_TYPE_EXPLICIT_DISABLE);
 		}
 
 		while ((cur = ucl_iterate_object (enabled, &it, true)) != NULL) {
@@ -2273,9 +2285,10 @@ rspamd_symcache_stats_symbols_count (struct rspamd_symcache *cache)
 }
 
 
-static void
+void
 rspamd_symcache_disable_all_symbols (struct rspamd_task *task,
-		struct rspamd_symcache *cache)
+									 struct rspamd_symcache *cache,
+									 guint skip_mask)
 {
 	struct cache_savepoint *checkpoint;
 	guint i;
@@ -2294,7 +2307,7 @@ rspamd_symcache_disable_all_symbols (struct rspamd_task *task,
 	PTR_ARRAY_FOREACH (cache->items_by_id, i, item) {
 		dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
 
-		if (!(item->type & SYMBOL_TYPE_SQUEEZED)) {
+		if (!(item->type & (SYMBOL_TYPE_SQUEEZED|skip_mask))) {
 			SET_FINISH_BIT (checkpoint, dyn_item);
 			SET_START_BIT (checkpoint, dyn_item);
 		}
@@ -2425,7 +2438,7 @@ rspamd_symcache_disable_symbol_perm (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = g_hash_table_lookup (cache->items_by_symbol, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol);
 
 	if (item) {
 		item->enabled = FALSE;
@@ -2441,7 +2454,7 @@ rspamd_symcache_enable_symbol_perm (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = g_hash_table_lookup (cache->items_by_symbol, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol);
 
 	if (item) {
 		item->enabled = TRUE;
@@ -2772,4 +2785,86 @@ rspamd_symcache_item_async_dec_check_full (struct rspamd_task *task,
 	}
 
 	return FALSE;
+}
+
+gboolean
+rspamd_symcache_add_symbol_flags (struct rspamd_symcache *cache,
+										   const gchar *symbol,
+										   guint flags)
+{
+	struct rspamd_symcache_item *item;
+
+	g_assert (cache != NULL);
+	g_assert (symbol != NULL);
+
+	item = rspamd_symcache_find_filter (cache, symbol);
+
+	if (item) {
+		item->type |= flags;
+
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+gboolean
+rspamd_symcache_set_symbol_flags (struct rspamd_symcache *cache,
+										   const gchar *symbol,
+										   guint flags)
+{
+	struct rspamd_symcache_item *item;
+
+	g_assert (cache != NULL);
+	g_assert (symbol != NULL);
+
+	item = rspamd_symcache_find_filter (cache, symbol);
+
+	if (item) {
+		item->type = flags;
+
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+guint
+rspamd_symcache_get_symbol_flags (struct rspamd_symcache *cache,
+										const gchar *symbol)
+{
+	struct rspamd_symcache_item *item;
+
+	g_assert (cache != NULL);
+	g_assert (symbol != NULL);
+
+	item = rspamd_symcache_find_filter (cache, symbol);
+
+	if (item) {
+		return item->type;
+	}
+
+	return 0;
+}
+
+void
+rspamd_symcache_composites_foreach (struct rspamd_task *task,
+										 struct rspamd_symcache *cache,
+										 GHFunc func,
+										 gpointer fd)
+{
+	guint i;
+	struct rspamd_symcache_item *item;
+	struct rspamd_symcache_dynamic_item *dyn_item;
+
+	PTR_ARRAY_FOREACH (cache->composites, i, item) {
+		dyn_item = rspamd_symcache_get_dynamic (task->checkpoint, item);
+
+		if (!CHECK_START_BIT (task->checkpoint, dyn_item)) {
+			/* Cannot do it due to 2 passes */
+			/* SET_START_BIT (task->checkpoint, dyn_item); */
+			func (item->symbol, item->specific.normal.user_data, fd);
+			SET_FINISH_BIT (task->checkpoint, dyn_item);
+		}
+	}
 }

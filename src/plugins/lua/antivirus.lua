@@ -15,10 +15,10 @@ limitations under the License.
 ]] --
 
 local rspamd_logger = require "rspamd_logger"
-local rspamd_regexp = require "rspamd_regexp"
 local lua_util = require "lua_util"
 local fun = require "fun"
 local lua_antivirus = require("lua_scanners").filter('antivirus')
+local common = require "lua_scanners/common"
 local redis_params
 
 local N = "antivirus"
@@ -70,29 +70,29 @@ end
 
 
 local function add_antivirus_rule(sym, opts)
-  if not opts['type'] then
+  if not opts.type then
     rspamd_logger.errx(rspamd_config, 'unknown type for AV rule %s', sym)
     return nil
   end
 
-  if not opts['symbol'] then opts['symbol'] = sym:upper() end
-  local cfg = lua_antivirus[opts['type']]
+  if not opts.symbol then opts.symbol = sym:upper() end
+  local cfg = lua_antivirus[opts.type]
 
   if not cfg then
     rspamd_logger.errx(rspamd_config, 'unknown antivirus type: %s',
-        opts['type'])
+        opts.type)
     return nil
   end
 
-  if not opts['symbol_fail'] then
-    opts['symbol_fail'] = string.upper(opts['type']) .. '_FAIL'
+  if not opts.symbol_fail then
+    opts.symbol_fail = opts.symbol .. '_FAIL'
   end
 
   -- WORKAROUND for deprecated attachments_only
-  if opts['attachments_only'] ~= nil then
-    opts['scan_mime_parts'] = opts['attachments_only']
+  if opts.attachments_only ~= nil then
+    opts.scan_mime_parts = opts.attachments_only
     rspamd_logger.warnx(rspamd_config, '%s [%s]: Using attachments_only is deprecated. '..
-     'Please use scan_mime_parts = %s instead', opts['symbol'], opts['type'], opts['attachments_only'])
+     'Please use scan_mime_parts = %s instead', opts.symbol, opts.type, opts.attachments_only)
   end
   -- WORKAROUND for deprecated attachments_only
 
@@ -103,52 +103,26 @@ local function add_antivirus_rule(sym, opts)
 
   if not rule then
     rspamd_logger.errx(rspamd_config, 'cannot configure %s for %s',
-      opts['type'], opts['symbol'])
+      opts.type, opts.symbol)
     return nil
   end
 
-  if type(opts['patterns']) == 'table' then
-    rule['patterns'] = {}
-    if opts['patterns'][1] then
-      for i, p in ipairs(opts['patterns']) do
-        if type(p) == 'table' then
-          local new_set = {}
-          for k, v in pairs(p) do
-            new_set[k] = rspamd_regexp.create_cached(v)
-          end
-          rule['patterns'][i] = new_set
-        else
-          rule['patterns'][i] = {}
-        end
-      end
-    else
-      for k, v in pairs(opts['patterns']) do
-        rule['patterns'][k] = rspamd_regexp.create_cached(v)
-      end
-    end
-  end
+  rule.patterns = common.create_regex_table(opts.patterns or {})
+  rule.patterns_fail = common.create_regex_table(opts.patterns_fail or {})
 
-  if opts['whitelist'] then
-    rule['whitelist'] = rspamd_config:add_hash_map(opts['whitelist'])
+  if opts.whitelist then
+    rule.whitelist = rspamd_config:add_hash_map(opts.whitelist)
   end
 
   return function(task)
     if rule.scan_mime_parts then
-      local parts = task:get_parts() or {}
-
-      local filter_func = function(p)
-        return (rule.scan_image_mime and p:is_image())
-            or (rule.scan_text_mime and p:is_text())
-            or (p:is_attachment())
-      end
 
       fun.each(function(p)
         local content = p:get_content()
-
         if content and #content > 0 then
           cfg.check(task, content, p:get_digest(), rule)
         end
-      end, fun.filter(filter_func, parts))
+      end, common.check_parts_match(task, rule))
 
     else
       cfg.check(task, task:get_content(), task:get_digest(), rule)
@@ -157,13 +131,14 @@ local function add_antivirus_rule(sym, opts)
 end
 
 -- Registration
-local opts = rspamd_config:get_all_opt('antivirus')
+local opts = rspamd_config:get_all_opt(N)
 if opts and type(opts) == 'table' then
-  redis_params = rspamd_parse_redis_server('antivirus')
+  redis_params = rspamd_parse_redis_server(N)
   local has_valid = false
   for k, m in pairs(opts) do
     if type(m) == 'table' and m.servers then
       if not m.type then m.type = k end
+      if not m.name then m.name = k end
       local cb = add_antivirus_rule(k, m)
 
       if not cb then
@@ -174,14 +149,14 @@ if opts and type(opts) == 'table' then
           name = m['symbol'],
           callback = cb,
           score = 0.0,
-          group = 'antivirus'
+          group = N
         })
         rspamd_config:register_symbol({
           type = 'virtual',
           name = m['symbol_fail'],
           parent = id,
           score = 0.0,
-          group = 'antivirus'
+          group = N
         })
         has_valid = true
         if type(m['patterns']) == 'table' then
@@ -194,11 +169,13 @@ if opts and type(opts) == 'table' then
                     name = sym,
                     parent = m['symbol'],
                     parent_id = id,
+                    group = N
                   })
                   rspamd_config:register_symbol({
                     type = 'virtual',
                     name = sym,
-                    parent = id
+                    parent = id,
+                    group = N
                   })
                 end
               end
@@ -208,7 +185,8 @@ if opts and type(opts) == 'table' then
               rspamd_config:register_symbol({
                 type = 'virtual',
                 name = sym,
-                parent = id
+                parent = id,
+                group = N
               })
             end
           end
@@ -216,7 +194,7 @@ if opts and type(opts) == 'table' then
         if m['score'] then
           -- Register metric symbol
           local description = 'antivirus symbol'
-          local group = 'antivirus'
+          local group = N
           if m['description'] then
             description = m['description']
           end
