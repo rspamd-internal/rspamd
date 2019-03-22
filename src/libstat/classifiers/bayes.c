@@ -306,6 +306,25 @@ bayes_classify (struct rspamd_classifier * ctx,
 		}
 	}
 
+	/* Check max learns */
+	if (ctx->cfg->min_learns > 0) {
+		msg_debug_bayes ("<%s> Inside max learns check", task->message_id);
+		if (ctx->ham_learns > 2) {
+			msg_info_task ("run script as ham class has more enough "
+					"learns: %ul",
+					ctx->ham_learns);
+
+			return TRUE;
+		}
+		if (ctx->spam_learns > 2) {
+			msg_info_task ("run script as spam class has more enough"
+					"learns: %ul",
+					ctx->spam_learns);
+
+			return TRUE;
+		}
+	}
+
 	for (i = 0; i < tokens->len; i ++) {
 		tok = g_ptr_array_index (tokens, i);
 		if (!(tok->flags & RSPAMD_STAT_TOKEN_FLAG_META)) {
