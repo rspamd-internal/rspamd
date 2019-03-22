@@ -7,7 +7,7 @@ cache_file = "$DBDIR/symbols.cache";
 # How often maps are checked (
 map_watch_interval = 5min;
 # Multiplier for watch interval for files
-map_file_watch_multiplier = 0.1;
+map_file_watch_multiplier = 5min;
 dynamic_conf = "$DBDIR/rspamd_dynamic";
 history_file = "$DBDIR/rspamd.history";
 check_all_filters = false;
@@ -17,12 +17,12 @@ dns {
     retransmits = 5;
 }
 tempdir = "/tmp";
-url_tld = "${SHAREDIR}/effective_tld_names.dat";
+url_tld = "${PLUGINSDIR}/effective_tld_names.dat";
 classify_headers = [
-	"User-Agent",
-	"X-Mailer",
-	"Content-Type",
-	"X-MimeOLE",
+    "User-Agent",
+    "X-Mailer",
+    "Content-Type",
+    "X-MimeOLE",
 ];
 
 control_socket = "$DBDIR/rspamd.sock mode=0600";
@@ -42,9 +42,3 @@ rrd = "${DBDIR}/rspamd.rrd";
 # Local networks
 local_addrs = [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, fd00::/8, 169.254.0.0/16, fe80::/10];
 hs_cache_dir = "${DBDIR}/";
-
-# Timeout for messages processing (must be larger than any internal timeout used)
-task_timeout = 8s;
-
-# Emit soft reject when timeout takes place
-soft_reject_on_timeout = false;
