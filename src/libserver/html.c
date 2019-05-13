@@ -598,7 +598,8 @@ rspamd_html_url_is_phished (rspamd_mempool_t *pool,
 	}
 
 	if (end > url_text + 4 &&
-			rspamd_url_find (pool, url_text, end - url_text, &url_str, FALSE,
+			rspamd_url_find (pool, url_text, end - url_text, &url_str,
+					RSPAMD_URL_FIND_ALL,
 					&url_pos, NULL) &&
 			url_str != NULL) {
 		if (url_pos > 0) {
@@ -1569,7 +1570,8 @@ rspamd_process_html_url (rspamd_mempool_t *pool, struct rspamd_url *url,
 
 	if (url->querylen > 0) {
 
-		if (rspamd_url_find (pool, url->query, url->querylen, &url_str, FALSE,
+		if (rspamd_url_find (pool, url->query, url->querylen, &url_str,
+				RSPAMD_URL_FIND_ALL,
 				NULL, &prefix_added)) {
 			query_url = rspamd_mempool_alloc0 (pool,
 					sizeof (struct rspamd_url));
@@ -1704,19 +1706,21 @@ rspamd_html_process_img_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 				/* We have an embedded image */
 				img->flags |= RSPAMD_HTML_FLAG_IMAGE_EMBEDDED;
 			}
-			if (comp->len > sizeof ("data:") - 1 && memcmp (comp->start,
-					"data:", sizeof ("data:") - 1) == 0) {
-				/* We have an embedded image in HTML tag */
-				img->flags |=
-						(RSPAMD_HTML_FLAG_IMAGE_EMBEDDED|RSPAMD_HTML_FLAG_IMAGE_DATA);
-				rspamd_html_process_data_image (pool, img, comp);
-				hc->flags |= RSPAMD_HTML_FLAG_HAS_DATA_URLS;
-			}
 			else {
-				img->flags |= RSPAMD_HTML_FLAG_IMAGE_EXTERNAL;
-				if (img->src) {
-					img->url = rspamd_html_process_url (pool,
-							img->src, fstr.len, NULL);
+				if (comp->len > sizeof ("data:") - 1 && memcmp (comp->start,
+						"data:", sizeof ("data:") - 1) == 0) {
+					/* We have an embedded image in HTML tag */
+					img->flags |=
+							(RSPAMD_HTML_FLAG_IMAGE_EMBEDDED | RSPAMD_HTML_FLAG_IMAGE_DATA);
+					rspamd_html_process_data_image (pool, img, comp);
+					hc->flags |= RSPAMD_HTML_FLAG_HAS_DATA_URLS;
+				}
+				else {
+					img->flags |= RSPAMD_HTML_FLAG_IMAGE_EXTERNAL;
+					if (img->src) {
+						img->url = rspamd_html_process_url (pool,
+								img->src, fstr.len, NULL);
+					}
 				}
 			}
 		}
@@ -2335,11 +2339,10 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 				msg_debug_html ("got class: %s", bl->class);
 				break;
 			case RSPAMD_HTML_COMPONENT_SIZE:
-				fstr.begin = (gchar *) comp->start;
-				fstr.len = comp->len;
-				rspamd_html_process_color (comp->start, comp->len,
-						&bl->font_color);
-				msg_debug_html ("got color: %xd", bl->font_color.d.val);
+				/* Not supported by html5 */
+				/* FIXME maybe support it */
+				bl->font_size = 16;
+				msg_debug_html ("got size: %*s", (gint)comp->len, comp->start);
 				break;
 			default:
 				/* NYI */

@@ -853,7 +853,14 @@ surbl_module_parse_rule (const ucl_object_t* value, struct rspamd_config* cfg)
 				0, surbl_test_url, new_suffix, SYMBOL_TYPE_CALLBACK, -1);
 		rspamd_symcache_add_dependency (cfg->cache, cb_id,
 				SURBL_REDIRECTOR_CALLBACK);
+		/* Failure symbol */
+		g_string_append (sym, "_FAIL");
+		rspamd_symcache_add_symbol (cfg->cache, sym->str,
+				0, NULL, NULL, SYMBOL_TYPE_VIRTUAL|SYMBOL_TYPE_NOSTAT, cb_id);
+		rspamd_config_add_symbol (cfg, sym->str, 0.0, "SURBL failure symbol",
+				"surbl", 0, 0, 0);
 		g_string_free (sym, TRUE);
+
 		nrules++;
 		new_suffix->callback_id = cb_id;
 		cur = ucl_object_lookup (cur_rule, "bits");
@@ -1476,7 +1483,7 @@ make_surbl_requests (struct rspamd_url *url, struct rspamd_task *task,
 			msg_debug_surbl ("send surbl dns ip request %s to %s", surbl_req,
 					suffix->suffix);
 
-			if (make_dns_request_task (task,
+			if (rspamd_dns_resolver_request_task (task,
 					surbl_dns_ip_callback,
 					(void *) param, RDNS_REQUEST_A, surbl_req)) {
 				param->item = item;
@@ -1503,7 +1510,7 @@ make_surbl_requests (struct rspamd_url *url, struct rspamd_task *task,
 			rspamd_mempool_strdup (task->task_pool, url->surbl);
 		msg_debug_surbl ("send surbl dns request %s", surbl_req);
 
-		if (make_dns_request_task (task,
+		if (rspamd_dns_resolver_request_task (task,
 				surbl_dns_callback,
 				(void *) param, RDNS_REQUEST_A, surbl_req)) {
 			param->item = item;
@@ -1617,9 +1624,19 @@ surbl_dns_callback (struct rdns_reply *reply, gpointer arg)
 		}
 	}
 	else {
-		msg_debug_surbl ("<%s> domain [%s] is not in surbl %s",
-			param->task->message_id, param->host_resolve,
-			param->suffix->suffix);
+		if (reply->code == RDNS_RC_NXDOMAIN || reply->code == RDNS_RC_NOREC) {
+			msg_debug_surbl ("<%s> domain [%s] is not in surbl %s",
+					param->task->message_id, param->host_resolve,
+					param->suffix->suffix);
+		}
+		else {
+			/* Insert failure symbol */
+			GString *sym = g_string_new (param->suffix->symbol);
+
+			g_string_append (sym, "_FAIL");
+			rspamd_task_insert_result (task, sym->str, 1.0,
+					rdns_strerror (reply->code));
+		}
 	}
 
 	rspamd_symcache_item_async_dec_check (param->task, param->item, M);
@@ -1658,7 +1675,7 @@ surbl_dns_ip_callback (struct rdns_reply *reply, gpointer arg)
 						param->host_resolve,
 						to_resolve);
 
-				if (make_dns_request_task (task,
+				if (rspamd_dns_resolver_request_task (task,
 						surbl_dns_callback,
 						param, RDNS_REQUEST_A, to_resolve->str)) {
 					rspamd_symcache_item_async_inc (param->task, param->item, M);

@@ -65,14 +65,15 @@ local my_victim = [[/(?:victim|prey)/{words}]]
 local your_webcam = [[/webcam/{words}]]
 local your_onan = [[/(?:mast[ur]{2}bati(?:on|ng)|onanism|solitary)/{words}]]
 local password_in_words = [[/^pass(?:(?:word)|(?:phrase))$/i{words}]]
-local btc_wallet_address = [[/^[13][1-9a-km-zA-HJ-NP-Z]{25,34}$/]]
+local btc_wallet_address = [[/^[13][1-9A-Za-z]{25,34}$/]]
 local wallet_word = [[/^wallet$/{words}]]
 local broken_unicode = [[has_flag(bad_unicode)]]
+local list_unsub = [[header_exists(List-Unsubscribe)]]
 
 reconf['LEAKED_PASSWORD_SCAM'] = {
-  re = string.format('%s{words} & (%s | %s | %s | %s | %s | %s | lua:check_data_images)',
+  re = string.format('%s{words} & (%s | %s | %s | %s | %s | %s | %s | lua:check_data_images)',
       btc_wallet_address, password_in_words, wallet_word,
-      my_victim, your_webcam, your_onan, broken_unicode),
+      my_victim, your_webcam, your_onan, broken_unicode, list_unsub),
   description = 'Contains password word and BTC wallet address',
   functions = {
     check_data_images = function(task)
@@ -130,10 +131,10 @@ local id = rspamd_config:register_symbol{
               local acc = base58_dec[ch] or 0
               for i=25,1,-1 do
                 acc = acc + (58 * bytes[i]);
-                bytes[i] = math.fmod(acc, 256);
-                acc = math.modf(acc / 256);
+                bytes[i] = acc % 256
+                acc = math.floor(acc / 256);
               end
-            end, fun.tail(word)) -- Tail due to first byte is version
+            end, word)
             -- Now create a validation tag
             local sha256 = hash.create_specific('sha256')
             for i=1,21 do
