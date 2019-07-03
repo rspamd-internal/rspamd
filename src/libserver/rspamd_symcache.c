@@ -442,7 +442,7 @@ rspamd_symcache_tsort_visit (struct rspamd_symcache *cache,
 		}
 	}
 	else if (TSORT_IS_MARKED_TEMP (it)) {
-		msg_err_cache ("cyclic dependencies found when checking '%s'!",
+		msg_debug_cache ("cyclic dependencies found when checking '%s'!",
 				it->symbol);
 		return;
 	}
@@ -1498,7 +1498,7 @@ rspamd_symcache_check_deps (struct rspamd_task *task,
 	struct rspamd_symcache_dynamic_item *dyn_item;
 
 	if (recursion > max_recursion) {
-		msg_err_task ("cyclic dependencies: maximum check level %ud exceed when "
+		msg_debug_cache ("cyclic dependencies: maximum check level %ud exceed when "
 				"checking dependencies for %s", max_recursion, item->symbol);
 
 		return TRUE;
