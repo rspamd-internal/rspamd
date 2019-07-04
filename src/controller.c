@@ -3236,7 +3236,7 @@ rspamd_controller_store_saved_stats (struct rspamd_controller_worker_ctx *ctx)
 	fd = open (ctx->saved_stats_path, O_WRONLY|O_CREAT|O_TRUNC, 00644);
 
 	if (fd == -1) {
-		msg_err_ctx ("cannot open for writing controller stats from %s: %s",
+		msg_debug_task ("cannot open for writing controller stats from %s: %s",
 				ctx->saved_stats_path, strerror (errno));
 		return;
 	}
