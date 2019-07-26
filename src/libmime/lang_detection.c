@@ -30,7 +30,7 @@
 #include <unicode/ustring.h>
 #include <math.h>
 
-static const gsize default_short_text_limit = 20;
+static const gsize default_short_text_limit = 10;
 static const gsize default_words = 80;
 static const gdouble update_prob = 0.6;
 static const gchar *default_languages_path = RSPAMD_SHAREDIR "/languages";
@@ -494,7 +494,8 @@ rspamd_language_detector_read_file (struct rspamd_config *cfg,
 					rspamd_ftok_t *tok;
 					gchar *dst;
 
-					tok = g_malloc (sizeof (*tok) + wlen + 1);
+					tok = rspamd_mempool_alloc (cfg->cfg_pool,
+							sizeof (*tok) + wlen + 1);
 					dst = ((gchar *)tok) + sizeof (*tok);
 					rspamd_strlcpy (dst, saved, wlen + 1);
 					tok->begin = dst;
@@ -737,8 +738,6 @@ static void
 rspamd_language_detector_dtor (struct rspamd_lang_detector *d)
 {
 	if (d) {
-		rspamd_ftok_t *tok;
-
 		for (guint i = 0; i < RSPAMD_LANGUAGE_MAX; i ++) {
 			kh_destroy (rspamd_trigram_hash, d->trigramms[i]);
 			rspamd_multipattern_destroy (d->stop_words[i].mp);
@@ -748,10 +747,6 @@ rspamd_language_detector_dtor (struct rspamd_lang_detector *d)
 		if (d->languages) {
 			g_ptr_array_free (d->languages, TRUE);
 		}
-
-		kh_foreach_key (d->stop_words_norm, tok, {
-			g_free (tok); /* String is embedded and freed automatically */
-		});
 
 		kh_destroy (rspamd_stopwords_hash, d->stop_words_norm);
 	}
@@ -1349,13 +1344,16 @@ rspamd_language_detector_cmp_heuristic (gconstpointer a, gconstpointer b,
 
 static void
 rspamd_language_detector_unicode_scripts (struct rspamd_task *task,
-										  struct rspamd_mime_text_part *part)
+										  struct rspamd_mime_text_part *part,
+										  guint *pchinese,
+										  guint *pspecial)
 {
 	const gchar *p = part->utf_stripped_content->data, *end;
-	guint i = 0;
+	guint i = 0, cnt = 0;
 	end = p + part->utf_stripped_content->len;
 	gint32 uc, sc;
 	guint nlatin = 0, nchinese = 0, nspecial = 0;
+	const guint cutoff_limit = 32;
 
 	while (p + i < end) {
 		U8_NEXT (p, i, part->utf_stripped_content->len, uc);
@@ -1366,6 +1364,7 @@ rspamd_language_detector_unicode_scripts (struct rspamd_task *task,
 
 		if (u_isalpha (uc)) {
 			sc = ublock_getCode (uc);
+			cnt ++;
 
 			switch (sc) {
 			case UBLOCK_BASIC_LATIN:
@@ -1446,10 +1445,10 @@ rspamd_language_detector_unicode_scripts (struct rspamd_task *task,
 			}
 		}
 
-		if (nspecial > 6 && nspecial > nlatin) {
+		if (nspecial > cutoff_limit && nspecial > nlatin) {
 			break;
 		}
-		else if (nchinese > 6 && nchinese > nlatin) {
+		else if (nchinese > cutoff_limit && nchinese > nlatin) {
 			if (nspecial > 0) {
 				/* Likely japanese */
 				break;
@@ -1459,7 +1458,10 @@ rspamd_language_detector_unicode_scripts (struct rspamd_task *task,
 
 	msg_debug_lang_det ("stop after checking %d characters, "
 						"%d latin, %d special, %d chinese",
-			i, nlatin, nspecial, nchinese);
+			cnt, nlatin, nspecial, nchinese);
+
+	*pchinese = nchinese;
+	*pspecial = nspecial;
 }
 
 static inline void
@@ -1483,22 +1485,48 @@ rspamd_language_detector_set_language (struct rspamd_task *task,
 
 static gboolean
 rspamd_language_detector_try_uniscript (struct rspamd_task *task,
-										struct rspamd_mime_text_part *part)
+										struct rspamd_mime_text_part *part,
+										guint nchinese,
+										guint nspecial)
 {
 	guint i;
 
 	for (i = 0; i < G_N_ELEMENTS (unicode_langs); i ++) {
 		if (unicode_langs[i].unicode_code & part->unicode_scripts) {
-			msg_debug_lang_det ("set language based on unicode script %s",
-					unicode_langs[i].lang);
-			rspamd_language_detector_set_language (task, part,
-					unicode_langs[i].lang);
 
-			return TRUE;
+			if (unicode_langs[i].unicode_code != RSPAMD_UNICODE_JP) {
+				msg_debug_lang_det ("set language based on unicode script %s",
+						unicode_langs[i].lang);
+				rspamd_language_detector_set_language (task, part,
+						unicode_langs[i].lang);
+
+				return TRUE;
+			}
+			else {
+				/* Japanese <-> Chinese guess */
+
+				/*
+				 * Typically there might be around 0-70% of kanji glyphs
+				 * and the rest are Haragana/Katakana
+				 *
+				 * If we discover that Kanji is more than 80% then we consider
+				 * it Chinese
+				 */
+				if (nchinese <= 5 || nchinese < nspecial * 5) {
+					msg_debug_lang_det ("set language based on unicode script %s",
+							unicode_langs[i].lang);
+					rspamd_language_detector_set_language (task, part,
+							unicode_langs[i].lang);
+
+					return TRUE;
+				}
+			}
 		}
 	}
 
 	if (part->unicode_scripts & RSPAMD_UNICODE_CJK) {
+		msg_debug_lang_det ("guess chinese based on CJK characters: %d chinese, %d special",
+				nchinese, nspecial);
 		rspamd_language_detector_set_language (task, part,
 				"zh-CN");
 
@@ -1562,6 +1590,7 @@ rspamd_language_detector_sw_cb (struct rspamd_multipattern *mp,
 	struct rspamd_stop_word_range *r;
 	struct rspamd_sw_cbdata *cbdata = (struct rspamd_sw_cbdata *)context;
 	khiter_t k;
+	static const gsize max_stop_words = 80;
 
 	if (match_start > 0) {
 		prev = text + match_start - 1;
@@ -1588,6 +1617,10 @@ rspamd_language_detector_sw_cb (struct rspamd_multipattern *mp,
 
 	if (k != kh_end (cbdata->res)) {
 		kh_value (cbdata->res, k) ++;
+
+		if (kh_value (cbdata->res, k) > max_stop_words) {
+			return 1;
+		}
 	}
 	else {
 		gint tt;
@@ -1642,6 +1675,9 @@ rspamd_language_detector_try_stop_words (struct rspamd_task *task,
 			ret = TRUE;
 		}
 	}
+	else {
+		msg_debug_lang_det ("found no stop words in a text");
+	}
 
 	kh_destroy (rspamd_sw_hash, cbdata.res);
 
@@ -1670,10 +1706,11 @@ rspamd_language_detector_detect (struct rspamd_task *task,
 
 	start_ticks = rspamd_get_ticks (TRUE);
 
-	rspamd_language_detector_unicode_scripts (task, part);
+	guint nchinese = 0, nspecial = 0;
+	rspamd_language_detector_unicode_scripts (task, part, &nchinese, &nspecial);
 	/* Apply unicode scripts heuristic */
 
-	if (rspamd_language_detector_try_uniscript (task, part)) {
+	if (rspamd_language_detector_try_uniscript (task, part, nchinese, nspecial)) {
 		ret = TRUE;
 	}
 
@@ -1684,13 +1721,30 @@ rspamd_language_detector_detect (struct rspamd_task *task,
 	}
 
 	if (!ret) {
-		if (part->nwords < default_short_text_limit) {
+		if (part->utf_words->len < default_short_text_limit) {
 			r = rs_detect_none;
 			msg_debug_lang_det ("text is too short for trigramms detection: "
 					   "%d words; at least %d words required",
-					(int)part->nwords,
+					(int)part->utf_words->len,
 					(int)default_short_text_limit);
-			rspamd_language_detector_set_language (task, part, "en");
+			switch (cat) {
+			case RSPAMD_LANGUAGE_CYRILLIC:
+				rspamd_language_detector_set_language (task, part, "ru");
+				break;
+			case RSPAMD_LANGUAGE_DEVANAGARI:
+				rspamd_language_detector_set_language (task, part, "hi");
+				break;
+			case RSPAMD_LANGUAGE_ARAB:
+				rspamd_language_detector_set_language (task, part, "ar");
+				break;
+			default:
+			case RSPAMD_LANGUAGE_LATIN:
+				rspamd_language_detector_set_language (task, part, "en");
+				break;
+			}
+			msg_debug_lang_det ("set %s language based on symbols category",
+					part->language);
+
 			candidates = kh_init (rspamd_candidates_hash);
 		}
 		else {
@@ -1777,6 +1831,10 @@ rspamd_language_detector_detect (struct rspamd_task *task,
 				cand = g_ptr_array_index (result, 0);
 				cand->elt->occurencies++;
 				d->total_occurencies++;
+			}
+
+			if (part->languages != NULL) {
+				g_ptr_array_unref (part->languages);
 			}
 
 			part->languages = result;

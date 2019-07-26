@@ -17,6 +17,7 @@ limitations under the License.
 local logger = require "rspamd_logger"
 local lua_util = require "lua_util"
 local rspamd_util = require "rspamd_util"
+local fun = require "fun"
 
 local function is_implicit(t)
   local mt = getmetatable(t)
@@ -301,8 +302,29 @@ return function(cfg)
   end
 
   -- Deal with dkim settings
-  if not cfg.dkim then cfg.dkim = {} end
+  if not cfg.dkim then
+    cfg.dkim = {}
+  else
+    if cfg.dkim.sign_condition then
+      -- We have an obsoleted sign condition, so we need to either add dkim_signing and move it
+      -- there or just move sign condition there...
+      if not cfg.dkim_signing then
+        logger.warnx('obsoleted DKIM signing method used, converting it to "dkim_signing" module')
+        cfg.dkim_signing = {
+          sign_condition = cfg.dkim.sign_condition
+        }
+      else
+        if not cfg.dkim_signing.sign_condition then
+          logger.warnx('obsoleted DKIM signing method used, move it to "dkim_signing" module')
+          cfg.dkim_signing.sign_condition = cfg.dkim.sign_condition
+        else
+          logger.warnx('obsoleted DKIM signing method used, ignore it as "dkim_signing" also defines condition!')
+        end
+      end
+    end
+  end
 
+  -- Again: legacy stuff :(
   if not cfg.dkim.sign_headers then
     local sec = cfg.dkim_signing
     if sec and sec[1] then sec = cfg.dkim_signing[1] end
@@ -322,6 +344,55 @@ return function(cfg)
     if type(v) == 'table' and v[k] and type (v[k]) == 'table' then
       logger.errx('nested section: %s { %s { ... } }, it is likely a configuration error',
               k, k)
+    end
+  end
+
+  -- If neural network is enabled we MUST have `check_all_filters` flag
+  if cfg.neural then
+    if not cfg.options then
+      cfg.options = {}
+    end
+
+    if not cfg.options.check_all_filters then
+      logger.infox(rspamd_config, 'enable `options.check_all_filters` for neural network')
+      cfg.options.check_all_filters = true
+    end
+  end
+
+  -- Deal with IP_SCORE
+  if cfg.ip_score then
+    logger.warnx(rspamd_config, 'ip_score module is deprecated in honor of reputation module!')
+
+    if not cfg.reputation then
+      cfg.reputation = {
+        rules = {}
+      }
+    end
+
+    if not fun.any(function(_, v) return v.selector and v.selector.ip end,
+        cfg.reputation.rules) then
+      logger.infox(rspamd_config, 'attach ip reputation element to use it')
+
+      cfg.reputation.rules.ip_score = {
+        selector = {
+          ip = {},
+        },
+        backend = {
+          redis = {},
+        }
+      }
+
+      if cfg.symbols['IP_SCORE'] then
+        local t = cfg.symbols['IP_SCORE']
+
+        if not cfg.symbols['SENDER_REP_SPAM'] then
+          cfg.symbols['SENDER_REP_SPAM'] = t
+          cfg.symbols['SENDER_REP_HAM'] = t
+          cfg.symbols['SENDER_REP_HAM'].weight = -(t.weight or 0)
+        end
+      end
+    else
+      logger.infox(rspamd_config, 'ip reputation already exists, do not do any IP_SCORE transforms')
     end
   end
 

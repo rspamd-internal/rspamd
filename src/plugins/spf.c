@@ -300,11 +300,26 @@ spf_module_config (struct rspamd_config *cfg)
 	}
 
 	cb_id = rspamd_symcache_add_symbol (cfg->cache,
-			spf_module_ctx->symbol_fail,
+			"SPF_CHECK",
 			0,
 			spf_symbol_callback,
 			NULL,
-			SYMBOL_TYPE_NORMAL | SYMBOL_TYPE_FINE | SYMBOL_TYPE_EMPTY, -1);
+			SYMBOL_TYPE_CALLBACK | SYMBOL_TYPE_FINE | SYMBOL_TYPE_EMPTY, -1);
+	rspamd_config_add_symbol (cfg,
+			"SPF_CHECK",
+			0.0,
+			"SPF check callback",
+			"policies",
+			RSPAMD_SYMBOL_FLAG_IGNORE,
+			1,
+			1);
+	rspamd_config_add_symbol_group (cfg, "SPF_CHECK", "spf");
+
+	rspamd_symcache_add_symbol (cfg->cache,
+			spf_module_ctx->symbol_fail, 0,
+			NULL, NULL,
+			SYMBOL_TYPE_VIRTUAL,
+			cb_id);
 	rspamd_symcache_add_symbol (cfg->cache,
 			spf_module_ctx->symbol_softfail, 0,
 			NULL, NULL,
@@ -336,19 +351,21 @@ spf_module_config (struct rspamd_config *cfg)
 			SYMBOL_TYPE_VIRTUAL,
 			cb_id);
 
-	spf_module_ctx->spf_hash = rspamd_lru_hash_new (
-			cache_size,
-			NULL,
-			(GDestroyNotify)spf_record_unref);
+	if (cache_size > 0) {
+		spf_module_ctx->spf_hash = rspamd_lru_hash_new (
+				cache_size,
+				NULL,
+				(GDestroyNotify) spf_record_unref);
+		rspamd_mempool_add_destructor (cfg->cfg_pool,
+				(rspamd_mempool_destruct_t)rspamd_lru_hash_destroy,
+				spf_module_ctx->spf_hash);
+	}
 
-	msg_info_config ("init internal spf module");
-
-	rspamd_mempool_add_destructor (cfg->cfg_pool,
-			(rspamd_mempool_destruct_t)rspamd_lru_hash_destroy,
-			spf_module_ctx->spf_hash);
 	rspamd_mempool_add_destructor (cfg->cfg_pool,
 			(rspamd_mempool_destruct_t)rspamd_map_helper_destroy_radix,
 			spf_module_ctx->whitelist_ip);
+
+	msg_info_config ("init internal spf module");
 
 	return res;
 }
@@ -528,7 +545,7 @@ static void
 spf_plugin_callback (struct spf_resolved *record, struct rspamd_task *task,
 		gpointer ud)
 {
-	struct spf_resolved *l;
+	struct spf_resolved *l = NULL;
 	struct rspamd_symcache_item *item = (struct rspamd_symcache_item *)ud;
 	struct spf_ctx *spf_module_ctx = spf_get_context (task->cfg);
 
@@ -560,8 +577,9 @@ spf_plugin_callback (struct spf_resolved *record, struct rspamd_task *task,
 
 		spf_record_ref (record);
 
-		if ((l = rspamd_lru_hash_lookup (spf_module_ctx->spf_hash,
-					record->domain, task->tv.tv_sec)) == NULL) {
+		if (!spf_module_ctx->spf_hash ||
+			(l = rspamd_lru_hash_lookup (spf_module_ctx->spf_hash,
+					record->domain, task->task_timestamp)) == NULL) {
 			l = record;
 
 			if (record->ttl > 0 &&
@@ -569,17 +587,19 @@ spf_plugin_callback (struct spf_resolved *record, struct rspamd_task *task,
 					!record->perm_failed &&
 					!record->na) {
 
-				rspamd_lru_hash_insert (spf_module_ctx->spf_hash,
-						record->domain, spf_record_ref (l),
-						task->tv.tv_sec, record->ttl);
+				if (spf_module_ctx->spf_hash) {
+					rspamd_lru_hash_insert (spf_module_ctx->spf_hash,
+							record->domain, spf_record_ref (l),
+							task->task_timestamp, record->ttl);
 
-				msg_info_task ("stored record for %s (0x%xuL) in LRU cache for %d seconds, "
-							   "%d/%d elements in the cache",
-						record->domain,
-						record->digest,
-						record->ttl,
-						rspamd_lru_hash_size (spf_module_ctx->spf_hash),
-						rspamd_lru_hash_capacity (spf_module_ctx->spf_hash));
+					msg_info_task ("stored record for %s (0x%xuL) in LRU cache for %d seconds, "
+								   "%d/%d elements in the cache",
+							record->domain,
+							record->digest,
+							record->ttl,
+							rspamd_lru_hash_size (spf_module_ctx->spf_hash),
+							rspamd_lru_hash_capacity (spf_module_ctx->spf_hash));
+				}
 			}
 
 		}
@@ -640,9 +660,9 @@ spf_symbol_callback (struct rspamd_task *task,
 	rspamd_symcache_item_async_inc (task, item, M);
 
 	if (domain) {
-		if ((l =
-			rspamd_lru_hash_lookup (spf_module_ctx->spf_hash, domain,
-			task->tv.tv_sec)) != NULL) {
+		if (spf_module_ctx->spf_hash &&
+				(l = rspamd_lru_hash_lookup (spf_module_ctx->spf_hash, domain,
+					task->task_timestamp)) != NULL) {
 			spf_record_ref (l);
 			spf_check_list (l, task, TRUE);
 			spf_record_unref (l);
@@ -650,8 +670,7 @@ spf_symbol_callback (struct rspamd_task *task,
 		else {
 
 			if (!rspamd_spf_resolve (task, spf_plugin_callback, item)) {
-				msg_info_task ("cannot make spf request for [%s]",
-						task->message_id);
+				msg_info_task ("cannot make spf request for %s", domain);
 				rspamd_task_insert_result (task,
 						spf_module_ctx->symbol_dnsfail,
 						1,

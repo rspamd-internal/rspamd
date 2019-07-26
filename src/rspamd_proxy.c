@@ -86,7 +86,6 @@ struct rspamd_http_upstream {
 	struct upstream_list *u;
 	struct rspamd_cryptobox_pubkey *key;
 	gdouble timeout;
-	struct timeval io_tv;
 	gint parser_from_ref;
 	gint parser_to_ref;
 	gboolean local;
@@ -101,7 +100,6 @@ struct rspamd_http_mirror {
 	struct rspamd_cryptobox_pubkey *key;
 	gdouble prob;
 	gdouble timeout;
-	struct timeval io_tv;
 	gint parser_from_ref;
 	gint parser_to_ref;
 	gboolean local;
@@ -113,14 +111,13 @@ static const guint64 rspamd_rspamd_proxy_magic = 0xcdeb4fd1fc351980ULL;
 struct rspamd_proxy_ctx {
 	guint64 magic;
 	/* Events base */
-	struct event_base *ev_base;
+	struct ev_loop *event_loop;
 	/* DNS resolver */
 	struct rspamd_dns_resolver *resolver;
 	/* Config */
 	struct rspamd_config *cfg;
 	/* END OF COMMON PART */
 	gdouble timeout;
-	struct timeval io_tv;
 	/* Encryption key for clients */
 	struct rspamd_cryptobox_keypair *key;
 	/* HTTP context */
@@ -174,8 +171,8 @@ struct rspamd_proxy_backend_connection {
 	ucl_object_t *results;
 	const gchar *err;
 	struct rspamd_proxy_session *s;
-	struct timeval *io_tv;
 	gint backend_sock;
+	ev_tstamp timeout;
 	enum rspamd_backend_flags flags;
 	gint parser_from_ref;
 	gint parser_to_ref;
@@ -224,7 +221,6 @@ rspamd_proxy_parse_lua_parser (lua_State *L, const ucl_object_t *obj,
 	const gchar *lua_script;
 	gsize slen;
 	gint err_idx, ref_idx;
-	GString *tb = NULL;
 	gboolean has_ref = FALSE;
 
 	g_assert (obj != NULL);
@@ -252,13 +248,11 @@ rspamd_proxy_parse_lua_parser (lua_State *L, const ucl_object_t *obj,
 
 	/* Now do it */
 	if (lua_pcall (L, 0, 1, err_idx) != 0) {
-		tb = lua_touserdata (L, -1);
 		g_set_error (err,
 				rspamd_proxy_quark (),
 				EINVAL,
 				"cannot init lua parser script: %s",
-				tb->str);
-		g_string_free (tb, TRUE);
+				lua_tostring (L, -1));
 		lua_settop (L, 0);
 
 		return FALSE;
@@ -467,8 +461,6 @@ rspamd_proxy_parse_upstream (rspamd_mempool_t *pool,
 		rspamd_lua_add_ref_dtor (L, pool, up->parser_to_ref);
 	}
 
-	double_to_tv (up->timeout, &up->io_tv);
-
 	g_hash_table_insert (ctx->upstreams, up->name, up);
 
 	return TRUE;
@@ -620,8 +612,6 @@ rspamd_proxy_parse_mirror (rspamd_mempool_t *pool,
 		up->settings_id = rspamd_mempool_strdup (pool, ucl_object_tostring (elt));
 	}
 
-	double_to_tv (up->timeout, &up->io_tv);
-
 	g_ptr_array_add (ctx->mirrors, up);
 
 	return TRUE;
@@ -644,7 +634,6 @@ rspamd_proxy_parse_script (rspamd_mempool_t *pool,
 	const gchar *lua_script;
 	gsize slen;
 	gint err_idx, ref_idx;
-	GString *tb = NULL;
 	struct stat st;
 
 	ctx = pd->user_struct;
@@ -690,13 +679,11 @@ rspamd_proxy_parse_script (rspamd_mempool_t *pool,
 
 	/* Now do it */
 	if (lua_pcall (L, 0, 1, err_idx) != 0) {
-		tb = lua_touserdata (L, -1);
 		g_set_error (err,
 				rspamd_proxy_quark (),
 				EINVAL,
 				"cannot init lua parser script: %s",
-				tb->str);
-		g_string_free (tb, TRUE);
+				lua_tostring (L, -1));
 		lua_settop (L, 0);
 
 		goto err;
@@ -867,16 +854,34 @@ proxy_backend_close_connection (struct rspamd_proxy_backend_connection *conn)
 
 static gboolean
 proxy_backend_parse_results (struct rspamd_proxy_session *session,
-		struct rspamd_proxy_backend_connection *conn,
-		lua_State *L, gint parser_ref,
-		const gchar *in, gsize inlen)
+							 struct rspamd_proxy_backend_connection *conn,
+							 lua_State *L, gint parser_ref,
+							 struct rspamd_http_message *msg,
+							 goffset *body_offset)
 {
 	struct ucl_parser *parser;
-	GString *tb = NULL;
 	gint err_idx;
+	const gchar *in = msg->body_buf.begin;
+	gsize inlen = msg->body_buf.len;
+	const rspamd_ftok_t *offset_hdr;
 
 	if (inlen == 0 || in == NULL) {
 		return FALSE;
+	}
+
+	offset_hdr = rspamd_http_message_find_header (msg, MESSAGE_OFFSET_HEADER);
+
+	if (offset_hdr) {
+		gulong val;
+
+		if (rspamd_strtoul (offset_hdr->begin, offset_hdr->len, &val)
+			&& val < inlen) {
+
+			if (body_offset) {
+				*body_offset = val;
+			}
+			inlen = val;
+		}
 	}
 
 	if (parser_ref != -1) {
@@ -889,11 +894,9 @@ proxy_backend_parse_results (struct rspamd_proxy_session *session,
 		lua_pushlstring (L, in, inlen);
 
 		if (lua_pcall (L, 1, 1, err_idx) != 0) {
-			tb = lua_touserdata (L, -1);
 			msg_err_session (
 					"cannot run lua parser script: %s",
-					tb->str);
-			g_string_free (tb, TRUE);
+					lua_tostring (L, -1));
 			lua_settop (L, 0);
 
 			return FALSE;
@@ -928,7 +931,6 @@ proxy_backend_parse_results (struct rspamd_proxy_session *session,
 static void
 proxy_call_cmp_script (struct rspamd_proxy_session *session, gint cbref)
 {
-	GString *tb = NULL;
 	gint err_idx;
 	guint i;
 	struct rspamd_proxy_backend_connection *conn;
@@ -969,11 +971,9 @@ proxy_call_cmp_script (struct rspamd_proxy_session *session, gint cbref)
 	}
 
 	if (lua_pcall (L, 1, 0, err_idx) != 0) {
-		tb = lua_touserdata (L, -1);
 		msg_err_session (
 				"cannot run lua compare script: %s",
-				tb->str);
-		g_string_free (tb, TRUE);
+				lua_tostring (L, -1));
 	}
 
 	lua_settop (L, 0);
@@ -1066,7 +1066,7 @@ proxy_request_compress (struct rspamd_http_message *msg)
 
 	flags = rspamd_http_message_get_flags (msg);
 
-	if (!rspamd_http_message_find_header (msg, "Compression")) {
+	if (!rspamd_http_message_find_header (msg, COMPRESSION_HEADER)) {
 		if ((flags & RSPAMD_HTTP_FLAG_SHMEM) ||
 				!(flags & RSPAMD_HTTP_FLAG_HAS_BODY)) {
 			/* Cannot compress shared or empty message */
@@ -1094,7 +1094,7 @@ proxy_request_compress (struct rspamd_http_message *msg)
 
 		ZSTD_freeCCtx (zctx);
 		rspamd_http_message_set_body_from_fstring_steal (msg, body);
-		rspamd_http_message_add_header (msg, "Compression", "zstd");
+		rspamd_http_message_add_header (msg, COMPRESSION_HEADER, "zstd");
 	}
 }
 
@@ -1108,7 +1108,7 @@ proxy_request_decompress (struct rspamd_http_message *msg)
 	ZSTD_inBuffer zin;
 	ZSTD_outBuffer zout;
 
-	if (rspamd_http_message_find_header (msg, "Compression")) {
+	if (rspamd_http_message_find_header (msg, COMPRESSION_HEADER)) {
 		in = rspamd_http_message_get_body (msg, &inlen);
 
 		if (in == NULL || inlen == 0) {
@@ -1154,10 +1154,8 @@ proxy_request_decompress (struct rspamd_http_message *msg)
 		body->len = zout.pos;
 		ZSTD_freeDStream (zstream);
 		rspamd_http_message_set_body_from_fstring_steal (msg, body);
-		rspamd_http_message_remove_header (msg, "Compression");
+		rspamd_http_message_remove_header (msg, COMPRESSION_HEADER);
 	}
-
-	return;
 }
 
 static struct rspamd_proxy_session *
@@ -1321,7 +1319,7 @@ proxy_backend_mirror_finish_handler (struct rspamd_http_connection *conn,
 	proxy_request_decompress (msg);
 
 	if (!proxy_backend_parse_results (session, bk_conn, session->ctx->lua_state,
-			bk_conn->parser_from_ref, msg->body_buf.begin, msg->body_buf.len)) {
+			bk_conn->parser_from_ref, msg, NULL)) {
 		msg_warn_session ("cannot parse results from the mirror backend %s:%s",
 				bk_conn->name,
 				rspamd_inet_address_to_string (
@@ -1362,7 +1360,7 @@ proxy_open_mirror_connections (struct rspamd_proxy_session *session)
 				sizeof (*bk_conn));
 		bk_conn->s = session;
 		bk_conn->name = m->name;
-		bk_conn->io_tv = &m->io_tv;
+		bk_conn->timeout = m->timeout;
 
 		bk_conn->up = rspamd_upstream_get (m->u,
 				RSPAMD_UPSTREAM_ROUND_ROBIN, NULL, 0);
@@ -1427,7 +1425,7 @@ proxy_open_mirror_connections (struct rspamd_proxy_session *session)
 			msg->method = HTTP_GET;
 			rspamd_http_connection_write_message_shared (bk_conn->backend_conn,
 					msg, NULL, NULL, bk_conn,
-					bk_conn->io_tv);
+					bk_conn->timeout);
 		}
 		else {
 			if (session->fname) {
@@ -1454,7 +1452,7 @@ proxy_open_mirror_connections (struct rspamd_proxy_session *session)
 
 			rspamd_http_connection_write_message (bk_conn->backend_conn,
 					msg, NULL, NULL, bk_conn,
-					bk_conn->io_tv);
+					bk_conn->timeout);
 		}
 
 		g_ptr_array_add (session->mirror_conns, bk_conn);
@@ -1480,7 +1478,7 @@ proxy_client_write_error (struct rspamd_proxy_session *session, gint code,
 		reply->status = rspamd_fstring_new_init (status, strlen (status));
 		rspamd_http_connection_write_message (session->client_conn,
 				reply, NULL, NULL, session,
-				&session->ctx->io_tv);
+				session->ctx->timeout);
 	}
 }
 
@@ -1524,11 +1522,12 @@ proxy_backend_master_error_handler (struct rspamd_http_connection *conn, GError 
 
 static gint
 proxy_backend_master_finish_handler (struct rspamd_http_connection *conn,
-	struct rspamd_http_message *msg)
+									 struct rspamd_http_message *msg)
 {
 	struct rspamd_proxy_backend_connection *bk_conn = conn->ud;
 	struct rspamd_proxy_session *session, *nsession;
 	rspamd_fstring_t *reply;
+	goffset body_offset = -1;
 
 	session = bk_conn->s;
 	rspamd_http_connection_steal_msg (session->master_conn->backend_conn);
@@ -1539,7 +1538,7 @@ proxy_backend_master_finish_handler (struct rspamd_http_connection *conn,
 	rspamd_http_connection_reset (session->master_conn->backend_conn);
 
 	if (!proxy_backend_parse_results (session, bk_conn, session->ctx->lua_state,
-			bk_conn->parser_from_ref, msg->body_buf.begin, msg->body_buf.len)) {
+			bk_conn->parser_from_ref, msg, &body_offset)) {
 		msg_warn_session ("cannot parse results from the master backend");
 	}
 
@@ -1570,15 +1569,24 @@ proxy_backend_master_finish_handler (struct rspamd_http_connection *conn,
 
 	if (session->client_milter_conn) {
 		nsession = proxy_session_refresh (session);
-		rspamd_milter_send_task_results (nsession->client_milter_conn,
-				session->master_conn->results);
+
+		if (body_offset > 0) {
+			rspamd_milter_send_task_results (nsession->client_milter_conn,
+					session->master_conn->results,
+					msg->body_buf.begin + body_offset,
+					msg->body_buf.len - body_offset);
+		}
+		else {
+			rspamd_milter_send_task_results (nsession->client_milter_conn,
+					session->master_conn->results, NULL, 0);
+		}
 		REF_RELEASE (session);
 		rspamd_http_message_free (msg);
 	}
 	else {
 		rspamd_http_connection_write_message (session->client_conn,
 				msg, NULL, NULL, session,
-				bk_conn->io_tv);
+				bk_conn->timeout);
 	}
 
 	return 0;
@@ -1597,12 +1605,10 @@ rspamd_proxy_scan_self_reply (struct rspamd_task *task)
 	msg->code = 200;
 
 	switch (task->cmd) {
-	case CMD_REPORT_IFSPAM:
-	case CMD_REPORT:
 	case CMD_CHECK:
-	case CMD_SYMBOLS:
-	case CMD_PROCESS:
 	case CMD_SKIP:
+	case CMD_CHECK_RSPAMC:
+	case CMD_CHECK_SPAMC:
 	case CMD_CHECK_V2:
 		rspamd_task_set_finish_time (task);
 		rspamd_protocol_http_reply (msg, task, &rep);
@@ -1612,7 +1618,7 @@ rspamd_proxy_scan_self_reply (struct rspamd_task *task)
 		rspamd_http_message_set_body (msg, "pong" CRLF, 6);
 		ctype = "text/plain";
 		break;
-	case CMD_OTHER:
+	default:
 		msg_err_task ("BROKEN");
 		break;
 	}
@@ -1625,8 +1631,50 @@ rspamd_proxy_scan_self_reply (struct rspamd_task *task)
 
 	if (session->client_milter_conn) {
 		nsession = proxy_session_refresh (session);
-		rspamd_milter_send_task_results (nsession->client_milter_conn,
-				session->master_conn->results);
+
+		if (task->flags & RSPAMD_TASK_FLAG_MESSAGE_REWRITE) {
+			const gchar *start;
+			goffset len, hdr_off;
+
+			start = task->msg.begin;
+			len = task->msg.len;
+
+			hdr_off = MESSAGE_FIELD (task, raw_headers_content).len;
+
+			if (hdr_off < len) {
+				start += hdr_off;
+				len -= hdr_off;
+
+				/* The problem here is that we need not end of headers, we need
+				 * start of body.
+				 *
+				 * Hence, we need to skip one \r\n till there is anything else in
+				 * a line.
+				 */
+
+				if (*start == '\r' && len > 0) {
+					start++;
+					len--;
+				}
+
+				if (*start == '\n' && len > 0) {
+					start++;
+					len--;
+				}
+
+				rspamd_milter_send_task_results (nsession->client_milter_conn,
+						session->master_conn->results, start, len);
+			}
+			else {
+				/* XXX: should never happen! */
+				rspamd_milter_send_task_results (nsession->client_milter_conn,
+						session->master_conn->results, NULL, 0);
+			}
+		}
+		else {
+			rspamd_milter_send_task_results (nsession->client_milter_conn,
+					session->master_conn->results, NULL, 0);
+		}
 		rspamd_http_message_free (msg);
 		REF_RELEASE (session);
 	}
@@ -1637,7 +1685,7 @@ rspamd_proxy_scan_self_reply (struct rspamd_task *task)
 				NULL,
 				ctype,
 				session,
-				NULL);
+				0);
 	}
 }
 
@@ -1678,7 +1726,7 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 	msg = session->client_message;
 	task = rspamd_task_new (session->worker, session->ctx->cfg,
 			session->pool, session->ctx->lang_det,
-			session->ctx->ev_base);
+			session->ctx->event_loop);
 	task->flags |= RSPAMD_TASK_FLAG_MIME;
 	task->sock = -1;
 
@@ -1723,23 +1771,18 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 
 	/* Set global timeout for the task */
 	if (session->ctx->default_upstream->timeout > 0.0) {
-		struct timeval task_tv;
+		task->timeout_ev.data = task;
+		ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
+				session->ctx->default_upstream->timeout, 0.0);
+		ev_timer_start (task->event_loop, &task->timeout_ev);
 
-		event_set (&task->timeout_ev, -1, EV_TIMEOUT, rspamd_task_timeout,
-				task);
-		event_base_set (session->ctx->ev_base, &task->timeout_ev);
-		double_to_tv (session->ctx->default_upstream->timeout, &task_tv);
-		event_add (&task->timeout_ev, &task_tv);
 	}
 	else if (session->ctx->has_self_scan) {
 		if (session->ctx->cfg->task_timeout > 0) {
-			struct timeval task_tv;
-
-			event_set (&task->timeout_ev, -1, EV_TIMEOUT, rspamd_task_timeout,
-					task);
-			event_base_set (session->ctx->ev_base, &task->timeout_ev);
-			double_to_tv (session->ctx->cfg->task_timeout, &task_tv);
-			event_add (&task->timeout_ev, &task_tv);
+			task->timeout_ev.data = task;
+			ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
+					session->ctx->cfg->task_timeout, 0.0);
+			ev_timer_start (task->event_loop, &task->timeout_ev);
 		}
 	}
 
@@ -1795,7 +1838,7 @@ retry:
 
 		session->master_conn->up = rspamd_upstream_get (backend->u,
 				RSPAMD_UPSTREAM_ROUND_ROBIN, NULL, 0);
-		session->master_conn->io_tv = &backend->io_tv;
+		session->master_conn->timeout = backend->timeout;
 
 		if (session->master_conn->up == NULL) {
 			msg_err_session ("cannot select upstream for %s",
@@ -1865,7 +1908,7 @@ retry:
 			rspamd_http_connection_write_message_shared (
 					session->master_conn->backend_conn,
 					msg, NULL, NULL, session->master_conn,
-					session->master_conn->io_tv);
+					session->master_conn->timeout);
 		}
 		else {
 			if (session->fname) {
@@ -1893,7 +1936,7 @@ retry:
 			rspamd_http_connection_write_message (
 					session->master_conn->backend_conn,
 					msg, NULL, NULL, session->master_conn,
-					session->master_conn->io_tv);
+					session->master_conn->timeout);
 		}
 	}
 
@@ -2043,9 +2086,9 @@ proxy_milter_error_handler (gint fd,
 }
 
 static void
-proxy_accept_socket (gint fd, short what, void *arg)
+proxy_accept_socket (EV_P_ ev_io *w, int revents)
 {
-	struct rspamd_worker *worker = (struct rspamd_worker *) arg;
+	struct rspamd_worker *worker = (struct rspamd_worker *)w->data;
 	struct rspamd_proxy_ctx *ctx;
 	rspamd_inet_addr_t *addr;
 	struct rspamd_proxy_session *session;
@@ -2054,7 +2097,8 @@ proxy_accept_socket (gint fd, short what, void *arg)
 	ctx = worker->ctx;
 
 	if ((nfd =
-		rspamd_accept_from_socket (fd, &addr, worker->accept_events)) == -1) {
+		rspamd_accept_from_socket (w->fd, &addr,
+				rspamd_worker_throttle_accept_events, worker->accept_events)) == -1) {
 		msg_warn ("accept failed: %s", strerror (errno));
 		return;
 	}
@@ -2098,7 +2142,7 @@ proxy_accept_socket (gint fd, short what, void *arg)
 
 		rspamd_http_connection_read_message_shared (session->client_conn,
 				session,
-				&ctx->io_tv);
+				session->ctx->timeout);
 	}
 	else {
 		msg_info_session ("accepted milter connection from %s port %d",
@@ -2122,9 +2166,9 @@ proxy_accept_socket (gint fd, short what, void *arg)
 		}
 #endif
 
-		rspamd_milter_handle_socket (nfd, NULL,
+		rspamd_milter_handle_socket (nfd, 0.0,
 				session->pool,
-				ctx->ev_base,
+				ctx->event_loop,
 				proxy_milter_finish_handler,
 				proxy_milter_error_handler,
 				session);
@@ -2165,30 +2209,30 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 	struct rspamd_proxy_ctx *ctx = worker->ctx;
 
 	ctx->cfg = worker->srv->cfg;
-	ctx->ev_base = rspamd_prepare_worker (worker, "rspamd_proxy",
+	ctx->event_loop = rspamd_prepare_worker (worker, "rspamd_proxy",
 			proxy_accept_socket);
 
 	ctx->resolver = rspamd_dns_resolver_init (worker->srv->logger,
-			ctx->ev_base,
+			ctx->event_loop,
 			worker->srv->cfg);
-	double_to_tv (ctx->timeout, &ctx->io_tv);
-	rspamd_map_watch (worker->srv->cfg, ctx->ev_base, ctx->resolver, worker, 0);
+	rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver, worker, 0);
 
 	rspamd_upstreams_library_config (worker->srv->cfg, ctx->cfg->ups_ctx,
-			ctx->ev_base, ctx->resolver->r);
+			ctx->event_loop, ctx->resolver->r);
 
-	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->ev_base,
+	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->event_loop,
 			ctx->cfg->ups_ctx);
 
 	if (ctx->has_self_scan) {
 		/* Additional initialisation needed */
-		rspamd_worker_init_scanner (worker, ctx->ev_base, ctx->resolver,
+		rspamd_worker_init_scanner (worker, ctx->event_loop, ctx->resolver,
 				&ctx->lang_det);
+
 	}
 
 	if (worker->srv->cfg->enable_sessions_cache) {
 		ctx->sessions_cache = rspamd_worker_session_cache_new (worker,
-				ctx->ev_base);
+				ctx->event_loop);
 	}
 
 	ctx->milter_ctx.spam_header = ctx->spam_header;
@@ -2200,11 +2244,11 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 	ctx->milter_ctx.cfg = ctx->cfg;
 	rspamd_milter_init_library (&ctx->milter_ctx);
 
-	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->ev_base,
+	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop,
 			worker);
 	adjust_upstreams_limits (ctx);
 
-	event_base_loop (ctx->ev_base, 0);
+	ev_loop (ctx->event_loop, 0);
 	rspamd_worker_block_signals ();
 
 	if (ctx->has_self_scan) {

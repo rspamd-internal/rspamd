@@ -89,11 +89,9 @@ ADD_SUBDIRECTORY(rspamadm)
 
 SET(RSPAMDSRC	controller.c
 				fuzzy_storage.c
-				lua_worker.c
 				rspamd.c
 				worker.c
-				rspamd_proxy.c
-				log_helper.c)
+				rspamd_proxy.c)
 
 SET(PLUGINSSRC	plugins/surbl.c
 				plugins/regexp.c
@@ -101,11 +99,10 @@ SET(PLUGINSSRC	plugins/surbl.c
 				plugins/fuzzy_check.c
 				plugins/spf.c
 				plugins/dkim_check.c
-				libserver/rspamd_control.c
-				lua/lua_fann.c)
+				libserver/rspamd_control.c)
 
 SET(MODULES_LIST surbl regexp chartable fuzzy_check spf dkim)
-SET(WORKERS_LIST normal controller fuzzy lua rspamd_proxy log_helper)
+SET(WORKERS_LIST normal controller fuzzy rspamd_proxy)
 IF (ENABLE_HYPERSCAN MATCHES "ON")
 	LIST(APPEND WORKERS_LIST "hs_helper")
 	LIST(APPEND RSPAMDSRC "hs_helper.c")
@@ -167,10 +164,10 @@ ELSE()
 	ADD_LIBRARY(rspamd-server SHARED
 			${RSPAMD_CRYPTOBOX}
 			${RSPAMD_UTIL}
-			${RSPAMD_LUA}
 			${RSPAMD_SERVER}
 			${RSPAMD_STAT}
 			${RSPAMD_MIME}
+			${RSPAMD_LUA}
 			${CMAKE_CURRENT_BINARY_DIR}/modules.c
 			${PLUGINSSRC}
 			"${RAGEL_ragel_smtp_addr_OUTPUTS}"
@@ -220,6 +217,7 @@ IF(NOT DEBIAN_BUILD)
 	SET_TARGET_PROPERTIES(rspamd PROPERTIES VERSION ${RSPAMD_VERSION})
 ENDIF(NOT DEBIAN_BUILD)
 
+#TARGET_LINK_LIBRARIES(rspamd ${RSPAMD_REQUIRED_LIBRARIES})
 TARGET_LINK_LIBRARIES(rspamd rspamd-server)
 
 INSTALL(TARGETS rspamd RUNTIME DESTINATION bin)

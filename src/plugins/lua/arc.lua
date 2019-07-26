@@ -90,6 +90,9 @@ local settings = {
   reuse_auth_results = false, -- Reuse the existing authentication results
 }
 
+-- To match normal AR
+local ar_settings = auth_results.default_settings
+
 local function parse_arc_header(hdr, target)
   -- Split elements by ';' and trim spaces
   local arr = fun.totable(fun.map(
@@ -425,10 +428,10 @@ local function arc_sign_seal(task, params, header)
       cur_auth_results = ar_header
     else
       rspamd_logger.debugm(N, task, 'cannot reuse authentication results, header is missing')
-      cur_auth_results = auth_results.gen_auth_results(task) or ''
+      cur_auth_results = auth_results.gen_auth_results(task, ar_settings) or ''
     end
   else
-    cur_auth_results = auth_results.gen_auth_results(task) or ''
+    cur_auth_results = auth_results.gen_auth_results(task, ar_settings) or ''
   end
 
   local sha_ctx = hash.create_specific('sha256')
@@ -506,7 +509,33 @@ local function arc_sign_seal(task, params, header)
   task:insert_result(settings.sign_symbol, 1.0, string.format('i=%d', cur_idx))
 end
 
+local function prepare_arc_selector(task, sel)
+  local arc_seals = task:cache_get('arc-seals')
+
+  sel.arc_cv = 'none'
+  sel.arc_idx = 1
+  sel.no_cache = true
+  sel.sign_type = 'arc-sign'
+
+  if arc_seals then
+    sel.arc_idx = #arc_seals + 1
+
+    if task:has_symbol(arc_symbols.allow) then
+      sel.arc_cv = 'pass'
+    else
+      sel.arc_cv = 'fail'
+    end
+  end
+end
+
 local function do_sign(task, p)
+  if p.alg and p.alg ~= 'rsa' then
+    -- No support for ed25519 keys
+    return
+  end
+
+  prepare_arc_selector(task, p)
+
   if settings.check_pubkey then
     local resolve_name = p.selector .. "._domainkey." .. p.domain
     task:get_resolver():resolve_txt({
@@ -552,30 +581,10 @@ local function sign_error(task, msg)
 end
 
 local function arc_signing_cb(task)
-  local arc_seals = task:cache_get('arc-seals')
-
   local ret, selectors = dkim_sign_tools.prepare_dkim_signing(N, task, settings)
 
   if not ret then
     return
-  end
-
-  -- TODO: support multiple signatures here
-  local p = selectors[1]
-
-  p.arc_cv = 'none'
-  p.arc_idx = 1
-  p.no_cache = true
-  p.sign_type = 'arc-sign'
-
-  if arc_seals then
-    p.arc_idx = #arc_seals + 1
-
-    if task:has_symbol(arc_symbols.allow) then
-      p.arc_cv = 'pass'
-    else
-      p.arc_cv = 'fail'
-    end
   end
 
   if settings.use_redis then
@@ -584,6 +593,9 @@ local function arc_signing_cb(task)
     if selectors.vault then
       dkim_sign_tools.sign_using_vault(N, task, settings, selectors, do_sign, sign_error)
     else
+      -- TODO: no support for multiple sigs
+      local p = selectors[1]
+      prepare_arc_selector(task, p)
       if ((p.key or p.rawkey) and p.selector) then
         if p.key then
           p.key = lua_util.template(p.key, {
@@ -602,10 +614,7 @@ local function arc_signing_cb(task)
           end
         end
 
-        local dret, hdr = dkim_sign(task, p)
-        if dret then
-          return arc_sign_seal(task, p, hdr)
-        end
+        do_sign(task, p)
       else
         rspamd_logger.infox(task, 'key path or dkim selector unconfigured; no signing')
         return false
@@ -621,6 +630,17 @@ if not dkim_sign_tools.validate_signing_settings(settings) then
   return
 end
 
+local ar_opts = rspamd_config:get_all_opt('milter_headers')
+
+if ar_opts and ar_opts.routines then
+  local routines = ar_opts.routines
+
+  if routines['authentication-results'] then
+    ar_settings = lua_util.override_defaults(ar_settings,
+        routines['authentication-results'])
+  end
+end
+
 if settings.use_redis then
   redis_params = rspamd_parse_redis_server('arc')
 
@@ -629,6 +649,8 @@ if settings.use_redis then
         'but module is configured to load keys from redis, disable arc signing')
     return
   end
+
+  settings.redis_params = redis_params
 end
 
 rspamd_config:register_symbol({

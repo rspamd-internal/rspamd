@@ -69,11 +69,12 @@ static const gchar *M = "surbl";
 #define DEFAULT_SURBL_WEIGHT 10
 #define DEFAULT_REDIRECTOR_READ_TIMEOUT 5.0
 #define DEFAULT_SURBL_SYMBOL "SURBL_DNS"
-#define SURBL_OPTION_NOIP (1 << 0)
-#define SURBL_OPTION_RESOLVEIP (1 << 1)
-#define SURBL_OPTION_CHECKIMAGES (1 << 2)
-#define SURBL_OPTION_CHECKDKIM (1 << 3)
-#define SURBL_OPTION_FULLDOMAIN (1 << 4)
+#define SURBL_OPTION_NOIP (1u << 0u)
+#define SURBL_OPTION_RESOLVEIP (1u << 1u)
+#define SURBL_OPTION_CHECKIMAGES (1u << 2u)
+#define SURBL_OPTION_CHECKDKIM (1u << 3u)
+#define SURBL_OPTION_FULLDOMAIN (1u << 4u)
+#define SURBL_OPTION_CHECKEMAILS (1u << 5u)
 #define MAX_LEVELS 10
 
 struct surbl_ctx {
@@ -82,7 +83,6 @@ struct surbl_ctx {
 	gdouble read_timeout;
 	gboolean use_tags;
 	GList *suffixes;
-	gchar *metric;
 	const gchar *redirector_symbol;
 	GHashTable **exceptions;
 	struct rspamd_hash_map_helper *whitelist;
@@ -111,6 +111,7 @@ struct dns_param {
 	struct rspamd_url *url;
 	struct rspamd_task *task;
 	gchar *host_resolve;
+	gchar *host_orig; /* Name with no uribl suffix */
 	struct suffix_item *suffix;
 	struct rspamd_symcache_item *item;
 	struct surbl_module_ctx *ctx;
@@ -800,14 +801,21 @@ surbl_module_parse_rule (const ucl_object_t* value, struct rspamd_config* cfg)
 				(rspamd_mempool_destruct_t )ucl_object_unref,
 				ropts);
 
-		cur = ucl_object_lookup (cur_rule, "images");
+		cur = ucl_object_lookup_any (cur_rule, "images", "check_images", NULL);
 		if (cur != NULL && cur->type == UCL_BOOLEAN) {
 			if (ucl_object_toboolean (cur)) {
 				new_suffix->options |= SURBL_OPTION_CHECKIMAGES;
 			}
 		}
 
-		cur = ucl_object_lookup (cur_rule, "check_dkim");
+		cur = ucl_object_lookup_any (cur_rule, "emails", "check_emails", NULL);
+		if (cur != NULL && cur->type == UCL_BOOLEAN) {
+			if (ucl_object_toboolean (cur)) {
+				new_suffix->options |= SURBL_OPTION_CHECKEMAILS;
+			}
+		}
+
+		cur = ucl_object_lookup_any (cur_rule, "dkim", "check_dkim", NULL);
 		if (cur != NULL && cur->type == UCL_BOOLEAN) {
 			if (ucl_object_toboolean (cur)) {
 				new_suffix->options |= SURBL_OPTION_CHECKDKIM;
@@ -851,6 +859,14 @@ surbl_module_parse_rule (const ucl_object_t* value, struct rspamd_config* cfg)
 
 		cb_id = rspamd_symcache_add_symbol (cfg->cache, sym->str,
 				0, surbl_test_url, new_suffix, SYMBOL_TYPE_CALLBACK, -1);
+		rspamd_config_add_symbol (cfg,
+				sym->str,
+				0.0,
+				"SURBL rule check callback",
+				"surbl",
+				RSPAMD_SYMBOL_FLAG_IGNORE,
+				1,
+				1);
 		rspamd_symcache_add_dependency (cfg->cache, cb_id,
 				SURBL_REDIRECTOR_CALLBACK);
 		/* Failure symbol */
@@ -972,9 +988,7 @@ surbl_module_parse_rule (const ucl_object_t* value, struct rspamd_config* cfg)
 
 			if (loaded) {
 				if (lua_pcall (L, 0, 1, err_idx) != 0) {
-					tb = lua_touserdata (L, -1);
-					msg_err_config ("call failed: %v\n", tb);
-					g_string_free (tb, TRUE);
+					msg_err_config ("call failed: %s\n", lua_tostring (L, -1));
 				}
 				else if (lua_isfunction (L, -1)) {
 					new_suffix->url_process_cbref = luaL_ref (L,
@@ -1044,6 +1058,14 @@ surbl_module_config (struct rspamd_config *cfg)
 	(void) rspamd_symcache_add_symbol (cfg->cache, SURBL_REDIRECTOR_CALLBACK,
 			0, surbl_test_redirector, NULL,
 			SYMBOL_TYPE_CALLBACK, -1);
+	rspamd_config_add_symbol (cfg,
+			SURBL_REDIRECTOR_CALLBACK,
+			0.0,
+			"SURBL redirector check callback",
+			"surbl",
+			RSPAMD_SYMBOL_FLAG_IGNORE,
+			1,
+			1);
 
 	if ((value =
 		rspamd_config_get_module_opt (cfg, "surbl", "redirector")) != NULL) {
@@ -1480,6 +1502,12 @@ make_surbl_requests (struct rspamd_url *url, struct rspamd_task *task,
 			param->suffix = suffix;
 			param->host_resolve =
 					rspamd_mempool_strdup (task->task_pool, surbl_req);
+
+			rspamd_ftok_t ftmp;
+			ftmp.begin = url->surbl;
+			ftmp.len = url->surbllen;
+			param->host_orig = rspamd_mempool_ftokdup (task->task_pool, &ftmp);
+
 			msg_debug_surbl ("send surbl dns ip request %s to %s", surbl_req,
 					suffix->suffix);
 
@@ -1508,6 +1536,12 @@ make_surbl_requests (struct rspamd_url *url, struct rspamd_task *task,
 		param->suffix = suffix;
 		param->host_resolve =
 			rspamd_mempool_strdup (task->task_pool, url->surbl);
+
+		rspamd_ftok_t ftmp;
+		ftmp.begin = url->surbl;
+		ftmp.len = url->surbllen;
+		param->host_orig = rspamd_mempool_ftokdup (task->task_pool, &ftmp);
+
 		msg_debug_surbl ("send surbl dns request %s", surbl_req);
 
 		if (rspamd_dns_resolver_request_task (task,
@@ -1545,8 +1579,7 @@ process_dns_results (struct rspamd_task *task,
 
 		bit = g_hash_table_lookup (suffix->ips, &addr);
 		if (bit != NULL) {
-			msg_info_surbl ("<%s> domain [%s] is in surbl %s(%xd)",
-					task->message_id,
+			msg_info_surbl ("domain [%s] is in surbl %s(%xd)",
 					resolved_name, suffix->suffix,
 					bit->bit);
 			rspamd_task_insert_result (task, bit->symbol, 1, resolved_name);
@@ -1568,8 +1601,7 @@ process_dns_results (struct rspamd_task *task,
 
 			if (((gint)bit->bit & (gint)ntohl (addr)) != 0) {
 				got_result = TRUE;
-				msg_info_surbl ("<%s> domain [%s] is in surbl %s(%xd)",
-						task->message_id,
+				msg_info_surbl ("domain [%s] is in surbl %s(%xd)",
 						resolved_name, suffix->suffix,
 						bit->bit);
 				rspamd_task_insert_result (task, bit->symbol, 1, resolved_name);
@@ -1583,8 +1615,7 @@ process_dns_results (struct rspamd_task *task,
 	if (!got_result) {
 		if ((suffix->bits == NULL || suffix->bits->len == 0) &&
 				suffix->ips == NULL) {
-			msg_info_surbl ("<%s> domain [%s] is in surbl %s",
-					task->message_id,
+			msg_info_surbl ("domain [%s] is in surbl %s",
 					resolved_name, suffix->suffix);
 			rspamd_task_insert_result (task, suffix->symbol, 1, resolved_name);
 
@@ -1594,8 +1625,7 @@ process_dns_results (struct rspamd_task *task,
 		}
 		else {
 			ina.s_addr = addr;
-			msg_info_surbl ("<%s> domain [%s] is in surbl %s but at unknown result: %s",
-					task->message_id,
+			msg_info_surbl ("domain [%s] is in surbl %s but at unknown result: %s",
 					resolved_name, suffix->suffix,
 					inet_ntoa (ina));
 		}
@@ -1611,22 +1641,21 @@ surbl_dns_callback (struct rdns_reply *reply, gpointer arg)
 
 	task = param->task;
 	if (reply->code == RDNS_RC_NOERROR && reply->entries) {
-		msg_debug_surbl ("<%s> domain [%s] is in surbl %s",
-				param->task->message_id,
-			param->host_resolve, param->suffix->suffix);
+		msg_debug_surbl ("domain [%s] is in surbl %s",
+				param->host_orig, param->suffix->suffix);
 
 		DL_FOREACH (reply->entries, elt) {
 			if (elt->type == RDNS_REQUEST_A) {
 				process_dns_results (param->task, param->suffix,
-						param->host_resolve, (guint32) elt->content.a.addr.s_addr,
+						param->host_orig, (guint32) elt->content.a.addr.s_addr,
 						param->url);
 			}
 		}
 	}
 	else {
 		if (reply->code == RDNS_RC_NXDOMAIN || reply->code == RDNS_RC_NOREC) {
-			msg_debug_surbl ("<%s> domain [%s] is not in surbl %s",
-					param->task->message_id, param->host_resolve,
+			msg_debug_surbl ("domain [%s] is not in surbl %s",
+					param->host_orig,
 					param->suffix->suffix);
 		}
 		else {
@@ -1636,6 +1665,7 @@ surbl_dns_callback (struct rdns_reply *reply, gpointer arg)
 			g_string_append (sym, "_FAIL");
 			rspamd_task_insert_result (task, sym->str, 1.0,
 					rdns_strerror (reply->code));
+			g_string_free (sym, TRUE);
 		}
 	}
 
@@ -1670,9 +1700,8 @@ surbl_dns_ip_callback (struct rdns_reply *reply, gpointer arg)
 						ip_addr >> 8 & 0xff,
 						ip_addr & 0xff, param->suffix->suffix);
 				msg_debug_surbl (
-						"<%s> domain [%s] send %v request to surbl",
-						param->task->message_id,
-						param->host_resolve,
+						"domain [%s] send %v request to surbl",
+						param->host_orig,
 						to_resolve);
 
 				if (rspamd_dns_resolver_request_task (task,
@@ -1686,8 +1715,8 @@ surbl_dns_ip_callback (struct rdns_reply *reply, gpointer arg)
 		}
 	}
 	else {
-		msg_debug_surbl ("<%s> domain [%s] cannot be resolved for SURBL check %s",
-				param->task->message_id, param->host_resolve,
+		msg_debug_surbl ("domain [%s] cannot be resolved for SURBL check %s",
+				param->host_resolve,
 				param->suffix->suffix);
 
 	}
@@ -1743,8 +1772,7 @@ surbl_redirector_finish (struct rspamd_http_connection *conn,
 		hdr = rspamd_http_message_find_header (msg, "Uri");
 
 		if (hdr != NULL) {
-			msg_info_surbl ("<%s> got reply from redirector: '%*s' -> '%T'",
-					param->task->message_id,
+			msg_info_surbl ("got reply from redirector: '%*s' -> '%T'",
 					param->url->urllen, param->url->string,
 					hdr);
 			urllen = hdr->len;
@@ -1757,8 +1785,9 @@ surbl_redirector_finish (struct rspamd_http_connection *conn,
 					task->task_pool, RSPAMD_URL_PARSE_TEXT);
 
 			if (r == URI_ERRNO_OK) {
-				if ((existing = g_hash_table_lookup (task->urls, redirected_url)) == NULL) {
-					g_hash_table_insert (task->urls, redirected_url,
+				if ((existing = g_hash_table_lookup (MESSAGE_FIELD (task, urls),
+						redirected_url)) == NULL) {
+					g_hash_table_insert (MESSAGE_FIELD (task, urls), redirected_url,
 							redirected_url);
 					redirected_url->phished_url = param->url;
 					redirected_url->flags |= RSPAMD_URL_FLAG_REDIRECTED;
@@ -1778,8 +1807,7 @@ surbl_redirector_finish (struct rspamd_http_connection *conn,
 		}
 	}
 	else {
-		msg_info_surbl ("<%s> could not resolve '%*s' on redirector",
-				param->task->message_id,
+		msg_info_surbl ("could not resolve '%*s' on redirector",
 				param->url->urllen, param->url->string);
 	}
 
@@ -1796,7 +1824,6 @@ register_redirector_call (struct rspamd_url *url, struct rspamd_task *task,
 	const gchar *rule)
 {
 	struct redirector_param *param;
-	struct timeval *timeout;
 	struct upstream *selected;
 	struct rspamd_http_message *msg;
 	struct surbl_ctx *surbl_module_ctx = surbl_get_context (task->cfg);
@@ -1818,8 +1845,7 @@ register_redirector_call (struct rspamd_url *url, struct rspamd_task *task,
 		}
 
 		if (param->conn == NULL) {
-			msg_info_surbl ("<%s> cannot create tcp socket failed: %s",
-					task->message_id,
+			msg_info_surbl ("cannot create tcp socket failed: %s",
 					strerror (errno));
 
 			return;
@@ -1832,8 +1858,6 @@ register_redirector_call (struct rspamd_url *url, struct rspamd_task *task,
 		msg = rspamd_http_new_message (HTTP_REQUEST);
 		msg->url = rspamd_fstring_assign (msg->url, url->string, url->urllen);
 		param->redirector = selected;
-		timeout = rspamd_mempool_alloc (task->task_pool, sizeof (struct timeval));
-		double_to_tv (surbl_module_ctx->read_timeout, timeout);
 
 		rspamd_session_add_event (task->s,
 				free_redirector_session, param,
@@ -1845,11 +1869,10 @@ register_redirector_call (struct rspamd_url *url, struct rspamd_task *task,
 		}
 
 		rspamd_http_connection_write_message (param->conn, msg, NULL,
-				NULL, param, timeout);
+				NULL, param, surbl_module_ctx->read_timeout);
 
 		msg_info_surbl (
-				"<%s> registered redirector call for %*s to %s, according to rule: %s",
-				task->message_id,
+				"registered redirector call for %*s to %s, according to rule: %s",
 				url->urllen, url->string,
 				rspamd_upstream_name (param->redirector),
 				rule);
@@ -1877,8 +1900,7 @@ surbl_test_tags (struct rspamd_task *task, struct redirector_param *param,
 		/* We know results for this URL */
 
 		DL_FOREACH (tag, cur) {
-			msg_info_surbl ("<%s> domain [%s] is in surbl %s (tags)",
-					task->message_id,
+			msg_info_surbl ("domain [%s] is in surbl %s (tags)",
 					ftld, cur->data);
 			rspamd_task_insert_result (task, cur->data, 1, ftld);
 		}
@@ -2052,15 +2074,19 @@ surbl_test_url (struct rspamd_task *task,
 	rspamd_mempool_add_destructor (task->task_pool,
 		(rspamd_mempool_destruct_t)g_hash_table_unref,
 		param->tree);
-	g_hash_table_foreach (task->urls, surbl_tree_url_callback, param);
+	g_hash_table_foreach (MESSAGE_FIELD (task, urls),
+			surbl_tree_url_callback, param);
 
 	rspamd_symcache_item_async_inc (task, item, M);
 
+	if (suffix->options & SURBL_OPTION_CHECKEMAILS) {
+		g_hash_table_foreach (MESSAGE_FIELD (task, emails),
+				surbl_tree_url_callback, param);
+	}
+
 	/* We also need to check and process img URLs */
 	if (suffix->options & SURBL_OPTION_CHECKIMAGES) {
-		for (i = 0; i < task->text_parts->len; i ++) {
-			part = g_ptr_array_index (task->text_parts, i);
-
+		PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, part) {
 			if (part->html && part->html->images) {
 				for (j = 0; j < part->html->images->len; j ++) {
 					img = g_ptr_array_index (part->html->images, j);
@@ -2130,11 +2156,11 @@ surbl_test_redirector (struct rspamd_task *task,
 	param->redirector_requests = 0;
 	param->ctx = surbl_module_ctx;
 	param->item = item;
-	g_hash_table_foreach (task->urls, surbl_tree_redirector_callback, param);
+	g_hash_table_foreach (MESSAGE_FIELD (task, urls),
+			surbl_tree_redirector_callback, param);
 
 	/* We also need to check and process img URLs */
-	for (i = 0; i < task->text_parts->len; i ++) {
-		part = g_ptr_array_index (task->text_parts, i);
+	PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, part) {
 		if (part->html && part->html->images) {
 			for (j = 0; j < part->html->images->len; j ++) {
 				img = g_ptr_array_index (part->html->images, j);
@@ -2278,8 +2304,7 @@ surbl_continue_process_handler (lua_State *L)
 		surbl_module_ctx = surbl_get_context (task->cfg);
 
 		if (nurl != NULL) {
-			msg_info_surbl ("<%s> got reply from redirector: '%*s' -> '%*s'",
-					param->task->message_id,
+			msg_info_surbl ("got reply from redirector: '%*s' -> '%*s'",
 					param->url->urllen, param->url->string,
 					(gint)urllen, nurl);
 			urlstr = rspamd_mempool_alloc (task->task_pool,
@@ -2291,8 +2316,10 @@ surbl_continue_process_handler (lua_State *L)
 					task->task_pool, RSPAMD_URL_PARSE_TEXT);
 
 			if (r == URI_ERRNO_OK) {
-				if (!g_hash_table_lookup (task->urls, redirected_url)) {
-					g_hash_table_insert (task->urls, redirected_url,
+				if (!g_hash_table_lookup (MESSAGE_FIELD (task, urls),
+						redirected_url)) {
+					g_hash_table_insert (MESSAGE_FIELD (task, urls),
+							redirected_url,
 							redirected_url);
 					redirected_url->phished_url = param->url;
 					redirected_url->flags |= RSPAMD_URL_FLAG_REDIRECTED;
@@ -2304,14 +2331,12 @@ surbl_continue_process_handler (lua_State *L)
 				}
 			}
 			else {
-				msg_info_surbl ("<%s> could not resolve '%*s' on redirector",
-						param->task->message_id,
+				msg_info_surbl ("could not resolve '%*s' on redirector",
 						param->url->urllen, param->url->string);
 			}
 		}
 		else {
-			msg_info_surbl ("<%s> could not resolve '%*s' on redirector",
-					param->task->message_id,
+			msg_info_surbl ("could not resolve '%*s' on redirector",
 					param->url->urllen, param->url->string);
 		}
 	}

@@ -26,7 +26,10 @@ limitations under the License.
 -- Typical selector looks like this: header(User).lower.substring(1, 2):ip
 --]]
 
-local exports = {}
+local exports = {
+  maps = {} -- Defined for selectors maps, must be indexed by name
+}
+
 local logger = require 'rspamd_logger'
 local fun = require 'fun'
 local lua_util = require "lua_util"
@@ -35,6 +38,7 @@ local M = "selectors"
 local E = {}
 
 local extractors = {
+  -- Plain id function
   ['id'] = {
     ['get_value'] = function(_, args)
       if args[1] then
@@ -46,6 +50,18 @@ local extractors = {
     ['description'] = [[Return value from function's argument or an empty string,
 For example, `id('Something')` returns a string 'Something']],
     ['args_schema'] = {ts.string:is_optional()}
+  },
+  -- Similar but for making lists
+  ['list'] = {
+    ['get_value'] = function(_, args)
+      if args[1] then
+        return fun.map(tostring, args), 'string_list'
+      end
+
+      return {},'string_list'
+    end,
+    ['description'] = [[Return a list from function's arguments or an empty list,
+For example, `list('foo', 'bar')` returns a list {'foo', 'bar'}]],
   },
   -- Get source IP address
   ['ip'] = {
@@ -342,7 +358,35 @@ The first argument must be header name.]],
   The second argument is optional time format, see [os.date](http://pgl.yoyo.org/luai/i/os.date) description]],
     ['args_schema'] = {ts.one_of{'connect', 'message'}:is_optional(),
                        ts.string:is_optional()}
-  }
+  },
+  -- Get text words from a message
+  ['words'] = {
+    ['get_value'] = function(task, args)
+      local how = args[1] or 'stem'
+      local tp = task:get_text_parts()
+
+      if tp then
+        local rtype = 'string_list'
+        if how == 'full' then
+          rtype = 'table_list'
+        end
+
+        return lua_util.flatten(
+            fun.map(function(p)
+              return p:get_words(how)
+            end, tp)), rtype
+      end
+
+      return nil
+    end,
+    ['description'] = [[Get words from text parts
+  - `stem`: stemmed words (default)
+  - `raw`: raw words
+  - `norm`: normalised words (lowercased)
+  - `full`: list of tables
+  ]],
+    ['args_schema'] = { ts.one_of { 'stem', 'raw', 'norm', 'full' }:is_optional()},
+  },
 }
 
 local function pure_type(ltype)
@@ -423,6 +467,32 @@ local transform_function = {
     ['description'] = 'Joins strings into a single string using separator in the argument',
     ['args_schema'] = {ts.string:is_optional()}
   },
+  -- Sort strings
+  ['sort'] = {
+    ['types'] = {
+      ['list'] = true
+    },
+    ['process'] = function(inp, t, _)
+      table.sort(inp)
+      return inp, t
+    end,
+    ['description'] = 'Sort strings lexicographically',
+  },
+  -- Return unique elements based on hashing (can work without sorting)
+  ['uniq'] = {
+    ['types'] = {
+      ['list'] = true
+    },
+    ['process'] = function(inp, t, _)
+      local tmp = {}
+      fun.each(function(val)
+         tmp[val] = true
+      end, inp)
+
+      return fun.map(function(k, _) return k end, tmp), t
+    end,
+    ['description'] = 'Returns a list of unique elements (using a hash table)',
+  },
   -- Create a digest from string or a list of strings
   ['digest'] = {
     ['types'] = {
@@ -468,6 +538,32 @@ the second argument is optional hash type (`blake2`, `sha256`, `sha1`, `sha512`,
     ['args_schema'] = {(ts.number + ts.string / tonumber):is_optional(),
                        (ts.number + ts.string / tonumber):is_optional()}
   },
+  -- Prepends a string or a strings list
+  ['prepend'] = {
+    ['types'] = {
+      ['string'] = true
+    },
+    ['map_type'] = 'string',
+    ['process'] = function(inp, _, args)
+      local prepend = table.concat(args, '')
+
+      return prepend .. inp, 'string'
+    end,
+    ['description'] = 'Prepends a string or a strings list',
+  },
+  -- Appends a string or a strings list
+  ['append'] = {
+    ['types'] = {
+      ['string'] = true
+    },
+    ['map_type'] = 'string',
+    ['process'] = function(inp, _, args)
+      local append = table.concat(args, '')
+
+      return inp .. append, 'string'
+    end,
+    ['description'] = 'Appends a string or a strings list',
+  },
   -- Regexp matching
   ['regexp'] = {
     ['types'] = {
@@ -497,6 +593,56 @@ the second argument is optional hash type (`blake2`, `sha256`, `sha1`, `sha512`,
       return nil
     end,
     ['description'] = 'Regexp matching',
+    ['args_schema'] = {ts.string}
+  },
+  -- Returns a value if it exists in some map (or acts like a `filter` function)
+  ['filter_map'] = {
+    ['types'] = {
+      ['string'] = true
+    },
+    ['map_type'] = 'string',
+    ['process'] = function(inp, t, args)
+      local map = exports.maps[args[1]]
+
+      if not map then
+        logger.errx('invalid map name: %s', args[1])
+        return nil
+      end
+
+      local res = map:get_key(inp)
+
+      if res then
+        return inp,t
+      end
+
+      return nil
+    end,
+    ['description'] = 'Returns a value if it exists in some map (or acts like a `filter` function)',
+    ['args_schema'] = {ts.string}
+  },
+  -- Returns a value from some map corresponding to some key (or acts like a `map` function)
+  ['apply_map'] = {
+    ['types'] = {
+      ['string'] = true
+    },
+    ['map_type'] = 'string',
+    ['process'] = function(inp, t, args)
+      local map = exports.maps[args[1]]
+
+      if not map then
+        logger.errx('invalid map name: %s', args[1])
+        return nil
+      end
+
+      local res = map:get_key(inp)
+
+      if res then
+        return res,t
+      end
+
+      return nil
+    end,
+    ['description'] = 'Returns a value from some map corresponding to some key (or acts like a `map` function)',
     ['args_schema'] = {ts.string}
   },
   -- Drops input value and return values from function's arguments or an empty string
@@ -671,10 +817,12 @@ local function process_selector(task, sel)
         if meth.types[pt] then
           lua_util.debugm(M, task, 'map method `%s` to list of %s',
               meth.name, pt)
-          input = fun.map(function(list_elt)
-            local ret, _ = meth.process(list_elt, pt)
-            return ret
-          end, input)
+          -- Map method to a list of inputs, excluding empty elements
+          input = fun.filter(function(map_elt) return map_elt end,
+              fun.map(function(list_elt)
+                local ret, _ = meth.process(list_elt, pt)
+                return ret
+              end, input))
           etype = 'string_list'
         end
       end
@@ -691,10 +839,11 @@ local function process_selector(task, sel)
         etype = 'string'
       else
         lua_util.debugm(M, task, 'apply implicit map %s->string', pt)
-        input = fun.map(function(list_elt)
-          local ret = implicit_tostring(pt, list_elt)
-          return ret
-        end, input)
+        input = fun.filter(function(map_elt) return map_elt end,
+            fun.map(function(list_elt)
+              local ret = implicit_tostring(pt, list_elt)
+              return ret
+            end, input))
         etype = 'string_list'
       end
     end
@@ -721,12 +870,16 @@ local function process_selector(task, sel)
         local map_type = x.map_type .. '_list'
         lua_util.debugm(M, task, 'map `%s` to list of %s resulting %s',
             x.name, pt, map_type)
-
-        return {fun.map(function(list_elt)
-          if not list_elt then return nil end
-          local ret, _ = x.process(list_elt, pt, x.args)
-          return ret
-        end, value), map_type}
+        -- Apply map, filtering empty values
+        return {
+          fun.filter(function(map_elt) return map_elt end,
+              fun.map(function(list_elt)
+                if not list_elt then return nil end
+                local ret, _ = x.process(list_elt, pt, x.args)
+                return ret
+              end, value)),
+          map_type -- Returned type
+        }
       end
       logger.errx(task, 'cannot apply transform %s for type %s', x.name, t)
       return nil
@@ -874,8 +1027,12 @@ exports.parse_selector = function(cfg, str)
       if proc_name:match('^__') then
         -- Special case - method
         local method_name = proc_name:match('^__(.*)$')
+        -- Check array indexing...
+        if tonumber(method_name) then
+          method_name = tonumber(method_name)
+        end
         local processor = {
-          name = method_name,
+          name = tostring(method_name),
           method = true,
           args = proc_tbl[2] or E,
           types = {
@@ -899,7 +1056,7 @@ exports.parse_selector = function(cfg, str)
 
         if not transform_function[proc_name] then
           logger.errx(cfg, 'processor %s is unknown', proc_name)
-          pipeline_error = true
+          pipeline_error = proc_name
           return nil
         end
         local processor = lua_util.shallowcopy(transform_function[proc_name])
@@ -907,7 +1064,7 @@ exports.parse_selector = function(cfg, str)
         processor.args = proc_tbl[2] or E
 
         if not check_args(processor.name, processor.args_schema, processor.args) then
-          pipeline_error = true
+          pipeline_error = 'args schema for ' .. proc_name
           return nil
         end
 
@@ -918,7 +1075,7 @@ exports.parse_selector = function(cfg, str)
     end, fun.tail(sel))
 
     if pipeline_error then
-      logger.errx(cfg, 'unknown or invalid processor used, exiting')
+      logger.errx(cfg, 'unknown or invalid processor used: "%s", exiting', pipeline_error)
       return nil
     end
 

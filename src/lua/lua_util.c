@@ -71,6 +71,15 @@ LUA_FUNCTION_DEF (util, encode_base64);
  * @return {rspamd_text} encoded data chunk
  */
 LUA_FUNCTION_DEF (util, encode_qp);
+
+/***
+ * @function util.decode_qp(input)
+ * Decodes data from quouted printable
+ * @param {text or string} input input data
+ * @return {rspamd_text} decoded data chunk
+ */
+LUA_FUNCTION_DEF (util, decode_qp);
+
 /***
  * @function util.decode_base64(input)
  * Decodes data from base64 ignoring whitespace characters
@@ -606,6 +615,7 @@ static const struct luaL_reg utillib_f[] = {
 	LUA_INTERFACE_DEF (util, process_message),
 	LUA_INTERFACE_DEF (util, encode_base64),
 	LUA_INTERFACE_DEF (util, encode_qp),
+	LUA_INTERFACE_DEF (util, decode_qp),
 	LUA_INTERFACE_DEF (util, decode_base64),
 	LUA_INTERFACE_DEF (util, encode_base32),
 	LUA_INTERFACE_DEF (util, decode_base32),
@@ -695,11 +705,11 @@ static gint
 lua_util_create_event_base (lua_State *L)
 {
 	LUA_TRACE_POINT;
-	struct event_base **pev_base;
+	struct ev_loop **pev_base;
 
-	pev_base = lua_newuserdata (L, sizeof (struct event_base *));
+	pev_base = lua_newuserdata (L, sizeof (struct ev_loop *));
 	rspamd_lua_setclass (L, "rspamd{ev_base}", -1);
-	*pev_base = event_init ();
+	*pev_base = ev_loop_new (EVFLAG_SIGNALFD|EVBACKEND_ALL);
 
 	return 1;
 }
@@ -842,13 +852,13 @@ lua_util_process_message (lua_State *L)
 	const gchar *message;
 	gsize mlen;
 	struct rspamd_task *task;
-	struct event_base *base;
+	struct ev_loop *base;
 	ucl_object_t *res = NULL;
 
 	message = luaL_checklstring (L, 2, &mlen);
 
 	if (cfg != NULL && message != NULL) {
-		base = event_init ();
+		base = ev_loop_new (EVFLAG_SIGNALFD|EVBACKEND_ALL);
 		rspamd_init_filters (cfg, FALSE);
 		task = rspamd_task_new (NULL, cfg, NULL, NULL, base);
 		task->msg.begin = rspamd_mempool_alloc (task->task_pool, mlen);
@@ -865,7 +875,7 @@ lua_util_process_message (lua_State *L)
 		}
 		else {
 			if (rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL)) {
-				event_base_loop (base, 0);
+				ev_loop (base, 0);
 
 				if (res != NULL) {
 					ucl_object_push_lua (L, res, true);
@@ -885,7 +895,7 @@ lua_util_process_message (lua_State *L)
 			}
 		}
 
-		event_base_free (base);
+		ev_loop_destroy (base);
 	}
 	else {
 		lua_pushnil (L);
@@ -1032,15 +1042,58 @@ lua_util_encode_qp (lua_State *L)
 }
 
 static gint
+lua_util_decode_qp (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_lua_text *t, *out;
+	const gchar *s = NULL;
+	gsize inlen = 0;
+	gssize outlen;
+
+	if (lua_type (L, 1) == LUA_TSTRING) {
+		s = luaL_checklstring (L, 1, &inlen);
+	}
+	else if (lua_type (L, 1) == LUA_TUSERDATA) {
+		t = lua_check_text (L, 1);
+
+		if (t != NULL) {
+			s = t->start;
+			inlen = t->len;
+		}
+	}
+
+	if (s == NULL) {
+		lua_pushnil (L);
+	}
+	else {
+		out = lua_newuserdata (L, sizeof (*t));
+		rspamd_lua_setclass (L, "rspamd{text}", -1);
+		out->start = g_malloc (inlen + 1);
+		out->flags = RSPAMD_TEXT_FLAG_OWN;
+		outlen = rspamd_decode_qp_buf (s, inlen, (gchar *)out->start, inlen + 1);
+
+		if (outlen > 0) {
+			out->len = outlen;
+		}
+		else {
+			/*
+			 * It removes out and frees memory on gc due to RSPAMD_TEXT_FLAG_OWN
+			 */
+			lua_pop (L, 1);
+			lua_pushnil (L);
+		}
+	}
+
+	return 1;
+}
+
+static gint
 lua_util_decode_base64 (lua_State *L)
 {
 	LUA_TRACE_POINT;
 	struct rspamd_lua_text *t;
 	const gchar *s = NULL;
-	gsize inlen, outlen;
-	gboolean zero_copy = FALSE, grab_own = FALSE;
-	gint state = 0;
-	guint save = 0;
+	gsize inlen = 0, outlen;
 
 	if (lua_type (L, 1) == LUA_TSTRING) {
 		s = luaL_checklstring (L, 1, &inlen);
@@ -1055,31 +1108,15 @@ lua_util_decode_base64 (lua_State *L)
 	}
 
 	if (s != NULL) {
-		if (zero_copy) {
-			/* Decode in place */
-			outlen = g_base64_decode_step (s, inlen, (guchar *)s, &state, &save);
-			t = lua_newuserdata (L, sizeof (*t));
-			rspamd_lua_setclass (L, "rspamd{text}", -1);
-			t->start = s;
-			t->len = outlen;
+		t = lua_newuserdata (L, sizeof (*t));
+		rspamd_lua_setclass (L, "rspamd{text}", -1);
+		t->len = (inlen / 4) * 3 + 3;
+		t->start = g_malloc (t->len);
 
-			if (grab_own) {
-				t->flags |= RSPAMD_TEXT_FLAG_OWN;
-			}
-			else {
-				t->flags = 0;
-			}
-		}
-		else {
-			t = lua_newuserdata (L, sizeof (*t));
-			rspamd_lua_setclass (L, "rspamd{text}", -1);
-			t->len = (inlen / 4) * 3 + 3;
-			t->start = g_malloc (t->len);
-			outlen = g_base64_decode_step (s, inlen, (guchar *)t->start,
-					&state, &save);
-			t->len = outlen;
-			t->flags = RSPAMD_TEXT_FLAG_OWN;
-		}
+		rspamd_cryptobox_base64_decode (s, inlen, (guchar *)t->start,
+				&outlen);
+		t->len = outlen;
+		t->flags = RSPAMD_TEXT_FLAG_OWN;
 	}
 	else {
 		lua_pushnil (L);
@@ -1739,17 +1776,8 @@ static gint
 lua_util_get_time (lua_State *L)
 {
 	LUA_TRACE_POINT;
-	gdouble seconds;
-	struct timeval tv;
 
-	if (gettimeofday (&tv, NULL) == 0) {
-		seconds = tv_to_double (&tv);
-	}
-	else {
-		seconds = time (NULL);
-	}
-
-	lua_pushnumber (L, seconds);
+	lua_pushnumber (L, ev_time ());
 
 	return 1;
 }
@@ -1759,19 +1787,13 @@ lua_util_time_to_string (lua_State *L)
 {
 	LUA_TRACE_POINT;
 	gdouble seconds;
-	struct timeval tv;
 	char timebuf[128];
 
 	if (lua_isnumber (L, 1)) {
 		seconds = lua_tonumber (L, 1);
 	}
 	else {
-		if (gettimeofday (&tv, NULL) == 0) {
-			seconds = tv_to_double (&tv);
-		}
-		else {
-			seconds = time (NULL);
-		}
+		seconds = ev_time ();
 	}
 
 	rspamd_http_date_format (timebuf, sizeof (timebuf), seconds);
@@ -3795,14 +3817,14 @@ static int
 lua_ev_base_loop (lua_State *L)
 {
 	int flags = 0;
-	struct event_base *ev_base;
+	struct ev_loop *ev_base;
 
 	ev_base = lua_check_ev_base (L, 1);
 	if (lua_isnumber (L, 2)) {
-		flags = lua_tonumber (L, 2);
+		flags = lua_tointeger (L, 2);
 	}
 
-	int ret = event_base_loop (ev_base, flags);
+	int ret = ev_run (ev_base, flags);
 	lua_pushinteger (L, ret);
 
 	return 1;

@@ -7,14 +7,21 @@
 #define RSPAMD_MESSAGE_H
 
 #include "config.h"
-#include "email_addr.h"
-#include "addr.h"
-#include "cryptobox.h"
-#include "mime_headers.h"
-#include "content_type.h"
+
+#include "libmime/email_addr.h"
+#include "libutil/addr.h"
+#include "libcryptobox/cryptobox.h"
+#include "libmime/mime_headers.h"
+#include "libmime/content_type.h"
+#include "libutil/ref.h"
+#include "libutil/str_util.h"
 
 #include <unicode/uchar.h>
 #include <unicode/utext.h>
+
+#ifdef  __cplusplus
+extern "C" {
+#endif
 
 struct rspamd_task;
 struct controller_session;
@@ -54,8 +61,8 @@ struct rspamd_mime_part {
 	rspamd_ftok_t parsed_data;
 	struct rspamd_mime_part *parent_part;
 
-	GQueue *headers_order;
-	GHashTable *raw_headers;
+	struct rspamd_mime_header *headers_order;
+	khash_t(rspamd_mime_headers_htb) *raw_headers;
 
 	gchar *raw_headers_str;
 	gsize raw_headers_len;
@@ -106,9 +113,9 @@ struct rspamd_mime_text_part {
 	GArray *utf_words;
 	UText utf_stripped_text; /* Used by libicu to represent the utf8 content */
 
-	GPtrArray *newlines;	/**< positions of newlines in text, relative to content*/
+	GPtrArray *newlines;    /**< positions of newlines in text, relative to content*/
 	struct html_content *html;
-	GList *exceptions;	/**< list of offsets of urls						*/
+	GList *exceptions;    /**< list of offsets of urls						*/
 	struct rspamd_mime_part *mime_part;
 
 	guint flags;
@@ -125,6 +132,36 @@ struct rspamd_mime_text_part {
 	guint unicode_scripts;
 };
 
+struct rspamd_message_raw_headers_content {
+	const gchar *begin;
+	gsize len;
+	const gchar *body_start;
+};
+
+struct rspamd_message {
+	const gchar *message_id;
+	gchar *subject;
+
+	GPtrArray *parts;				/**< list of parsed parts							*/
+	GPtrArray *text_parts;			/**< list of text parts								*/
+	struct rspamd_message_raw_headers_content raw_headers_content;
+	struct rspamd_received_header *received;	/**< list of received headers						*/
+	GHashTable *urls;							/**< list of parsed urls							*/
+	GHashTable *emails;							/**< list of parsed emails							*/
+	khash_t(rspamd_mime_headers_htb) *raw_headers;	/**< list of raw headers						*/
+	struct rspamd_mime_header *headers_order;	/**< order of raw headers							*/
+	GPtrArray *rcpt_mime;
+	GPtrArray *from_mime;
+	guchar digest[16];
+	enum rspamd_newlines_type nlines_type; 		/**< type of newlines (detected on most of headers 	*/
+	ref_entry_t ref;
+};
+
+#define MESSAGE_FIELD(task, field) ((task)->message->field)
+#define MESSAGE_FIELD_CHECK(task, field) ((task)->message ? \
+	(task)->message->field : \
+	(__typeof__((task)->message->field))NULL)
+
 /**
  * Parse and pre-process mime message
  * @param task worker_task object
@@ -137,39 +174,6 @@ gboolean rspamd_message_parse (struct rspamd_task *task);
  * @param task
  */
 void rspamd_message_process (struct rspamd_task *task);
-
-/**
- * Get an array of header's values with specified header's name using raw headers
- * @param task worker task structure
- * @param field header's name
- * @param strong if this flag is TRUE header's name is case sensitive, otherwise it is not
- * @return An array of header's values or NULL. It is NOT permitted to free array or values.
- */
-GPtrArray *rspamd_message_get_header_array (struct rspamd_task *task,
-		const gchar *field,
-		gboolean strong);
-/**
- * Get an array of mime parts header's values with specified header's name using raw headers
- * @param task worker task structure
- * @param field header's name
- * @param strong if this flag is TRUE header's name is case sensitive, otherwise it is not
- * @return An array of header's values or NULL. It is NOT permitted to free array or values.
- */
-GPtrArray *rspamd_message_get_mime_header_array (struct rspamd_task *task,
-		const gchar *field,
-		gboolean strong);
-
-/**
- * Get an array of header's values with specified header's name using raw headers
- * @param htb hash table indexed by header name (caseless) with ptr arrays as elements
- * @param field header's name
- * @param strong if this flag is TRUE header's name is case sensitive, otherwise it is not
- * @return An array of header's values or NULL. It is NOT permitted to free array or values.
- */
-GPtrArray *rspamd_message_get_header_from_hash (GHashTable *htb,
-		rspamd_mempool_t *pool,
-		const gchar *field,
-		gboolean strong);
 
 
 /**
@@ -184,6 +188,25 @@ enum rspamd_cte rspamd_cte_from_string (const gchar *str);
  * @param ct
  * @return
  */
-const gchar* rspamd_cte_to_string (enum rspamd_cte ct);
+const gchar *rspamd_cte_to_string (enum rspamd_cte ct);
+
+struct rspamd_message* rspamd_message_new (struct rspamd_task *task);
+
+struct rspamd_message *rspamd_message_ref (struct rspamd_message *msg);
+
+void rspamd_message_unref (struct rspamd_message *msg);
+
+/**
+ * Updates digest of the message if modified
+ * @param msg
+ * @param input
+ * @param len
+ */
+void rspamd_message_update_digest (struct rspamd_message *msg,
+		const void *input, gsize len);
+
+#ifdef  __cplusplus
+}
+#endif
 
 #endif

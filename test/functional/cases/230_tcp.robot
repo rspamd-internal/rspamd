@@ -1,6 +1,6 @@
 *** Settings ***
-Test Setup      Http Setup
-Test Teardown   Http Teardown
+Suite Setup      Servers Setup
+Suite Teardown   Servers Teardown
 Library         Process
 Library         ${TESTDIR}/lib/rspamd.py
 Resource        ${TESTDIR}/lib/rspamd.robot
@@ -11,7 +11,7 @@ Variables       ${TESTDIR}/lib/vars.py
 ${URL_TLD}      ${TESTDIR}/../lua/unit/test_tld.dat
 ${CONFIG}       ${TESTDIR}/configs/lua_test.conf
 ${MESSAGE}      ${TESTDIR}/messages/spam_message.eml
-${RSPAMD_SCOPE}  Test
+${RSPAMD_SCOPE}  Suite
 
 *** Test Cases ***
 Simple TCP request
@@ -19,6 +19,15 @@ Simple TCP request
   Check Rspamc  ${result}  HTTP_ASYNC_RESPONSE
   Check Rspamc  ${result}  HTTP_ASYNC_RESPONSE_2
 
+SSL TCP request
+  ${result} =  Scan Message With Rspamc  ${MESSAGE}
+  Check Rspamc  ${result}  TCP_SSL_RESPONSE (0.00)[test]
+  Check Rspamc  ${result}  TCP_SSL_RESPONSE_2 (0.00)[test2]
+
+SSL Large TCP request
+  ${result} =  Scan Message With Rspamc  ${MESSAGE}
+  Check Rspamc  ${result}  TCP_SSL_LARGE (0.00)
+  Check Rspamc  ${result}  TCP_SSL_LARGE_2 (0.00)
 
 Sync API TCP request
   ${result} =  Scan Message With Rspamc  ${MESSAGE}
@@ -41,20 +50,27 @@ Lua Setup
   Set Global Variable  ${LUA_SCRIPT}
   Generic Setup
 
-Http Setup
+Servers Setup
   Run Dummy Http
+  Run Dummy Ssl
   Lua Setup  ${TESTDIR}/lua/tcp.lua
 
-Http Teardown
+Servers Teardown
   ${http_pid} =  Get File  /tmp/dummy_http.pid
   Shutdown Process With Children  ${http_pid}
+  ${ssl_pid} =  Get File  /tmp/dummy_ssl.pid
+  Shutdown Process With Children  ${ssl_pid}
   Normal Teardown
 
 Run Dummy Http
   [Arguments]
   ${result} =  Start Process  ${TESTDIR}/util/dummy_http.py
-  Wait Until Created  /tmp/dummy_http.pid
+  Wait Until Created  /tmp/dummy_http.pid  timeout=2 second
 
+Run Dummy Ssl
+  [Arguments]
+  ${result} =  Start Process  ${TESTDIR}/util/dummy_ssl.py  ${TESTDIR}/util/server.pem
+  Wait Until Created  /tmp/dummy_ssl.pid  timeout=2 second
 
 Check url
   [Arguments]  ${url}  ${method}  @{expect_results}

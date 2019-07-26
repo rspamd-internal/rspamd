@@ -753,7 +753,6 @@ rspamd_rcl_lua_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 			ucl_object_tostring (obj));
 	gchar *cur_dir, *lua_dir, *lua_file, *tmp1, *tmp2;
 	lua_State *L = cfg->lua_state;
-	GString *tb;
 	gint err_idx;
 
 	tmp1 = g_strdup (lua_src);
@@ -788,15 +787,13 @@ rspamd_rcl_lua_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 
 			/* Now do it */
 			if (lua_pcall (L, 0, 0, err_idx) != 0) {
-				tb = lua_touserdata (L, -1);
 				g_set_error (err,
 						CFG_RCL_ERROR,
 						EINVAL,
 						"cannot init lua file %s: %s",
 						lua_src,
-						tb->str);
-				g_string_free (tb, TRUE);
-				lua_pop (L, 2);
+						lua_tostring (L, -1));
+				lua_settop (L, 0);
 
 				if (chdir (cur_dir) == -1) {
 					msg_err_config ("cannot chdir to %s: %s", cur_dir,
@@ -990,6 +987,8 @@ rspamd_rcl_modules_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 							TRUE,
 							mods_seen,
 							err)) {
+						g_hash_table_unref (mods_seen);
+
 						return FALSE;
 					}
 				}
@@ -1000,6 +999,8 @@ rspamd_rcl_modules_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 					CFG_RCL_ERROR,
 					EINVAL,
 					"path attribute is missing");
+			g_hash_table_unref (mods_seen);
+
 			return FALSE;
 		}
 
@@ -1013,6 +1014,8 @@ rspamd_rcl_modules_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 							FALSE,
 							mods_seen,
 							err)) {
+						g_hash_table_unref (mods_seen);
+
 						return FALSE;
 					}
 				}
@@ -1029,11 +1032,15 @@ rspamd_rcl_modules_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 							FALSE,
 							mods_seen,
 							err)) {
+						g_hash_table_unref (mods_seen);
+
 						return FALSE;
 					}
 				}
 			}
 		}
+
+		g_hash_table_unref (mods_seen);
 	}
 	else if (ucl_object_tostring_safe (obj, &data)) {
 		if (!rspamd_rcl_add_lua_plugins_path (cfg,
@@ -1241,7 +1248,6 @@ rspamd_rcl_classifier_handler (rspamd_mempool_t *pool,
 				const gchar *lua_script;
 				gsize slen;
 				gint err_idx, ref_idx;
-				GString *tb = NULL;
 
 				lua_script = ucl_object_tolstring (cur, &slen);
 				L = cfg->lua_state;
@@ -1263,13 +1269,11 @@ rspamd_rcl_classifier_handler (rspamd_mempool_t *pool,
 
 				/* Now do it */
 				if (lua_pcall (L, 0, 1, err_idx) != 0) {
-					tb = lua_touserdata (L, -1);
 					g_set_error (err,
 							CFG_RCL_ERROR,
 							EINVAL,
 							"cannot init lua condition script: %s",
-							tb->str);
-					g_string_free (tb, TRUE);
+							lua_tostring (L, -1));
 					lua_settop (L, 0);
 
 					return FALSE;
@@ -1929,12 +1933,6 @@ rspamd_rcl_config_init (struct rspamd_config *cfg, GHashTable *skip_sections)
 				G_STRUCT_OFFSET (struct rspamd_config, disable_pcre_jit),
 				0,
 				"Disable PCRE JIT");
-		rspamd_rcl_add_default_handler (sub,
-				"disable_lua_squeeze",
-				rspamd_rcl_parse_struct_boolean,
-				G_STRUCT_OFFSET (struct rspamd_config, disable_lua_squeeze),
-				0,
-				"Disable Lua rules squeezing");
 		rspamd_rcl_add_default_handler (sub,
 				"min_word_len",
 				rspamd_rcl_parse_struct_integer,
@@ -3484,7 +3482,6 @@ rspamd_rcl_maybe_apply_lua_transform (struct rspamd_config *cfg)
 {
 	lua_State *L = cfg->lua_state;
 	gint err_idx, ret;
-	GString *tb;
 	gchar str[PATH_MAX];
 	static const char *transform_script = "lua_cfg_transform";
 
@@ -3518,13 +3515,8 @@ rspamd_rcl_maybe_apply_lua_transform (struct rspamd_config *cfg)
 	ucl_object_push_lua (L, cfg->rcl_obj, true);
 
 	if ((ret = lua_pcall (L, 1, 2, err_idx)) != 0) {
-		tb = lua_touserdata (L, -1);
-		msg_err ("call to rspamadm lua script failed (%d): %v", ret, tb);
-
-		if (tb) {
-			g_string_free (tb, TRUE);
-		}
-
+		msg_err ("call to rspamadm lua script failed (%d): %s", ret,
+				lua_tostring (L, -1));
 		lua_settop (L, 0);
 
 		return;
@@ -3588,11 +3580,8 @@ rspamd_rcl_jinja_handler (struct ucl_parser *parser,
 	lua_pushboolean (L, false);
 
 	if (lua_pcall (L, 3, 1, err_idx) != 0) {
-		GString *tb;
-
-		tb = lua_touserdata (L, -1);
-		msg_err_config ("cannot call lua jinja_template script: %s", tb->str);
-		g_string_free (tb, TRUE);
+		msg_err_config ("cannot call lua jinja_template script: %s",
+				lua_tostring (L, -1));
 		lua_settop (L, err_idx - 1);
 
 		return false;
@@ -3856,12 +3845,8 @@ rspamd_config_read (struct rspamd_config *cfg,
 				rspamd_lua_setclass (L, "rspamd{config}", -1);
 
 				if (lua_pcall (L, 1, 0, err_idx) != 0) {
-					GString *tb;
-
-					tb = lua_touserdata (L, -1);
 					msg_err_config ("cannot call lua init_debug_logging script: %s",
-							tb->str);
-					g_string_free (tb, TRUE);
+							lua_tostring (L, -1));
 					lua_settop (L, err_idx - 1);
 
 					return FALSE;

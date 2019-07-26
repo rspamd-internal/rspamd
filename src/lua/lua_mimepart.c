@@ -21,6 +21,8 @@
 #include "libcryptobox/cryptobox.h"
 #include "libutil/shingles.h"
 
+#include "contrib/uthash/utlist.h"
+
 /* Textpart methods */
 /***
  * @module rspamd_textpart
@@ -147,6 +149,24 @@ LUA_FUNCTION_DEF (textpart, get_words_count);
 LUA_FUNCTION_DEF (textpart, get_words);
 
 /***
+ * @method mime_part:filter_words(regexp, [how][, max]])
+ * Filter words using some regexp:
+ * - `stem`: stemmed words (default)
+ * - `norm`: normalised words (utf normalised + lowercased)
+ * - `raw`: raw words in utf (if possible)
+ * - `full`: list of tables, each table has the following fields:
+ *   - [1] - stemmed word
+ *   - [2] - normalised word
+ *   - [3] - raw word
+ *   - [4] - flags (table of strings)
+ * @param {rspamd_regexp} regexp regexp to match
+ * @param {string} how what words to extract
+ * @param {number} max maximum number of hits returned (all hits if <= 0 or nil)
+ * @return {table/strings} words matching regexp
+ */
+LUA_FUNCTION_DEF (textpart, filter_words);
+
+/***
  * @method text_part:is_empty()
  * Returns `true` if the specified part is empty
  * @return {bool} whether a part is empty
@@ -216,6 +236,7 @@ static const struct luaL_reg textpartlib_m[] = {
 	LUA_INTERFACE_DEF (textpart, get_lines_count),
 	LUA_INTERFACE_DEF (textpart, get_words_count),
 	LUA_INTERFACE_DEF (textpart, get_words),
+	LUA_INTERFACE_DEF (textpart, filter_words),
 	LUA_INTERFACE_DEF (textpart, is_empty),
 	LUA_INTERFACE_DEF (textpart, is_html),
 	LUA_INTERFACE_DEF (textpart, get_html),
@@ -841,6 +862,27 @@ lua_textpart_get_words_count (lua_State *L)
 	return 1;
 }
 
+static inline enum rspamd_lua_words_type
+word_extract_type_from_string (const gchar *how_str)
+{
+	enum rspamd_lua_words_type how = RSPAMD_LUA_WORDS_MAX;
+
+	if (strcmp (how_str, "stem") == 0) {
+		how = RSPAMD_LUA_WORDS_STEM;
+	}
+	else if (strcmp (how_str, "norm") == 0) {
+		how = RSPAMD_LUA_WORDS_NORM;
+	}
+	else if (strcmp (how_str, "raw") == 0) {
+		how = RSPAMD_LUA_WORDS_RAW;
+	}
+	else if (strcmp (how_str, "full") == 0) {
+		how = RSPAMD_LUA_WORDS_FULL;
+	}
+
+	return how;
+}
+
 static gint
 lua_textpart_get_words (lua_State *L)
 {
@@ -859,24 +901,102 @@ lua_textpart_get_words (lua_State *L)
 		if (lua_type (L, 2) == LUA_TSTRING) {
 			const gchar *how_str = lua_tostring (L, 2);
 
-			if (strcmp (how_str, "stem") == 0) {
-				how = RSPAMD_LUA_WORDS_STEM;
-			}
-			else if (strcmp (how_str, "norm") == 0) {
-				how = RSPAMD_LUA_WORDS_NORM;
-			}
-			else if (strcmp (how_str, "raw") == 0) {
-				how = RSPAMD_LUA_WORDS_RAW;
-			}
-			else if (strcmp (how_str, "full") == 0) {
-				how = RSPAMD_LUA_WORDS_FULL;
-			}
-			else {
-				return luaL_error (L, "unknown words type: %s", how_str);
+			how = word_extract_type_from_string (how_str);
+
+			if (how == RSPAMD_LUA_WORDS_MAX) {
+				return luaL_error (L, "invalid extraction type: %s", how_str);
 			}
 		}
 
 		return rspamd_lua_push_words (L, part->utf_words, how);
+	}
+
+	return 1;
+}
+
+static gint
+lua_textpart_filter_words (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_mime_text_part *part = lua_check_textpart (L);
+	struct rspamd_lua_regexp *re = lua_check_regexp (L, 2);
+	gint lim = -1;
+	enum rspamd_lua_words_type how = RSPAMD_LUA_WORDS_STEM;
+
+	if (part == NULL || re == NULL) {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	if (IS_PART_EMPTY (part) || part->utf_words == NULL) {
+		lua_createtable (L, 0, 0);
+	}
+	else {
+		if (lua_type (L, 3) == LUA_TSTRING) {
+			const gchar *how_str = lua_tostring (L, 3);
+
+			how = word_extract_type_from_string (how_str);
+
+			if (how == RSPAMD_LUA_WORDS_MAX) {
+				return luaL_error (L, "invalid extraction type: %s", how_str);
+			}
+		}
+
+		if (lua_type (L, 4) == LUA_TNUMBER) {
+			lim = lua_tointeger (L, 4);
+		}
+
+		guint cnt, i;
+
+		lua_createtable (L, 8, 0);
+
+		for (i = 0, cnt = 1; i < part->utf_words->len; i ++) {
+			rspamd_stat_token_t *w = &g_array_index (part->utf_words,
+					rspamd_stat_token_t, i);
+
+			switch (how) {
+			case RSPAMD_LUA_WORDS_STEM:
+				if (w->stemmed.len > 0) {
+					if (rspamd_regexp_match (re->re, w->stemmed.begin,
+							w->stemmed.len, FALSE)) {
+						lua_pushlstring (L, w->stemmed.begin, w->stemmed.len);
+						lua_rawseti (L, -2, cnt++);
+					}
+				}
+				break;
+			case RSPAMD_LUA_WORDS_NORM:
+				if (w->normalized.len > 0) {
+					if (rspamd_regexp_match (re->re, w->normalized.begin,
+							w->normalized.len, FALSE)) {
+						lua_pushlstring (L, w->normalized.begin, w->normalized.len);
+						lua_rawseti (L, -2, cnt++);
+					}
+				}
+				break;
+			case RSPAMD_LUA_WORDS_RAW:
+				if (w->original.len > 0) {
+					if (rspamd_regexp_match (re->re, w->original.begin,
+							w->original.len, TRUE)) {
+						lua_pushlstring (L, w->original.begin, w->original.len);
+						lua_rawseti (L, -2, cnt++);
+					}
+				}
+				break;
+			case RSPAMD_LUA_WORDS_FULL:
+				if (rspamd_regexp_match (re->re, w->normalized.begin,
+						w->normalized.len, FALSE)) {
+					rspamd_lua_push_full_word (L, w);
+					/* Push to the resulting vector */
+					lua_rawseti (L, -2, cnt++);
+				}
+				break;
+			default:
+				break;
+			}
+
+			if (lim > 0 && cnt >= lim) {
+				break;
+			}
+		}
 	}
 
 	return 1;
@@ -1440,16 +1560,21 @@ lua_mimepart_get_header_common (lua_State *L, enum rspamd_lua_task_header_type h
 {
 	struct rspamd_mime_part *part = lua_check_mimepart (L);
 	const gchar *name;
-	GPtrArray *ar;
+	gboolean strong = FALSE;
 
 	name = luaL_checkstring (L, 2);
 
 	if (name && part) {
 
-		ar = rspamd_message_get_header_from_hash (part->raw_headers, NULL,
-				name, FALSE);
+		if (lua_isboolean (L, 3)) {
+			strong = lua_toboolean (L, 3);
+		}
 
-		return rspamd_lua_push_header_array (L, ar, how);
+		return rspamd_lua_push_header_array (L,
+				name,
+				rspamd_message_get_header_from_hash (part->raw_headers, name),
+				how,
+				strong);
 	}
 
 	lua_pushnil (L);
@@ -1797,8 +1922,7 @@ lua_mimepart_headers_foreach (lua_State *L)
 	struct rspamd_mime_part *part = lua_check_mimepart (L);
 	enum rspamd_lua_task_header_type how = RSPAMD_TASK_HEADER_PUSH_SIMPLE;
 	struct rspamd_lua_regexp *re = NULL;
-	GList *cur;
-	struct rspamd_mime_header *hdr;
+	struct rspamd_mime_header *hdr, *cur;
 	gint old_top;
 
 	if (part && lua_isfunction (L, 2)) {
@@ -1833,23 +1957,20 @@ lua_mimepart_headers_foreach (lua_State *L)
 		}
 
 		if (part->headers_order) {
-			cur = part->headers_order->head;
+			hdr = part->headers_order;
 
-			while (cur) {
-				hdr = cur->data;
-
+			LL_FOREACH (hdr, cur) {
 				if (re && re->re) {
-					if (!rspamd_regexp_match (re->re, hdr->name,
-							strlen (hdr->name),FALSE)) {
-						cur = g_list_next (cur);
+					if (!rspamd_regexp_match (re->re, cur->name,
+							strlen (cur->name),FALSE)) {
 						continue;
 					}
 				}
 
 				old_top = lua_gettop (L);
 				lua_pushvalue (L, 2);
-				lua_pushstring (L, hdr->name);
-				rspamd_lua_push_header (L, hdr, how);
+				lua_pushstring (L, cur->name);
+				rspamd_lua_push_header (L, cur, how);
 
 				if (lua_pcall (L, 2, LUA_MULTRET, 0) != 0) {
 					msg_err ("call to header_foreach failed: %s",
@@ -1869,7 +1990,6 @@ lua_mimepart_headers_foreach (lua_State *L)
 				}
 
 				lua_settop (L, old_top);
-				cur = g_list_next (cur);
 			}
 		}
 	}

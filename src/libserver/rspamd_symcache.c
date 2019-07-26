@@ -66,7 +66,6 @@ INIT_LOG_MODULE(symcache)
 	(dyn_item)->finished = 1
 #define CLR_FINISH_BIT(checkpoint, dyn_item) \
 	(dyn_item)->finished = 0
-
 static const guchar rspamd_symcache_magic[8] = {'r', 's', 'c', 2, 0, 0, 0, 0 };
 
 struct rspamd_symcache_header {
@@ -80,6 +79,22 @@ struct symcache_order {
 	GPtrArray *d;
 	guint id;
 	ref_entry_t ref;
+};
+
+/*
+ * This structure is optimised to store ids list:
+ * - If the first element is -1 then use dynamic part, else use static part
+ */
+struct rspamd_symcache_id_list {
+	union {
+		guint32 st[4];
+		struct {
+			guint32 e; /* First element */
+			guint16 len;
+			guint16 allocated;
+			guint *n;
+		} dyn;
+	};
 };
 
 struct rspamd_symcache_item {
@@ -115,10 +130,18 @@ struct rspamd_symcache_item {
 	guint order;
 	gint id;
 	gint frequency_peaks;
+	/* Settings ids */
+	struct rspamd_symcache_id_list allowed_ids;
+	/* Allows execution but not symbols insertion */
+	struct rspamd_symcache_id_list exec_only_ids;
+	struct rspamd_symcache_id_list forbidden_ids;
 
 	/* Dependencies */
 	GPtrArray *deps;
 	GPtrArray *rdeps;
+
+	/* Container */
+	GPtrArray *container;
 };
 
 struct item_stat {
@@ -143,7 +166,6 @@ struct rspamd_symcache {
 	GPtrArray *composites;
 	GPtrArray *idempotent;
 	GPtrArray *virtual;
-	GPtrArray *squeezed;
 	GList *delayed_deps;
 	GList *delayed_conditions;
 	rspamd_mempool_t *static_pool;
@@ -155,6 +177,7 @@ struct rspamd_symcache {
 	guint id;
 	struct rspamd_config *cfg;
 	gdouble reload_time;
+	gdouble last_profile;
 	gint peak_cb;
 };
 
@@ -199,6 +222,8 @@ struct cache_savepoint {
 	enum rspamd_cache_savepoint_stage pass;
 	guint version;
 	guint items_inflight;
+	gboolean profile;
+	gdouble profile_start;
 
 	struct rspamd_metric_result *rs;
 	gdouble lim;
@@ -210,11 +235,18 @@ struct cache_savepoint {
 
 struct rspamd_cache_refresh_cbdata {
 	gdouble last_resort;
-	struct event resort_ev;
+	ev_timer resort_ev;
 	struct rspamd_symcache *cache;
 	struct rspamd_worker *w;
-	struct event_base *ev_base;
+	struct ev_loop *event_loop;
 };
+
+/* At least once per minute */
+#define PROFILE_MAX_TIME (60.0)
+/* For messages larger than 2Mb enable profiling */
+#define PROFILE_MESSAGE_SIZE_THRESHOLD (1024 * 1024 * 2)
+/* Enable profile at least once per this amount of messages processed */
+#define PROFILE_PROBABILITY (0.01)
 
 /* weight, frequency, time */
 #define TIME_ALPHA (1.0)
@@ -256,6 +288,12 @@ rspamd_symcache_order_unref (gpointer p)
 	REF_RELEASE (ord);
 }
 
+static gint
+rspamd_id_cmp (const void * a, const void * b)
+{
+	return (*(guint32*)a - *(guint32*)b);
+}
+
 static struct symcache_order *
 rspamd_symcache_order_new (struct rspamd_symcache *cache,
 		gsize nelts)
@@ -279,7 +317,8 @@ rspamd_symcache_get_dynamic (struct cache_savepoint *checkpoint,
 
 static inline struct rspamd_symcache_item *
 rspamd_symcache_find_filter (struct rspamd_symcache *cache,
-							 const gchar *name)
+							 const gchar *name,
+							 bool resolve_parent)
 {
 	struct rspamd_symcache_item *item;
 
@@ -293,7 +332,7 @@ rspamd_symcache_find_filter (struct rspamd_symcache *cache,
 
 	if (item != NULL) {
 
-		if (item->is_virtual) {
+		if (resolve_parent && item->is_virtual && !(item->type & SYMBOL_TYPE_GHOST)) {
 			item = g_ptr_array_index (cache->items_by_id,
 					item->specific.virtual.parent);
 		}
@@ -320,7 +359,7 @@ rspamd_symcache_get_parent (struct rspamd_symcache *cache,
 
 	if (item != NULL) {
 
-		if (item->is_virtual) {
+		if (item->is_virtual && !(item->type & SYMBOL_TYPE_GHOST)) {
 			item = g_ptr_array_index (cache->items_by_id,
 					item->specific.virtual.parent);
 		}
@@ -519,7 +558,7 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 	while (cur) {
 		ddep = cur->data;
 
-		it = rspamd_symcache_find_filter (cache, ddep->from);
+		it = rspamd_symcache_find_filter (cache, ddep->from, true);
 
 		if (it == NULL) {
 			msg_err_cache ("cannot register delayed dependency between %s and %s, "
@@ -538,7 +577,7 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 	while (cur) {
 		dcond = cur->data;
 
-		it = rspamd_symcache_find_filter (cache, dcond->sym);
+		it = rspamd_symcache_find_filter (cache, dcond->sym, true);
 
 		if (it == NULL) {
 			msg_err_cache (
@@ -556,7 +595,7 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 	PTR_ARRAY_FOREACH (cache->items_by_id, i, it) {
 
 		PTR_ARRAY_FOREACH (it->deps, j, dep) {
-			dit = rspamd_symcache_find_filter (cache, dep->sym);
+			dit = rspamd_symcache_find_filter (cache, dep->sym, true);
 
 			if (dit != NULL) {
 				if (!dit->is_filter) {
@@ -587,7 +626,8 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 				}
 			}
 			else {
-				msg_err_cache ("cannot find dependency on symbol %s", dep->sym);
+				msg_err_cache ("cannot find dependency on symbol %s for symbol %s",
+						dep->sym, it->symbol);
 			}
 		}
 
@@ -734,21 +774,21 @@ rspamd_symcache_load_items (struct rspamd_symcache *cache, const gchar *name)
 
 			elt = ucl_object_lookup (cur, "frequency");
 			if (elt && ucl_object_type (elt) == UCL_OBJECT) {
-				const ucl_object_t *cur;
+				const ucl_object_t *freq_elt;
 
-				cur = ucl_object_lookup (elt, "avg");
+				freq_elt = ucl_object_lookup (elt, "avg");
 
-				if (cur) {
-					item->st->avg_frequency = ucl_object_todouble (cur);
+				if (freq_elt) {
+					item->st->avg_frequency = ucl_object_todouble (freq_elt);
 				}
-				cur = ucl_object_lookup (elt, "stddev");
+				freq_elt = ucl_object_lookup (elt, "stddev");
 
-				if (cur) {
-					item->st->stddev_frequency = ucl_object_todouble (cur);
+				if (freq_elt) {
+					item->st->stddev_frequency = ucl_object_todouble (freq_elt);
 				}
 			}
 
-			if (item->is_virtual) {
+			if (item->is_virtual && !(item->type & SYMBOL_TYPE_GHOST)) {
 				g_assert (item->specific.virtual.parent < (gint)cache->items_by_id->len);
 				parent = g_ptr_array_index (cache->items_by_id,
 						item->specific.virtual.parent);
@@ -886,21 +926,50 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 	if (name == NULL && !(type & SYMBOL_TYPE_CALLBACK)) {
 		msg_warn_cache ("no name for non-callback symbol!");
 	}
-	else if ((type & SYMBOL_TYPE_VIRTUAL) && parent == -1) {
+	else if ((type & SYMBOL_TYPE_VIRTUAL & (~SYMBOL_TYPE_GHOST)) && parent == -1) {
 		msg_warn_cache ("no parent symbol is associated with virtual symbol %s",
 			name);
 	}
 
 	if (name != NULL && !(type & SYMBOL_TYPE_CALLBACK)) {
-		if (g_hash_table_lookup (cache->items_by_symbol, name) != NULL) {
-			msg_err_cache ("skip duplicate symbol registration for %s", name);
-			return -1;
+		struct rspamd_symcache_item *existing;
+
+		if ((existing = g_hash_table_lookup (cache->items_by_symbol, name)) != NULL) {
+
+			if (existing->type & SYMBOL_TYPE_GHOST) {
+				/*
+				 * Complicated part:
+				 * - we need to remove the existing ghost symbol
+				 * - we need to cleanup containers:
+				 *   - symbols hash
+				 *   - specific array
+				 *   - items_by_it
+				 *   - decrement used_items
+				 */
+				msg_info_cache ("duplicate ghost symbol %s is removed", name);
+
+				if (existing->container) {
+					g_ptr_array_remove (existing->container, existing);
+				}
+
+				g_ptr_array_remove (cache->items_by_id, existing->container);
+				cache->used_items --;
+				g_hash_table_remove (cache->items_by_symbol, name);
+				/*
+				 * Here can be memory leak, but we assume that ghost symbols
+				 * are also virtual
+				 */
+			}
+			else {
+				msg_err_cache ("skip duplicate symbol registration for %s", name);
+				return -1;
+			}
 		}
 	}
 
 	if (type & (SYMBOL_TYPE_CLASSIFIER|SYMBOL_TYPE_CALLBACK|
 			SYMBOL_TYPE_PREFILTER|SYMBOL_TYPE_POSTFILTER|
-			SYMBOL_TYPE_IDEMPOTENT)) {
+			SYMBOL_TYPE_IDEMPOTENT|SYMBOL_TYPE_GHOST)) {
 		type |= SYMBOL_TYPE_NOSTAT;
 	}
 
@@ -930,16 +999,20 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 
 		if (item->type & SYMBOL_TYPE_PREFILTER) {
 			g_ptr_array_add (cache->prefilters, item);
+			item->container = cache->prefilters;
 		}
 		else if (item->type & SYMBOL_TYPE_IDEMPOTENT) {
 			g_ptr_array_add (cache->idempotent, item);
+			item->container = cache->idempotent;
 		}
 		else if (item->type & SYMBOL_TYPE_POSTFILTER) {
 			g_ptr_array_add (cache->postfilters, item);
+			item->container = cache->postfilters;
 		}
 		else {
 			item->is_filter = TRUE;
 			g_ptr_array_add (cache->filters, item);
+			item->container = cache->filters;
 		}
 
 		item->id = cache->items_by_id->len;
@@ -952,7 +1025,7 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 	else {
 		/*
 		 * Three possibilities here when no function is specified:
-		 * - virtual symbol
+		 * - virtual symbol (beware of ghosts!)
 		 * - classifier symbol
 		 * - composite symbol
 		 */
@@ -964,6 +1037,7 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 
 			item->id = cache->items_by_id->len;
 			g_ptr_array_add (cache->items_by_id, item);
+			item->container = cache->composites;
 		}
 		else if (item->type & SYMBOL_TYPE_CLASSIFIER) {
 			/* Treat it as normal symbol to allow enable/disable */
@@ -976,19 +1050,13 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 			item->specific.normal.condition_cb = -1;
 		}
 		else {
-			/* Require parent */
-			g_assert (parent != -1);
-
 			item->is_virtual = TRUE;
 			item->specific.virtual.parent = parent;
 			item->id = cache->virtual->len;
 			g_ptr_array_add (cache->virtual, item);
+			item->container = cache->virtual;
 			/* Not added to items_by_id, handled by parent */
 		}
-	}
-
-	if (item->type & SYMBOL_TYPE_SQUEEZED) {
-		g_ptr_array_add (cache->squeezed, item);
 	}
 
 	cache->used_items ++;
@@ -1130,7 +1198,7 @@ rspamd_symcache_destroy (struct rspamd_symcache *cache)
 		g_ptr_array_free (cache->postfilters, TRUE);
 		g_ptr_array_free (cache->idempotent, TRUE);
 		g_ptr_array_free (cache->composites, TRUE);
-		g_ptr_array_free (cache->squeezed, TRUE);
+		g_ptr_array_free (cache->virtual, TRUE);
 		REF_RELEASE (cache->items_by_order);
 
 		if (cache->peak_cb != -1) {
@@ -1158,7 +1226,6 @@ rspamd_symcache_new (struct rspamd_config *cfg)
 	cache->idempotent = g_ptr_array_new ();
 	cache->composites = g_ptr_array_new ();
 	cache->virtual = g_ptr_array_new ();
-	cache->squeezed = g_ptr_array_new ();
 	cache->reload_time = cfg->cache_reload_time;
 	cache->total_hits = 1;
 	cache->total_weight = 1.0;
@@ -1251,20 +1318,23 @@ rspamd_symcache_validate_cb (gpointer k, gpointer v, gpointer ud)
 	}
 
 	if (item->is_virtual) {
-		g_assert (item->specific.virtual.parent < (gint)cache->items_by_id->len);
-		parent = g_ptr_array_index (cache->items_by_id,
-				item->specific.virtual.parent);
+		if (!(item->type & SYMBOL_TYPE_GHOST)) {
+			g_assert (item->specific.virtual.parent != -1);
+			g_assert (item->specific.virtual.parent < (gint) cache->items_by_id->len);
+			parent = g_ptr_array_index (cache->items_by_id,
+					item->specific.virtual.parent);
 
-		if (fabs (parent->st->weight) < fabs (item->st->weight)) {
-			parent->st->weight = item->st->weight;
-		}
+			if (fabs (parent->st->weight) < fabs (item->st->weight)) {
+				parent->st->weight = item->st->weight;
+			}
 
-		p1 = abs (item->priority);
-		p2 = abs (parent->priority);
+			p1 = abs (item->priority);
+			p2 = abs (parent->priority);
 
-		if (p1 != p2) {
-			parent->priority = MAX (p1, p2);
-			item->priority = parent->priority;
+			if (p1 != p2) {
+				parent->priority = MAX (p1, p2);
+				item->priority = parent->priority;
+			}
 		}
 	}
 
@@ -1285,6 +1355,7 @@ rspamd_symcache_metric_validate_cb (gpointer k, gpointer v, gpointer ud)
 
 	if (item) {
 		item->st->weight = weight;
+		s->cache_item = item;
 	}
 }
 
@@ -1380,13 +1451,141 @@ rspamd_symcache_metric_limit (struct rspamd_task *task,
 	return FALSE;
 }
 
+static inline gboolean
+rspamd_symcache_check_id_list (const struct rspamd_symcache_id_list *ls, guint32 id)
+{
+	guint i;
+
+	if (ls->dyn.e == -1) {
+		guint *res = bsearch (&id, ls->dyn.n, ls->dyn.len, sizeof (guint32),
+				rspamd_id_cmp);
+
+		if (res) {
+			return TRUE;
+		}
+	}
+	else {
+		for (i = 0; i < G_N_ELEMENTS (ls->st); i ++) {
+			if (ls->st[i] == id) {
+				return TRUE;
+			}
+			else if (ls->st[i] == 0) {
+				return FALSE;
+			}
+		}
+	}
+
+	return FALSE;
+}
+
+gboolean
+rspamd_symcache_is_item_allowed (struct rspamd_task *task,
+								 struct rspamd_symcache_item *item,
+								 gboolean exec_only)
+{
+	const gchar *what = "execution";
+
+	/* Static checks */
+	if (!item->enabled ||
+		(RSPAMD_TASK_IS_EMPTY (task) && !(item->type & SYMBOL_TYPE_EMPTY)) ||
+		(item->type & SYMBOL_TYPE_MIME_ONLY && !RSPAMD_TASK_IS_MIME(task))) {
+
+		if (!item->enabled) {
+			msg_debug_cache_task ("skipping check of %s as it is permanently disabled",
+					item->symbol);
+
+			return FALSE;
+		}
+		else {
+			/*
+			 * Exclude virtual symbols
+			 */
+			if (exec_only) {
+				msg_debug_cache_task ("skipping check of %s as it cannot be "
+									  "executed for this task type",
+						item->symbol);
+
+				return FALSE;
+			}
+		}
+	}
+
+	if (!exec_only) {
+		what = "symbol insertion";
+	}
+
+	/* Settings checks */
+	if (task->settings_elt != 0) {
+		guint32 id = task->settings_elt->id;
+
+		if (item->forbidden_ids.st[0] != 0 &&
+			rspamd_symcache_check_id_list (&item->forbidden_ids,
+					id)) {
+			msg_debug_cache_task ("deny %s of %s as it is forbidden for "
+						 "settings id %ud",
+						 what,
+						 item->symbol,
+						 id);
+
+			return FALSE;
+		}
+
+		if (!(item->type & SYMBOL_TYPE_EXPLICIT_DISABLE)) {
+			if (item->allowed_ids.st[0] == 0 ||
+				!rspamd_symcache_check_id_list (&item->allowed_ids,
+						id)) {
+
+				if (task->settings_elt->policy == RSPAMD_SETTINGS_POLICY_IMPLICIT_ALLOW) {
+					msg_debug_cache_task ("allow execution of %s settings id %ud "
+										  "allows implicit execution of the symbols",
+							item->symbol,
+							id);
+
+					return TRUE;
+				}
+
+				if (exec_only) {
+					/*
+					 * Special case if any of our virtual children are enabled
+					 */
+					if (rspamd_symcache_check_id_list (&item->exec_only_ids, id)) {
+						return TRUE;
+					}
+				}
+
+				msg_debug_cache_task ("deny %s of %s as it is not listed "
+									  "as allowed for settings id %ud",
+						what,
+						item->symbol,
+						id);
+				return FALSE;
+			}
+		}
+		else {
+			msg_debug_cache_task ("allow %s of %s for "
+								  "settings id %ud as it can be only disabled explicitly",
+					what,
+					item->symbol,
+					id);
+		}
+	}
+	else if (item->type & SYMBOL_TYPE_EXPLICIT_ENABLE) {
+		msg_debug_cache_task ("deny %s of %s as it must be explicitly enabled",
+				what,
+				item->symbol);
+		return FALSE;
+	}
+
+	/* Allow all symbols with no settings id */
+	return TRUE;
+}
+
 static gboolean
 rspamd_symcache_check_symbol (struct rspamd_task *task,
 		struct rspamd_symcache *cache,
 		struct rspamd_symcache_item *item,
 		struct cache_savepoint *checkpoint)
 {
-	double t1 = 0;
 	struct rspamd_task **ptask;
 	lua_State *L;
 	gboolean check = TRUE;
@@ -1418,9 +1617,7 @@ rspamd_symcache_check_symbol (struct rspamd_task *task,
 	/* Check has been started */
 	SET_START_BIT (checkpoint, dyn_item);
 
-	if (!item->enabled ||
-		(RSPAMD_TASK_IS_EMPTY (task) && !(item->type & SYMBOL_TYPE_EMPTY)) ||
-		(item->type & SYMBOL_TYPE_MIME_ONLY && !RSPAMD_TASK_IS_MIME(task))) {
+	if (!rspamd_symcache_is_item_allowed (task, item, TRUE)) {
 		check = FALSE;
 	}
 	else if (item->specific.normal.condition_cb != -1) {
@@ -1440,20 +1637,21 @@ rspamd_symcache_check_symbol (struct rspamd_task *task,
 			check = lua_toboolean (L, -1);
 			lua_pop (L, 1);
 		}
+
+		if (!check) {
+			msg_debug_cache_task ("skipping check of %s as its start condition is false",
+					item->symbol);
+		}
 	}
 
 	if (check) {
 		msg_debug_cache_task ("execute %s, %d", item->symbol, item->id);
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FUNC
-		struct timeval tv;
 
-		event_base_update_cache_time (task->ev_base);
-		event_base_gettimeofday_cached (task->ev_base, &tv);
-		t1 = tv_to_double (&tv);
-#else
-		t1 = rspamd_get_ticks (FALSE);
-#endif
-		dyn_item->start_msec = (t1 - task->time_real) * 1e3;
+		if (checkpoint->profile) {
+			dyn_item->start_msec = (rspamd_get_virtual_ticks () -
+					checkpoint->profile_start) * 1e3;
+		}
+
 		dyn_item->async_events = 0;
 		checkpoint->cur_item = item;
 		checkpoint->items_inflight ++;
@@ -1475,8 +1673,6 @@ rspamd_symcache_check_symbol (struct rspamd_task *task,
 		return FALSE;
 	}
 	else {
-		msg_debug_cache_task ("skipping check of %s as its start condition is false",
-				item->symbol);
 		SET_FINISH_BIT (checkpoint, dyn_item);
 	}
 
@@ -1604,6 +1800,18 @@ rspamd_symcache_make_checkpoint (struct rspamd_task *task,
 	rspamd_mempool_add_destructor (task->task_pool,
 			rspamd_symcache_order_unref, checkpoint->order);
 
+	/* Calculate profile probability */
+	ev_tstamp now = ev_now (task->event_loop);
+
+	if ((cache->last_profile == 0.0 || now > cache->last_profile + PROFILE_MAX_TIME) ||
+			(task->msg.len >= PROFILE_MESSAGE_SIZE_THRESHOLD) ||
+			(rspamd_random_double_fast () >= (1 - PROFILE_PROBABILITY))) {
+		msg_debug_cache_task ("enable profiling of symbols for task");
+		checkpoint->profile = TRUE;
+		checkpoint->profile_start = rspamd_get_virtual_ticks ();
+		cache->last_profile = now;
+	}
+
 	checkpoint->pass = RSPAMD_CACHE_PASS_INIT;
 	task->checkpoint = checkpoint;
 
@@ -1625,7 +1833,7 @@ rspamd_symcache_process_settings (struct rspamd_task *task,
 	wl = ucl_object_lookup (task->settings, "whitelist");
 
 	if (wl != NULL) {
-		msg_info_task ("<%s> is whitelisted", task->message_id);
+		msg_info_task ("task is whitelisted");
 		task->flags |= RSPAMD_TASK_FLAG_SKIP;
 		return TRUE;
 	}
@@ -1832,9 +2040,9 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 
 			if (!(item->type & SYMBOL_TYPE_FINE)) {
 				if (rspamd_symcache_metric_limit (task, checkpoint)) {
-					msg_info_task ("<%s> has already scored more than %.2f, so do "
+					msg_info_task ("task has already scored more than %.2f, so do "
 								   "not "
-								   "plan more checks", task->message_id,
+								   "plan more checks",
 							checkpoint->rs->score);
 					all_done = TRUE;
 					break;
@@ -1990,20 +2198,36 @@ rspamd_symcache_counters_cb (gpointer k, gpointer v, gpointer ud)
 			"symbol", 0, false);
 
 	if (item->is_virtual) {
-		parent = g_ptr_array_index (cbd->cache->items_by_id,
-				item->specific.virtual.parent);
-		ucl_object_insert_key (obj,
-				ucl_object_fromdouble (ROUND_DOUBLE (item->st->weight)),
-				"weight", 0, false);
-		ucl_object_insert_key (obj,
-				ucl_object_fromdouble (ROUND_DOUBLE (parent->st->avg_frequency)),
-				"frequency", 0, false);
-		ucl_object_insert_key (obj,
-				ucl_object_fromint (parent->st->total_hits),
-				"hits", 0, false);
-		ucl_object_insert_key (obj,
-				ucl_object_fromdouble (ROUND_DOUBLE (parent->st->avg_time)),
-				"time", 0, false);
+		if (!(item->type & SYMBOL_TYPE_GHOST)) {
+			parent = g_ptr_array_index (cbd->cache->items_by_id,
+					item->specific.virtual.parent);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (ROUND_DOUBLE (item->st->weight)),
+					"weight", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (ROUND_DOUBLE (parent->st->avg_frequency)),
+					"frequency", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromint (parent->st->total_hits),
+					"hits", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (ROUND_DOUBLE (parent->st->avg_time)),
+					"time", 0, false);
+		}
+		else {
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (ROUND_DOUBLE (item->st->weight)),
+					"weight", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (0.0),
+					"frequency", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (0.0),
+					"hits", 0, false);
+			ucl_object_insert_key (obj,
+					ucl_object_fromdouble (0.0),
+					"time", 0, false);
+		}
 	}
 	else {
 		ucl_object_insert_key (obj,
@@ -2042,14 +2266,14 @@ rspamd_symcache_counters (struct rspamd_symcache *cache)
 }
 
 static void
-rspamd_symcache_call_peak_cb (struct event_base *ev_base,
+rspamd_symcache_call_peak_cb (struct ev_loop *ev_base,
 		struct rspamd_symcache *cache,
 		struct rspamd_symcache_item *item,
 		gdouble cur_value,
 		gdouble cur_err)
 {
 	lua_State *L = cache->cfg->lua_state;
-	struct event_base **pbase;
+	struct ev_loop **pbase;
 
 	lua_rawgeti (L, LUA_REGISTRYINDEX, cache->peak_cb);
 	pbase = lua_newuserdata (L, sizeof (*pbase));
@@ -2069,11 +2293,11 @@ rspamd_symcache_call_peak_cb (struct event_base *ev_base,
 }
 
 static void
-rspamd_symcache_resort_cb (gint fd, short what, gpointer ud)
+rspamd_symcache_resort_cb (EV_P_ ev_timer *w, int revents)
 {
-	struct timeval tv;
 	gdouble tm;
-	struct rspamd_cache_refresh_cbdata *cbdata = ud;
+	struct rspamd_cache_refresh_cbdata *cbdata =
+			(struct rspamd_cache_refresh_cbdata *)w->data;
 	struct rspamd_symcache *cache;
 	struct rspamd_symcache_item *item;
 	guint i;
@@ -2086,10 +2310,8 @@ rspamd_symcache_resort_cb (gint fd, short what, gpointer ud)
 	cur_ticks = rspamd_get_ticks (FALSE);
 	msg_debug_cache ("resort symbols cache, next reload in %.2f seconds", tm);
 	g_assert (cache != NULL);
-	evtimer_set (&cbdata->resort_ev, rspamd_symcache_resort_cb, cbdata);
-	event_base_set (cbdata->ev_base, &cbdata->resort_ev);
-	double_to_tv (tm, &tv);
-	event_add (&cbdata->resort_ev, &tv);
+	cbdata->resort_ev.repeat = tm;
+	ev_timer_again (EV_A_ w);
 
 	if (rspamd_worker_is_primary_controller (cbdata->w)) {
 		/* Gather stats from shared execution times */
@@ -2132,7 +2354,7 @@ rspamd_symcache_resort_cb (gint fd, short what, gpointer ud)
 							item->frequency_peaks);
 
 					if (cache->peak_cb != -1) {
-						rspamd_symcache_call_peak_cb (cbdata->ev_base,
+						rspamd_symcache_call_peak_cb (cbdata->event_loop,
 								cache, item,
 								cur_value, cur_err);
 					}
@@ -2152,48 +2374,47 @@ rspamd_symcache_resort_cb (gint fd, short what, gpointer ud)
 			}
 		}
 
-
 		cbdata->last_resort = cur_ticks;
 		/* We don't do actual sorting due to topological guarantees */
 	}
 }
 
+static void
+rspamd_symcache_refresh_dtor (void *d)
+{
+	struct rspamd_cache_refresh_cbdata *cbdata =
+			(struct rspamd_cache_refresh_cbdata *)d;
+
+	ev_timer_stop (cbdata->event_loop, &cbdata->resort_ev);
+}
+
 void
 rspamd_symcache_start_refresh (struct rspamd_symcache *cache,
-							   struct event_base *ev_base, struct rspamd_worker *w)
+							   struct ev_loop *ev_base, struct rspamd_worker *w)
 {
-	struct timeval tv;
 	gdouble tm;
 	struct rspamd_cache_refresh_cbdata *cbdata;
 
 	cbdata = rspamd_mempool_alloc0 (cache->static_pool, sizeof (*cbdata));
 	cbdata->last_resort = rspamd_get_ticks (TRUE);
-	cbdata->ev_base = ev_base;
+	cbdata->event_loop = ev_base;
 	cbdata->w = w;
 	cbdata->cache = cache;
 	tm = rspamd_time_jitter (cache->reload_time, 0);
 	msg_debug_cache ("next reload in %.2f seconds", tm);
 	g_assert (cache != NULL);
-	evtimer_set (&cbdata->resort_ev, rspamd_symcache_resort_cb,
-			cbdata);
-	event_base_set (ev_base, &cbdata->resort_ev);
-	double_to_tv (tm, &tv);
-	event_add (&cbdata->resort_ev, &tv);
+	cbdata->resort_ev.data = cbdata;
+	ev_timer_init (&cbdata->resort_ev, rspamd_symcache_resort_cb,
+			tm, tm);
+	ev_timer_start (cbdata->event_loop, &cbdata->resort_ev);
 	rspamd_mempool_add_destructor (cache->static_pool,
-			(rspamd_mempool_destruct_t) event_del,
-			&cbdata->resort_ev);
+			rspamd_symcache_refresh_dtor, cbdata);
 }
 
 void
 rspamd_symcache_inc_frequency (struct rspamd_symcache *cache,
-							   const gchar *symbol)
+							   struct rspamd_symcache_item *item)
 {
-	struct rspamd_symcache_item *item;
-
-	g_assert (cache != NULL);
-
-	item = g_hash_table_lookup (cache->items_by_symbol, symbol);
-
 	if (item != NULL) {
 		g_atomic_int_inc (&item->st->hits);
 	}
@@ -2334,7 +2555,7 @@ rspamd_symcache_disable_all_symbols (struct rspamd_task *task,
 	PTR_ARRAY_FOREACH (cache->items_by_id, i, item) {
 		dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
 
-		if (!(item->type & (SYMBOL_TYPE_SQUEEZED|skip_mask))) {
+		if (!(item->type & (skip_mask))) {
 			SET_FINISH_BIT (checkpoint, dyn_item);
 			SET_START_BIT (checkpoint, dyn_item);
 		}
@@ -2357,18 +2578,13 @@ rspamd_symcache_disable_symbol_checkpoint (struct rspamd_task *task,
 		checkpoint = task->checkpoint;
 	}
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
-		if (!(item->type & SYMBOL_TYPE_SQUEEZED)) {
-			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
-			SET_FINISH_BIT (checkpoint, dyn_item);
-			SET_START_BIT (checkpoint, dyn_item);
-			msg_debug_cache_task ("disable execution of %s", symbol);
-		}
-		else {
-			msg_debug_cache_task ("skip disabling squeezed symbol %s", symbol);
-		}
+		dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
+		SET_FINISH_BIT (checkpoint, dyn_item);
+		SET_START_BIT (checkpoint, dyn_item);
+		msg_debug_cache_task ("disable execution of %s", symbol);
 	}
 	else {
 		msg_info_task ("cannot disable %s: not found", symbol);
@@ -2391,18 +2607,13 @@ rspamd_symcache_enable_symbol_checkpoint (struct rspamd_task *task,
 		checkpoint = task->checkpoint;
 	}
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
-		if (!(item->type & SYMBOL_TYPE_SQUEEZED)) {
-			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
-			dyn_item->finished = 0;
-			dyn_item->started = 0;
-			msg_debug_cache_task ("enable execution of %s", symbol);
-		}
-		else {
-			msg_debug_cache_task ("skip enabling squeezed symbol %s", symbol);
-		}
+		dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
+		dyn_item->finished = 0;
+		dyn_item->started = 0;
+		msg_debug_cache_task ("enable execution of %s", symbol);
 	}
 	else {
 		msg_info_task ("cannot enable %s: not found", symbol);
@@ -2418,7 +2629,7 @@ rspamd_symcache_get_cbdata (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		return item->specific.normal.user_data;
@@ -2446,7 +2657,7 @@ rspamd_symcache_is_checked (struct rspamd_task *task,
 		checkpoint = task->checkpoint;
 	}
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
@@ -2465,7 +2676,7 @@ rspamd_symcache_disable_symbol_perm (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		item->enabled = FALSE;
@@ -2481,7 +2692,7 @@ rspamd_symcache_enable_symbol_perm (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		item->enabled = TRUE;
@@ -2516,31 +2727,40 @@ rspamd_symcache_is_symbol_enabled (struct rspamd_task *task,
 
 
 	if (checkpoint) {
-		item = rspamd_symcache_find_filter (cache, symbol);
+		item = rspamd_symcache_find_filter (cache, symbol, true);
 
 		if (item) {
-			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
-			if (CHECK_START_BIT (checkpoint, dyn_item)) {
+
+			if (!rspamd_symcache_is_item_allowed (task, item, TRUE)) {
 				ret = FALSE;
 			}
 			else {
-				if (item->specific.normal.condition_cb != -1) {
-					/* We also executes condition callback to check if we need this symbol */
-					L = task->cfg->lua_state;
-					lua_rawgeti (L, LUA_REGISTRYINDEX,
-							item->specific.normal.condition_cb);
-					ptask = lua_newuserdata (L, sizeof (struct rspamd_task *));
-					rspamd_lua_setclass (L, "rspamd{task}", -1);
-					*ptask = task;
+				dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
+				if (CHECK_START_BIT (checkpoint, dyn_item)) {
+					ret = FALSE;
+				}
+				else {
+					if (item->specific.normal.condition_cb != -1) {
+						/*
+						 * We also executes condition callback to check
+						 * if we need this symbol
+						 */
+						L = task->cfg->lua_state;
+						lua_rawgeti (L, LUA_REGISTRYINDEX,
+								item->specific.normal.condition_cb);
+						ptask = lua_newuserdata (L, sizeof (struct rspamd_task *));
+						rspamd_lua_setclass (L, "rspamd{task}", -1);
+						*ptask = task;
 
-					if (lua_pcall (L, 1, 1, 0) != 0) {
-						msg_info_task ("call to condition for %s failed: %s",
-								item->symbol, lua_tostring (L, -1));
-						lua_pop (L, 1);
-					}
-					else {
-						ret = lua_toboolean (L, -1);
-						lua_pop (L, 1);
+						if (lua_pcall (L, 1, 1, 0) != 0) {
+							msg_info_task ("call to condition for %s failed: %s",
+									item->symbol, lua_tostring (L, -1));
+							lua_pop (L, 1);
+						}
+						else {
+							ret = lua_toboolean (L, -1);
+							lua_pop (L, 1);
+						}
 					}
 				}
 			}
@@ -2567,7 +2787,7 @@ rspamd_symcache_enable_symbol (struct rspamd_task *task,
 	checkpoint = task->checkpoint;
 
 	if (checkpoint) {
-		item = rspamd_symcache_find_filter (cache, symbol);
+		item = rspamd_symcache_find_filter (cache, symbol, true);
 
 		if (item) {
 			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
@@ -2603,7 +2823,7 @@ rspamd_symcache_disable_symbol (struct rspamd_task *task,
 	checkpoint = task->checkpoint;
 
 	if (checkpoint) {
-		item = rspamd_symcache_find_filter (cache, symbol);
+		item = rspamd_symcache_find_filter (cache, symbol, true);
 
 		if (item) {
 			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
@@ -2685,9 +2905,8 @@ rspamd_symcache_finalize_item (struct rspamd_task *task,
 	struct cache_savepoint *checkpoint = task->checkpoint;
 	struct cache_dependency *rdep;
 	struct rspamd_symcache_dynamic_item *dyn_item;
-	gdouble t2, diff;
+	gdouble diff;
 	guint i;
-	struct timeval tv;
 	const gdouble slow_diff_limit = 300;
 
 	/* Sanity checks */
@@ -2715,24 +2934,16 @@ rspamd_symcache_finalize_item (struct rspamd_task *task,
 	checkpoint->items_inflight --;
 	checkpoint->cur_item = NULL;
 
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FUNC
-	event_base_update_cache_time (task->ev_base);
-	event_base_gettimeofday_cached (task->ev_base, &tv);
-	t2 = tv_to_double (&tv);
-#else
-	t2 = rspamd_get_ticks (FALSE);
-#endif
-
-	diff = ((t2 - task->time_real) * 1e3 - dyn_item->start_msec);
-
-	if (G_UNLIKELY (RSPAMD_TASK_IS_PROFILING (task))) {
-		rspamd_task_profile_set (task, item->symbol, diff);
-	}
-
-	if (!(item->type & SYMBOL_TYPE_SQUEEZED)) {
+	if (checkpoint->profile) {
+		diff = ((rspamd_get_virtual_ticks () - checkpoint->profile_start) * 1e3 -
+				dyn_item->start_msec);
 		if (diff > slow_diff_limit) {
 			msg_info_task ("slow rule: %s(%d): %.2f ms", item->symbol, item->id,
 					diff);
+		}
+
+		if (G_UNLIKELY (RSPAMD_TASK_IS_PROFILING (task))) {
+			rspamd_task_profile_set (task, item->symbol, diff);
 		}
 
 		if (rspamd_worker_is_scanner (task->worker)) {
@@ -2824,7 +3035,7 @@ rspamd_symcache_add_symbol_flags (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		item->type |= flags;
@@ -2845,7 +3056,7 @@ rspamd_symcache_set_symbol_flags (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		item->type = flags;
@@ -2865,7 +3076,7 @@ rspamd_symcache_get_symbol_flags (struct rspamd_symcache *cache,
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol);
+	item = rspamd_symcache_find_filter (cache, symbol, true);
 
 	if (item) {
 		return item->type;
@@ -2894,4 +3105,325 @@ rspamd_symcache_composites_foreach (struct rspamd_task *task,
 			SET_FINISH_BIT (task->checkpoint, dyn_item);
 		}
 	}
+}
+
+bool
+rspamd_symcache_set_allowed_settings_ids (struct rspamd_symcache *cache,
+											   const gchar *symbol,
+											   const guint32 *ids,
+											   guint nids)
+{
+	struct rspamd_symcache_item *item;
+
+	item = rspamd_symcache_find_filter (cache, symbol, false);
+
+	if (item == NULL) {
+		return false;
+	}
+
+	if (nids <= G_N_ELEMENTS (item->allowed_ids.st)) {
+		/* Use static version */
+		memset (&item->allowed_ids, 0, sizeof (item->allowed_ids));
+		for (guint i = 0; i < nids; i++) {
+			item->allowed_ids.st[i] = ids[i];
+		}
+	}
+	else {
+		/* Need to use a separate list */
+		item->allowed_ids.dyn.e = -1; /* Flag */
+		item->allowed_ids.dyn.n = rspamd_mempool_alloc (cache->static_pool,
+				sizeof (guint32) * nids);
+		item->allowed_ids.dyn.len = nids;
+		item->allowed_ids.dyn.allocated = nids;
+
+		for (guint i = 0; i < nids; i++) {
+			item->allowed_ids.dyn.n[i] = ids[i];
+		}
+
+		/* Keep sorted */
+		qsort (item->allowed_ids.dyn.n, nids, sizeof (guint32), rspamd_id_cmp);
+	}
+
+	return true;
+}
+
+bool
+rspamd_symcache_set_forbidden_settings_ids (struct rspamd_symcache *cache,
+											  const gchar *symbol,
+											  const guint32 *ids,
+											  guint nids)
+{
+	struct rspamd_symcache_item *item;
+
+	item = rspamd_symcache_find_filter (cache, symbol, false);
+
+	if (item == NULL) {
+		return false;
+	}
+
+	g_assert (nids < G_MAXUINT16);
+
+	if (nids <= G_N_ELEMENTS (item->forbidden_ids.st)) {
+		/* Use static version */
+		memset (&item->forbidden_ids, 0, sizeof (item->forbidden_ids));
+		for (guint i = 0; i < nids; i++) {
+			item->forbidden_ids.st[i] = ids[i];
+		}
+	}
+	else {
+		/* Need to use a separate list */
+		item->forbidden_ids.dyn.e = -1; /* Flag */
+		item->forbidden_ids.dyn.n = rspamd_mempool_alloc (cache->static_pool,
+				sizeof (guint32) * nids);
+		item->forbidden_ids.dyn.len = nids;
+		item->forbidden_ids.dyn.allocated = nids;
+
+		for (guint i = 0; i < nids; i++) {
+			item->forbidden_ids.dyn.n[i] = ids[i];
+		}
+
+		/* Keep sorted */
+		qsort (item->forbidden_ids.dyn.n, nids, sizeof (guint32), rspamd_id_cmp);
+	}
+
+	return true;
+}
+
+const guint32*
+rspamd_symcache_get_allowed_settings_ids (struct rspamd_symcache *cache,
+										  const gchar *symbol,
+										  guint *nids)
+{
+	struct rspamd_symcache_item *item;
+	guint cnt = 0;
+
+	item = rspamd_symcache_find_filter (cache, symbol, false);
+
+	if (item == NULL) {
+		return NULL;
+	}
+
+	if (item->allowed_ids.dyn.e == -1) {
+		/* Dynamic list */
+		*nids = item->allowed_ids.dyn.len;
+
+		return item->allowed_ids.dyn.n;
+	}
+	else {
+		while (item->allowed_ids.st[cnt] != 0) {
+			cnt ++;
+
+			g_assert (cnt < G_N_ELEMENTS (item->allowed_ids.st));
+		}
+
+
+		*nids = cnt;
+
+		return item->allowed_ids.st;
+	}
+}
+
+const guint32*
+rspamd_symcache_get_forbidden_settings_ids (struct rspamd_symcache *cache,
+											const gchar *symbol,
+											guint *nids)
+{
+	struct rspamd_symcache_item *item;
+	guint cnt = 0;
+
+	item = rspamd_symcache_find_filter (cache, symbol, false);
+
+	if (item == NULL) {
+		return NULL;
+	}
+
+	if (item->forbidden_ids.dyn.e == -1) {
+		/* Dynamic list */
+		*nids = item->allowed_ids.dyn.len;
+
+		return item->allowed_ids.dyn.n;
+	}
+	else {
+		while (item->forbidden_ids.st[cnt] != 0) {
+			cnt ++;
+
+			g_assert (cnt < G_N_ELEMENTS (item->allowed_ids.st));
+		}
+
+		*nids = cnt;
+
+		return item->forbidden_ids.st;
+	}
+}
+
+/* Usable for near-sorted ids list */
+static inline void
+rspamd_ids_insertion_sort (guint *a, guint n)
+{
+	for (guint i = 1; i < n; i++) {
+		guint32 tmp = a[i];
+		guint j = i;
+
+		while (j > 0 && tmp < a[j - 1]) {
+			a[j] = a[j - 1];
+			j --;
+		}
+
+		a[j] = tmp;
+	}
+}
+
+static inline void
+rspamd_symcache_add_id_to_list (rspamd_mempool_t *pool,
+								struct rspamd_symcache_id_list *ls,
+								guint32 id)
+{
+	guint cnt = 0;
+	guint *new_array;
+
+	if (ls->st[0] == -1) {
+		/* Dynamic array */
+		if (ls->dyn.len < ls->dyn.allocated) {
+			/* Trivial, append + qsort */
+			ls->dyn.n[ls->dyn.len++] = id;
+		}
+		else {
+			/* Reallocate */
+			g_assert (ls->dyn.allocated <= G_MAXINT16);
+			ls->dyn.allocated *= 2;
+
+			new_array = rspamd_mempool_alloc (pool,
+					ls->dyn.allocated * sizeof (guint32));
+			memcpy (new_array, ls->dyn.n, ls->dyn.len * sizeof (guint32));
+			ls->dyn.n = new_array;
+			ls->dyn.n[ls->dyn.len++] = id;
+		}
+
+		rspamd_ids_insertion_sort (ls->dyn.n, ls->dyn.len);
+	}
+	else {
+		/* Static part */
+		while (ls->st[cnt] != 0) {
+			cnt ++;
+		}
+
+		if (cnt < G_N_ELEMENTS (ls->st)) {
+			ls->st[cnt] = id;
+		}
+		else {
+			/* Switch to dynamic */
+			new_array = rspamd_mempool_alloc (pool,
+					G_N_ELEMENTS (ls->st) * 2 * sizeof (guint32));
+			memcpy (new_array, ls->st,  G_N_ELEMENTS (ls->st) * sizeof (guint32));
+			ls->dyn.n = new_array;
+			ls->dyn.e = -1;
+			ls->dyn.allocated = G_N_ELEMENTS (ls->st) * 2;
+			ls->dyn.len = G_N_ELEMENTS (ls->st);
+
+			/* Recursively jump to dynamic branch that will handle insertion + sorting */
+			rspamd_symcache_add_id_to_list (pool, ls, id);
+		}
+	}
+}
+
+void
+rspamd_symcache_process_settings_elt (struct rspamd_symcache *cache,
+									  struct rspamd_config_settings_elt *elt)
+{
+	guint32 id = elt->id;
+	ucl_object_iter_t iter;
+	struct rspamd_symcache_item *item, *parent;
+	const ucl_object_t *cur;
+
+
+	if (elt->symbols_disabled) {
+		/* Process denied symbols */
+		iter = NULL;
+
+		while ((cur = ucl_object_iterate (elt->symbols_disabled, &iter, true)) != NULL) {
+			const gchar *sym = ucl_object_key (cur);
+			item = rspamd_symcache_find_filter (cache, sym, false);
+
+			if (item) {
+				if (item->is_virtual) {
+					/*
+					 * Virtual symbols are special:
+					 * we ignore them in symcache but prevent them from being
+					 * inserted.
+					 */
+					rspamd_symcache_add_id_to_list (cache->static_pool,
+							&item->forbidden_ids, id);
+					msg_debug_cache ("deny virtual symbol %s for settings %ud (%s); "
+									 "parent can still be executed",
+							sym, id, elt->name);
+				}
+				else {
+					/* Normal symbol, disable it */
+					rspamd_symcache_add_id_to_list (cache->static_pool,
+							&item->forbidden_ids, id);
+					msg_debug_cache ("deny symbol %s for settings %ud (%s)",
+							sym, id, elt->name);
+				}
+			}
+			else {
+				msg_warn_cache ("cannot find a symbol to disable %s "
+					"when processing settings %ud (%s)",
+					sym, id, elt->name);
+			}
+		}
+	}
+
+	if (elt->symbols_enabled) {
+		iter = NULL;
+
+		while ((cur = ucl_object_iterate (elt->symbols_enabled, &iter, true)) != NULL) {
+			/* Here, we resolve parent and explicitly allow it */
+			const gchar *sym = ucl_object_key (cur);
+			item = rspamd_symcache_find_filter (cache, sym, false);
+
+			if (item) {
+				if (item->is_virtual) {
+					if (!(item->type & SYMBOL_TYPE_GHOST)) {
+						parent = rspamd_symcache_find_filter (cache, sym, true);
+
+						if (parent) {
+							if (elt->symbols_disabled &&
+								ucl_object_lookup (elt->symbols_disabled, parent->symbol)) {
+								msg_err_cache ("conflict in %s: cannot enable disabled symbol %s, "
+											   "wanted to enable symbol %s",
+										elt->name, parent->symbol, sym);
+								continue;
+							}
+
+							rspamd_symcache_add_id_to_list (cache->static_pool,
+									&parent->exec_only_ids, id);
+							msg_debug_cache ("allow just execution of symbol %s for settings %ud (%s)",
+									parent->symbol, id, elt->name);
+						}
+					}
+					/* Ignore ghosts */
+				}
+
+				rspamd_symcache_add_id_to_list (cache->static_pool,
+						&item->allowed_ids, id);
+				msg_debug_cache ("allow execution of symbol %s for settings %ud (%s)",
+						sym, id, elt->name);
+			}
+			else {
+				msg_warn_cache ("cannot find a symbol to enable %s "
+								"when processing settings %ud (%s)",
+						sym, id, elt->name);
+			}
+		}
+	}
+}
+
+enum rspamd_symbol_type
+rspamd_symcache_item_flags (struct rspamd_symcache_item *item)
+{
+	if (item) {
+		return item->type;
+	}
+
+	return 0;
 }

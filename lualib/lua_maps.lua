@@ -19,7 +19,64 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ]]--
 
+local rspamd_logger = require "rspamd_logger"
+
 local exports = {}
+
+local maps_cache = {}
+
+local function map_hash_key(data, mtype)
+  local hash = require "rspamd_cryptobox_hash"
+  local st = hash.create_specific('xxh64')
+  st:update(data)
+  st:update(mtype)
+
+  return st:hex()
+end
+
+local function starts(where,st)
+  return string.sub(where,1,string.len(st))==st
+end
+
+local function cut_prefix(where,st)
+  return string.sub(where,#st + 1)
+end
+
+local function maybe_adjust_type(data,mtype)
+  local function check_prefix(prefix, t)
+    if starts(data, prefix) then
+      data = cut_prefix(data, prefix)
+      mtype = t
+
+      return true
+    end
+
+    return false
+  end
+
+  local known_types = {
+    {'regexp;', 'regexp'},
+    {'re;', 'regexp'},
+    {'regexp_multi;', 'regexp_multi'},
+    {'re_multi;', 'regexp_multi'},
+    {'glob;', 'glob'},
+    {'glob_multi;', 'glob_multi'},
+    {'radix;', 'radix'},
+    {'ipnet;', 'radix'},
+    {'set;', 'set'},
+    {'hash;', 'hash'},
+    {'plain;', 'hash'}
+  }
+
+  for _,t in ipairs(known_types) do
+    if check_prefix(t[1], t[2]) then
+      return data,mtype
+    end
+  end
+
+  -- No change
+  return data,mtype
+end
 
 --[[[
 -- @function lua_maps.map_add_from_ucl(opt, mtype, description)
@@ -56,6 +113,14 @@ local function rspamd_map_add_from_ucl(opt, mtype, description)
   end
 
   if type(opt) == 'string' then
+    opt,mtype = maybe_adjust_type(opt, mtype)
+    local k = map_hash_key(opt, mtype)
+    if maps_cache[k] then
+      rspamd_logger.infox(rspamd_config, 'reuse url for %s(%s)',
+          opt, mtype)
+
+      return maps_cache[k]
+    end
     -- We have a single string, so we treat it as a map
     local map = rspamd_config:add_map{
       type = mtype,
@@ -65,11 +130,14 @@ local function rspamd_map_add_from_ucl(opt, mtype, description)
 
     if map then
       ret.__data = map
+      ret.hash = k
       setmetatable(ret, ret_mt)
+      maps_cache[k] = ret
       return ret
     end
   elseif type(opt) == 'table' then
     -- it might be plain map or map of plain elements
+    -- no caching in this case (yet)
     if opt[1] then
       if mtype == 'radix' then
 
@@ -138,14 +206,30 @@ local function rspamd_map_add_from_ucl(opt, mtype, description)
         else
           local data = {}
           local nelts = 0
+          -- Plain array of keys, count merely numeric elts
           for _,elt in ipairs(opt) do
             if type(elt) == 'string' then
-              data[elt] = true
+              -- Numeric table
+              if mtype == 'hash' then
+                -- Treat as KV pair
+                local lua_util = require "lua_util"
+                local pieces = lua_util.str_split(elt, ' ')
+                if #pieces > 1 then
+                  local key = table.remove(pieces, 1)
+                  data[key] = table.concat(pieces, ' ')
+                else
+                  data[elt] = true
+                end
+              else
+                data[elt] = true
+              end
+
               nelts = nelts + 1
             end
           end
 
           if nelts > 0 then
+            -- Plain Lua table that is used as a map
             ret.__data = data
             ret.get_key = function(t, k)
               if k ~= '__data' then
@@ -154,11 +238,17 @@ local function rspamd_map_add_from_ucl(opt, mtype, description)
 
               return nil
             end
+
             return ret
+          else
+            -- Empty map, huh?
+            rspamd_logger.errx(rspamd_config, 'invalid map element: %s',
+                opt)
           end
         end
       end
     else
+      -- We have some non-trivial object so let C code to deal with it somehow...
       local map = rspamd_config:add_map{
         type = mtype,
         description = description,
@@ -169,7 +259,7 @@ local function rspamd_map_add_from_ucl(opt, mtype, description)
         setmetatable(ret, ret_mt)
         return ret
       end
-    end
+    end -- opt[1]
   end
 
   return nil
@@ -200,10 +290,6 @@ exports.map_add_from_ucl = rspamd_map_add_from_ucl
 -- Check `what` for being lua_map name, otherwise just compares key with what
 local function rspamd_maybe_check_map(key, what)
   local fun = require "fun"
-
-  local function starts(where,st)
-    return string.sub(where,1,string.len(st))==st
-  end
 
   if type(what) == "table" then
     return fun.any(function(elt) return rspamd_maybe_check_map(key, elt) end, what)

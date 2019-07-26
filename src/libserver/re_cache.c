@@ -24,6 +24,7 @@
 #include "libutil/regexp.h"
 #include "lua/lua_common.h"
 #include "libstat/stat_api.h"
+#include "contrib/uthash/utlist.h"
 
 #include "khash.h"
 
@@ -31,6 +32,7 @@
 #include "hs.h"
 #include "unix-std.h"
 #include <signal.h>
+#include <stdalign.h>
 
 #ifndef WITH_PCRE2
 #include <pcre.h>
@@ -385,7 +387,9 @@ rspamd_re_cache_init (struct rspamd_re_cache *cache, struct rspamd_config *cfg)
 		rspamd_regexp_set_cache_id (re, i);
 
 		if (re_class->st == NULL) {
-			re_class->st = g_malloc (sizeof (*re_class->st));
+			posix_memalign ((void **)&re_class->st, _Alignof (rspamd_cryptobox_hash_state_t),
+			 		sizeof (*re_class->st));
+			g_assert (re_class->st != NULL);
 			rspamd_cryptobox_hash_init (re_class->st, NULL, 0);
 		}
 
@@ -447,7 +451,7 @@ rspamd_re_cache_init (struct rspamd_re_cache *cache, struct rspamd_config *cfg)
 			rspamd_cryptobox_hash_final (re_class->st, hash_out);
 			rspamd_snprintf (re_class->hash, sizeof (re_class->hash), "%*xs",
 					(gint) rspamd_cryptobox_HASHBYTES, hash_out);
-			g_free (re_class->st);
+			free (re_class->st); /* Due to posix_memalign */
 			re_class->st = NULL;
 		}
 	}
@@ -801,7 +805,6 @@ rspamd_re_cache_process_selector (struct rspamd_task *task,
 	khiter_t k;
 	lua_State *L;
 	gint err_idx, ret;
-	GString *tb;
 	struct rspamd_task **ptask;
 	gboolean result = FALSE;
 	struct rspamd_re_cache *cache = rt->cache;
@@ -845,13 +848,9 @@ rspamd_re_cache_process_selector (struct rspamd_task *task,
 	rspamd_lua_setclass (L, "rspamd{task}", -1);
 
 	if ((ret = lua_pcall (L, 1, 1, err_idx)) != 0) {
-		tb = lua_touserdata (L, -1);
 		msg_err_task ("call to selector %s "
-						"failed (%d): %v", name, ret, tb);
-
-		if (tb) {
-			g_string_free (tb, TRUE);
-		}
+						"failed (%d): %s", name, ret,
+						lua_tostring (L, -1));
 	}
 	else {
 		gsize slen;
@@ -952,6 +951,72 @@ rspamd_process_words_vector (GArray *words,
 	return cnt;
 }
 
+static guint
+rspamd_re_cache_process_headers_list (struct rspamd_task *task,
+									  struct rspamd_re_runtime *rt,
+									  rspamd_regexp_t *re,
+									  struct rspamd_re_class *re_class,
+									  struct rspamd_mime_header *rh,
+									  gboolean is_strong)
+{
+	const guchar **scvec, *in;
+	gboolean raw = FALSE;
+	guint *lenvec;
+	struct rspamd_mime_header *cur;
+	guint cnt = 0, i = 0, ret = 0;
+
+	DL_COUNT (rh, cur, cnt);
+
+	scvec = g_malloc (sizeof (*scvec) * cnt);
+	lenvec = g_malloc (sizeof (*lenvec) * cnt);
+
+	DL_FOREACH (rh, cur) {
+
+		if (is_strong && strcmp (cur->name, re_class->type_data) != 0) {
+			/* Skip a different case */
+			continue;
+		}
+
+		if (re_class->type == RSPAMD_RE_RAWHEADER) {
+			in = (const guchar *)cur->value;
+			lenvec[i] = strlen (cur->value);
+
+			if (!g_utf8_validate (in, lenvec[i], NULL)) {
+				raw = TRUE;
+			}
+		}
+		else {
+			in = (const guchar *)cur->decoded;
+			/* Validate input^W^WNo need to validate as it is already valid */
+			if (!in) {
+				lenvec[i] = 0;
+				scvec[i] = (guchar *)"";
+				continue;
+			}
+
+			lenvec[i] = strlen (in);
+		}
+
+		scvec[i] = in;
+
+		i ++;
+	}
+
+	if (i > 0) {
+		ret = rspamd_re_cache_process_regexp_data (rt, re,
+				task, scvec, lenvec, i, raw);
+		msg_debug_re_task ("checking header %s regexp: %s=%*s -> %d",
+				re_class->type_data,
+				rspamd_regexp_get_pattern (re),
+				(int) lenvec[0], scvec[0], ret);
+	}
+
+	g_free (scvec);
+	g_free (lenvec);
+
+	return ret;
+}
+
 /*
  * Calculates the specified regexp for the specified class if it's not calculated
  */
@@ -963,14 +1028,14 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 		gboolean is_strong)
 {
 	guint ret = 0, i, re_id;
-	GPtrArray *headerlist;
 	GHashTableIter it;
 	struct rspamd_mime_header *rh;
-	const gchar *in, *end;
+	const gchar *in;
 	const guchar **scvec;
 	guint *lenvec;
 	gboolean raw = FALSE;
-	struct rspamd_mime_text_part *part;
+	struct rspamd_mime_text_part *text_part;
+	struct rspamd_mime_part *mime_part;
 	struct rspamd_url *url;
 	gpointer k, v;
 	guint len, cnt;
@@ -984,140 +1049,70 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 	case RSPAMD_RE_HEADER:
 	case RSPAMD_RE_RAWHEADER:
 		/* Get list of specified headers */
-		headerlist = rspamd_message_get_header_array (task,
-				re_class->type_data,
-				is_strong);
+		rh = rspamd_message_get_header_array (task,
+				re_class->type_data);
 
-		if (headerlist && headerlist->len > 0) {
-			scvec = g_malloc (sizeof (*scvec) * headerlist->len);
-			lenvec = g_malloc (sizeof (*lenvec) * headerlist->len);
-
-			for (i = 0; i < headerlist->len; i ++) {
-				rh = g_ptr_array_index (headerlist, i);
-
-				if (re_class->type == RSPAMD_RE_RAWHEADER) {
-					in = rh->value;
-					lenvec[i] = strlen (rh->value);
-
-					if (!g_utf8_validate (in, lenvec[i], NULL)) {
-						raw = TRUE;
-					}
-				}
-				else {
-					in = rh->decoded;
-					/* Validate input */
-					if (!in || !g_utf8_validate (in, -1, &end)) {
-						lenvec[i] = 0;
-						scvec[i] = (guchar *)"";
-						continue;
-					}
-					lenvec[i] = end - in;
-				}
-
-				scvec[i] = (guchar *)in;
-			}
-
-			ret = rspamd_re_cache_process_regexp_data (rt, re,
-					task, scvec, lenvec, headerlist->len, raw);
-			msg_debug_re_task ("checking header %s regexp: %s=%*s -> %d",
-					re_class->type_data,
-					rspamd_regexp_get_pattern (re),
-					(int)lenvec[0], scvec[0], ret);
-			g_free (scvec);
-			g_free (lenvec);
+		if (rh) {
+			ret = rspamd_re_cache_process_headers_list (task, rt, re,
+					re_class, rh, is_strong);
 		}
 		break;
 	case RSPAMD_RE_ALLHEADER:
 		raw = TRUE;
-		in = task->raw_headers_content.begin;
-		len = task->raw_headers_content.len;
+		in = MESSAGE_FIELD (task, raw_headers_content).begin;
+		len = MESSAGE_FIELD (task, raw_headers_content).len;
 		ret = rspamd_re_cache_process_regexp_data (rt, re,
 				task, (const guchar **)&in, &len, 1, raw);
 		msg_debug_re_task ("checking allheader regexp: %s -> %d",
 				rspamd_regexp_get_pattern (re), ret);
 		break;
 	case RSPAMD_RE_MIMEHEADER:
-		headerlist = rspamd_message_get_mime_header_array (task,
-				re_class->type_data,
-				is_strong);
+		PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, parts), i, mime_part) {
+			rh = rspamd_message_get_header_from_hash (mime_part->raw_headers,
+					re_class->type_data);
 
-		if (headerlist && headerlist->len > 0) {
-			scvec = g_malloc (sizeof (*scvec) * headerlist->len);
-			lenvec = g_malloc (sizeof (*lenvec) * headerlist->len);
-
-			for (i = 0; i < headerlist->len; i ++) {
-				rh = g_ptr_array_index (headerlist, i);
-
-				if (re_class->type == RSPAMD_RE_RAWHEADER) {
-					in = rh->value;
-					lenvec[i] = strlen (rh->value);
-
-					if (!g_utf8_validate (in, lenvec[i], NULL)) {
-						raw = TRUE;
-					}
-				}
-				else {
-					in = rh->decoded;
-					/* Validate input */
-					if (!in || !g_utf8_validate (in, -1, &end)) {
-						lenvec[i] = 0;
-						scvec[i] = (guchar *)"";
-						continue;
-					}
-
-					lenvec[i] = end - in;
-				}
-
-				scvec[i] = (guchar *)in;
+			if (rh) {
+				ret += rspamd_re_cache_process_headers_list (task, rt, re,
+						re_class, rh, is_strong);
 			}
-
-			ret = rspamd_re_cache_process_regexp_data (rt, re,
-					task, scvec, lenvec, headerlist->len, raw);
-			msg_debug_re_task ("checking mime header %s regexp: %s -> %d",
-					re_class->type_data,
-					rspamd_regexp_get_pattern (re), ret);
-			g_free (scvec);
-			g_free (lenvec);
 		}
 		break;
 	case RSPAMD_RE_MIME:
 	case RSPAMD_RE_RAWMIME:
 		/* Iterate through text parts */
-		if (task->text_parts->len > 0) {
-			cnt = task->text_parts->len;
+		if (MESSAGE_FIELD (task, text_parts)->len > 0) {
+			cnt = MESSAGE_FIELD (task, text_parts)->len;
 			scvec = g_malloc (sizeof (*scvec) * cnt);
 			lenvec = g_malloc (sizeof (*lenvec) * cnt);
 
-			for (i = 0; i < task->text_parts->len; i++) {
-				part = g_ptr_array_index (task->text_parts, i);
-
+			PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, text_part) {
 				/* Select data for regexp */
 				if (re_class->type == RSPAMD_RE_RAWMIME) {
-					if (part->raw.len == 0) {
+					if (text_part->raw.len == 0) {
 						len = 0;
 						in = "";
 					}
 					else {
-						in = part->raw.begin;
-						len = part->raw.len;
+						in = text_part->raw.begin;
+						len = text_part->raw.len;
 					}
 
 					raw = TRUE;
 				}
 				else {
 					/* Skip empty parts */
-					if (IS_PART_EMPTY (part)) {
+					if (IS_PART_EMPTY (text_part)) {
 						len = 0;
 						in = "";
 					}
 					else {
 						/* Check raw flags */
-						if (!IS_PART_UTF (part)) {
+						if (!IS_PART_UTF (text_part)) {
 							raw = TRUE;
 						}
 
-						in = part->utf_content->data;
-						len = part->utf_content->len;
+						in = text_part->utf_content->data;
+						len = text_part->utf_content->len;
 					}
 				}
 
@@ -1134,12 +1129,13 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 		}
 		break;
 	case RSPAMD_RE_URL:
-		cnt = g_hash_table_size (task->urls) + g_hash_table_size (task->emails);
+		cnt = g_hash_table_size (MESSAGE_FIELD (task, urls)) +
+				g_hash_table_size (MESSAGE_FIELD (task, emails));
 
 		if (cnt > 0) {
 			scvec = g_malloc (sizeof (*scvec) * cnt);
 			lenvec = g_malloc (sizeof (*lenvec) * cnt);
-			g_hash_table_iter_init (&it, task->urls);
+			g_hash_table_iter_init (&it, MESSAGE_FIELD (task, urls));
 			i = 0;
 
 			while (g_hash_table_iter_next (&it, &k, &v)) {
@@ -1152,7 +1148,7 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 				lenvec[i++] = len;
 			}
 
-			g_hash_table_iter_init (&it, task->emails);
+			g_hash_table_iter_init (&it, MESSAGE_FIELD (task, emails));
 
 			while (g_hash_table_iter_next (&it, &k, &v)) {
 				url = v;
@@ -1193,7 +1189,7 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 		 * paragraph when running the rules. All HTML tags and line breaks will
 		 * be removed before matching.
 		 */
-		cnt = task->text_parts->len + 1;
+		cnt = MESSAGE_FIELD (task, text_parts)->len + 1;
 		scvec = g_malloc (sizeof (*scvec) * cnt);
 		lenvec = g_malloc (sizeof (*lenvec) * cnt);
 
@@ -1202,11 +1198,9 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 		 * of the body content.
 		 */
 
-		headerlist = rspamd_message_get_header_array (task, "Subject", FALSE);
+		rh = rspamd_message_get_header_array (task, "Subject");
 
-		if (headerlist && headerlist->len > 0) {
-			rh = g_ptr_array_index (headerlist, 0);
-
+		if (rh) {
 			scvec[0] = (guchar *)rh->decoded;
 			lenvec[0] = strlen (rh->decoded);
 		}
@@ -1214,14 +1208,13 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 			scvec[0] = (guchar *)"";
 			lenvec[0] = 0;
 		}
-		for (i = 0; i < task->text_parts->len; i++) {
-			part = g_ptr_array_index (task->text_parts, i);
 
-			if (part->utf_stripped_content) {
-				scvec[i + 1] = (guchar *)part->utf_stripped_content->data;
-				lenvec[i + 1] = part->utf_stripped_content->len;
+		PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, text_part) {
+			if (text_part->utf_stripped_content) {
+				scvec[i + 1] = (guchar *)text_part->utf_stripped_content->data;
+				lenvec[i + 1] = text_part->utf_stripped_content->len;
 
-				if (!IS_PART_UTF (part)) {
+				if (!IS_PART_UTF (text_part)) {
 					raw = TRUE;
 				}
 			}
@@ -1246,19 +1239,19 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 		 * Multiline expressions will need to be used to match strings that are
 		 * broken by line breaks.
 		 */
-		if (task->text_parts->len > 0) {
-			cnt = task->text_parts->len;
+		if (MESSAGE_FIELD (task, text_parts)->len > 0) {
+			cnt = MESSAGE_FIELD (task, text_parts)->len;
 			scvec = g_malloc (sizeof (*scvec) * cnt);
 			lenvec = g_malloc (sizeof (*lenvec) * cnt);
 
-			for (i = 0; i < task->text_parts->len; i++) {
-				part = g_ptr_array_index (task->text_parts, i);
+			for (i = 0; i < cnt; i++) {
+				text_part = g_ptr_array_index (MESSAGE_FIELD (task, text_parts), i);
 
-				if (part->parsed.len > 0) {
-					scvec[i] = (guchar *)part->parsed.begin;
-					lenvec[i] = part->parsed.len;
+				if (text_part->parsed.len > 0) {
+					scvec[i] = (guchar *)text_part->parsed.begin;
+					lenvec[i] = text_part->parsed.len;
 
-					if (!IS_PART_UTF (part)) {
+					if (!IS_PART_UTF (text_part)) {
 						raw = TRUE;
 					}
 				}
@@ -1279,13 +1272,13 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 	case RSPAMD_RE_WORDS:
 	case RSPAMD_RE_STEMWORDS:
 	case RSPAMD_RE_RAWWORDS:
-		if (task->text_parts->len > 0) {
+		if (MESSAGE_FIELD (task, text_parts)->len > 0) {
 			cnt = 0;
 			raw = FALSE;
 
-			PTR_ARRAY_FOREACH (task->text_parts, i, part) {
-				if (part->utf_words) {
-					cnt += part->utf_words->len;
+			PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, text_part) {
+				if (text_part->utf_words) {
+					cnt += text_part->utf_words->len;
 				}
 			}
 
@@ -1299,9 +1292,9 @@ rspamd_re_cache_exec_re (struct rspamd_task *task,
 
 				cnt = 0;
 
-				PTR_ARRAY_FOREACH (task->text_parts, i, part) {
-					if (part->utf_words) {
-						cnt = rspamd_process_words_vector (part->utf_words,
+				PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, text_part) {
+					if (text_part->utf_words) {
+						cnt = rspamd_process_words_vector (text_part->utf_words,
 								scvec, lenvec, re_class, cnt, &raw);
 					}
 				}
@@ -1524,6 +1517,7 @@ rspamd_re_cache_type_to_string (enum rspamd_re_type type)
 		ret = "stem_words";
 		break;
 	case RSPAMD_RE_MAX:
+	default:
 		ret = "invalid class";
 		break;
 	}
@@ -1592,6 +1586,23 @@ rspamd_re_cache_type_from_string (const char *str)
 }
 
 #ifdef WITH_HYPERSCAN
+static gchar *
+rspamd_re_cache_hs_pattern_from_pcre (rspamd_regexp_t *re)
+{
+	/*
+	 * Workaroung for bug in ragel 7.0.0.11
+	 * https://github.com/intel/hyperscan/issues/133
+	 */
+	const gchar *pat = rspamd_regexp_get_pattern (re);
+	gchar *escaped;
+	gsize esc_len;
+
+	escaped = rspamd_str_regexp_escape (pat, strlen (pat), &esc_len,
+			RSPAMD_REGEXP_ESCAPE_RE|RSPAMD_REGEXP_ESCAPE_UTF);
+
+	return escaped;
+}
+
 static gboolean
 rspamd_re_cache_is_finite (struct rspamd_re_cache *cache,
 		rspamd_regexp_t *re, gint flags, gdouble max_time)
@@ -1613,7 +1624,11 @@ rspamd_re_cache_is_finite (struct rspamd_re_cache *cache,
 
 	if (cld == 0) {
 		/* Try to compile pattern */
-		if (hs_compile (rspamd_regexp_get_pattern (re),
+
+		gchar *pat = rspamd_re_cache_hs_pattern_from_pcre (re);
+		/* Memory leak here but ok since we do exit */
+
+		if (hs_compile (pat,
 				flags | HS_FLAG_PREFILTER,
 				cache->vectorized_hyperscan ? HS_MODE_VECTORED : HS_MODE_BLOCK,
 				&cache->plt,
@@ -1686,7 +1701,7 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 	hs_compile_error_t *hs_errors;
 	guint *hs_flags = NULL;
 	const hs_expr_ext_t **hs_exts = NULL;
-	const gchar **hs_pats = NULL;
+	gchar **hs_pats = NULL;
 	gchar *hs_serialized;
 	gsize serialized_len, total = 0;
 	struct iovec iov[7];
@@ -1788,14 +1803,16 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 				hs_flags[i] |= HS_FLAG_SINGLEMATCH;
 			}
 
-			if (hs_compile (rspamd_regexp_get_pattern (re),
+			gchar *pat = rspamd_re_cache_hs_pattern_from_pcre (re);
+
+			if (hs_compile (pat,
 					hs_flags[i],
 					cache->vectorized_hyperscan ? HS_MODE_VECTORED : HS_MODE_BLOCK,
 					&cache->plt,
 					&test_db,
 					&hs_errors) != HS_SUCCESS) {
 				msg_info_re_cache ("cannot compile %s to hyperscan, try prefilter match",
-						rspamd_regexp_get_pattern (re));
+						pat);
 				hs_free_compile_error (hs_errors);
 
 				/* The approximation operation might take a significant
@@ -1804,13 +1821,16 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 				if (rspamd_re_cache_is_finite (cache, re, hs_flags[i], max_time)) {
 					hs_flags[i] |= HS_FLAG_PREFILTER;
 					hs_ids[i] = rspamd_regexp_get_cache_id (re);
-					hs_pats[i] = rspamd_regexp_get_pattern (re);
+					hs_pats[i] = pat;
 					i++;
+				}
+				else {
+					g_free (pat); /* Avoid leak */
 				}
 			}
 			else {
 				hs_ids[i] = rspamd_regexp_get_cache_id (re);
-				hs_pats[i] = rspamd_regexp_get_pattern (re);
+				hs_pats[i] = pat;
 				i ++;
 				hs_free_database (test_db);
 			}
@@ -1820,7 +1840,7 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 
 		if (n > 0) {
 			/* Create the hs tree */
-			if (hs_compile_ext_multi (hs_pats,
+			if (hs_compile_ext_multi ((const char **)hs_pats,
 					hs_flags,
 					hs_ids,
 					hs_exts,
@@ -1835,6 +1855,11 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 						hs_pats[hs_errors->expression], hs_errors->message);
 				g_free (hs_flags);
 				g_free (hs_ids);
+
+				for (guint j = 0; j < i; j ++) {
+					g_free (hs_pats[j]);
+				}
+
 				g_free (hs_pats);
 				g_free (hs_exts);
 				close (fd);
@@ -1844,6 +1869,9 @@ rspamd_re_cache_compile_hyperscan (struct rspamd_re_cache *cache,
 				return -1;
 			}
 
+			for (guint j = 0; j < i; j ++) {
+				g_free (hs_pats[j]);
+			}
 			g_free (hs_pats);
 			g_free (hs_exts);
 

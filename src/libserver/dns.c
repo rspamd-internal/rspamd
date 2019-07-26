@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include <contrib/librdns/rdns.h>
-#include <contrib/librdns/dns_private.h>
+
 #include "config.h"
 #include "dns.h"
 #include "rspamd.h"
 #include "utlist.h"
-#include "rdns_event.h"
+#include "contrib/librdns/rdns.h"
+#include "contrib/librdns/dns_private.h"
+#include "contrib/librdns/rdns_ev.h"
 #include "unix-std.h"
 
 static const gchar *M = "rspamd dns";
@@ -205,8 +206,8 @@ make_dns_request_task_common (struct rspamd_task *task,
 		}
 
 		if (!forced && task->dns_requests >= task->cfg->dns_max_requests) {
-			msg_info_task ("<%s> stop resolving on reaching %ud requests",
-					task->message_id, task->dns_requests);
+			msg_info_task ("stop resolving on reaching %ud requests",
+					task->dns_requests);
 		}
 
 		return TRUE;
@@ -532,13 +533,13 @@ rspamd_dns_resolver_config_ucl (struct rspamd_config *cfg,
 
 struct rspamd_dns_resolver *
 rspamd_dns_resolver_init (rspamd_logger_t *logger,
-						  struct event_base *ev_base,
+						  struct ev_loop *ev_base,
 						  struct rspamd_config *cfg)
 {
 	struct rspamd_dns_resolver *dns_resolver;
 
 	dns_resolver = g_malloc0 (sizeof (struct rspamd_dns_resolver));
-	dns_resolver->ev_base = ev_base;
+	dns_resolver->event_loop = ev_base;
 	if (cfg != NULL) {
 		dns_resolver->request_timeout = cfg->dns_timeout;
 		dns_resolver->max_retransmits = cfg->dns_retransmits;
@@ -549,7 +550,7 @@ rspamd_dns_resolver_init (rspamd_logger_t *logger,
 	}
 
 	dns_resolver->r = rdns_resolver_new ();
-	rdns_bind_libevent (dns_resolver->r, dns_resolver->ev_base);
+	rdns_bind_libev (dns_resolver->r, dns_resolver->event_loop);
 
 	if (cfg != NULL) {
 		rdns_resolver_set_log_level (dns_resolver->r, cfg->log_level);

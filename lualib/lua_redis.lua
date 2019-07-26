@@ -71,6 +71,7 @@ local function redis_query_sentinel(ev_base, params, initialised)
     timeout = params.timeout,
     config = rspamd_config,
     ev_base = ev_base,
+    no_pool = true,
   })
 
   if not is_ok then
@@ -230,7 +231,7 @@ local function add_redis_sentinels(params)
     params.sentinel_master_maxerrors = 2 -- Maximum number of errors before rechecking
   end
 
-  rspamd_config:add_on_load(function(cfg, ev_base, worker)
+  rspamd_config:add_on_load(function(_, ev_base, worker)
     local initialised = false
     if worker:is_scanner() then
       rspamd_config:add_periodic(ev_base, 0.0, function()
@@ -304,8 +305,8 @@ local function process_redis_opts(options, redis_params)
     redis_params['password'] = options['password']
   end
 
-  if not redis_params.sentinel and options.sentinel then
-    redis_params.sentinel = options.sentinel
+  if not redis_params.sentinels and options.sentinels then
+    redis_params.sentinels = options.sentinels
   end
 end
 
@@ -923,8 +924,8 @@ local function rspamd_redis_make_request(task, redis_params, key, is_write,
   end
 
   lutil.debugm(N, task, 'perform request to redis server' ..
-      ' (host=%s, timeout=%s): cmd: %s, arguments: %s', ip_addr,
-      options.timeout, options.cmd, args)
+      ' (host=%s, timeout=%s): cmd: %s', ip_addr,
+      options.timeout, options.cmd)
 
   local ret,conn = rspamd_redis.make_request(options)
 
@@ -1012,8 +1013,8 @@ local function redis_make_request_taskless(ev_base, cfg, redis_params, key,
   end
 
   lutil.debugm(N, cfg, 'perform taskless request to redis server' ..
-      ' (host=%s, timeout=%s): cmd: %s, arguments: %s', options.host,
-      options.timeout, options.cmd, args)
+      ' (host=%s, timeout=%s): cmd: %s', options.host,
+      options.timeout, options.cmd)
   local ret,conn = rspamd_redis.make_request(options)
   if not ret then
     logger.errx('cannot execute redis request')
@@ -1100,15 +1101,17 @@ local function load_script_task(script, task)
     opt.task = task
     opt.callback = function(err, data)
       if err then
-        logger.errx(task, 'cannot upload script to %s: %s',
-          opt.upstream:get_addr(), err)
+        logger.errx(task, 'cannot upload script to %s: %s; registered from: %s:%s',
+            opt.upstream:get_addr():to_string(true),
+            err, script.caller.short_src, script.caller.currentline)
         opt.upstream:fail()
         script.fatal_error = err
       else
         opt.upstream:ok()
         logger.infox(task,
           "uploaded redis script to %s with id %s, sha: %s",
-          opt.upstream:get_addr(), script.id, data)
+            opt.upstream:get_addr():to_string(true),
+            script.id, data)
         script.sha = data -- We assume that sha is the same on all servers
       end
       script.in_flight = script.in_flight - 1
@@ -1142,15 +1145,16 @@ local function load_script_taskless(script, cfg, ev_base)
     opt.ev_base = ev_base
     opt.callback = function(err, data)
       if err then
-        logger.errx(cfg, 'cannot upload script to %s: %s',
-          opt.upstream:get_addr(), err)
+        logger.errx(cfg, 'cannot upload script to %s: %s; registered from: %s:%s',
+            opt.upstream:get_addr():to_string(true),
+            err, script.caller.short_src, script.caller.currentline)
         opt.upstream:fail()
         script.fatal_error = err
       else
         opt.upstream:ok()
         logger.infox(cfg,
           "uploaded redis script to %s with id %s, sha: %s",
-            opt.upstream:get_addr(), script.id, data)
+            opt.upstream:get_addr():to_string(true), script.id, data)
         script.sha = data -- We assume that sha is the same on all servers
         script.fatal_error = nil
       end
@@ -1182,7 +1186,10 @@ local function load_redis_script(script, cfg, ev_base, _)
 end
 
 local function add_redis_script(script, redis_params)
+  local caller = debug.getinfo(2)
+
   local new_script = {
+    caller = caller,
     loaded = false,
     redis_params = redis_params,
     script = script,
@@ -1292,7 +1299,14 @@ local function exec_redis_script(id, params, callback, keys, args)
       table.insert(script.waitq, do_call)
     else
       -- TODO: fix taskfull requests
-      callback('NOSCRIPT', nil)
+      table.insert(script.waitq, function()
+        if script.loaded then
+          do_call(false)
+        else
+          callback('NOSCRIPT', nil)
+        end
+      end)
+      load_script_task(script, params.task)
     end
   end
 
@@ -1583,5 +1597,46 @@ exports.connect = function(redis_params, attrs)
   end
 end
 
+local redis_prefixes = {}
+
+--[[[
+-- @function lua_redis.register_prefix(prefix, module, description[, optional])
+-- Register new redis prefix for documentation purposes
+-- @param {string} prefix string prefix
+-- @param {string} module module name
+-- @param {string} description prefix description
+-- @param {table} optional optional kv pairs (e.g. pattern)
+--]]
+local function register_prefix(prefix, module, description, optional)
+  local pr = {
+    module = module,
+    description = description
+  }
+
+  if optional and type(optional) == 'table' then
+    for k,v in pairs(optional) do
+      pr[k] = v
+    end
+  end
+
+  redis_prefixes[prefix] = pr
+end
+
+exports.register_prefix = register_prefix
+
+--[[[
+-- @function lua_redis.prefixes([mname])
+-- Returns prefixes for specific module (or all prefixes). Returns a table prefix -> table
+--]]
+exports.prefixes = function(mname)
+  if not mname then
+    return redis_prefixes
+  else
+    local fun = require "fun"
+
+    return fun.totable(fun.filter(function(_, data) return data.module == mname end,
+        redis_prefixes))
+  end
+end
 
 return exports

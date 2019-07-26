@@ -21,6 +21,7 @@
 #include "lua/lua_thread_pool.h"
 #include "lua_ucl.h"
 #include "unix-std.h"
+#include "contrib/libev/ev.h"
 
 #ifdef HAVE_LIBUTIL_H
 #include <libutil.h>
@@ -329,7 +330,7 @@ static void
 rspamadm_add_lua_globals (struct rspamd_dns_resolver *resolver)
 {
 	struct rspamd_async_session  **psession;
-	struct event_base **pev_base;
+	struct ev_loop **pev_base;
 	struct rspamd_dns_resolver **presolver;
 
 	rspamadm_session = rspamd_session_create (rspamd_main->cfg->cfg_pool, NULL,
@@ -340,9 +341,9 @@ rspamadm_add_lua_globals (struct rspamd_dns_resolver *resolver)
 	*psession = rspamadm_session;
 	lua_setglobal (L, "rspamadm_session");
 
-	pev_base = lua_newuserdata (L, sizeof (struct event_base *));
+	pev_base = lua_newuserdata (L, sizeof (struct ev_loop *));
 	rspamd_lua_setclass (L, "rspamd{ev_base}", -1);
-	*pev_base = rspamd_main->ev_base;
+	*pev_base = rspamd_main->event_loop;
 	lua_setglobal (L, "rspamadm_ev_base");
 
 	presolver = lua_newuserdata (L, sizeof (struct rspamd_dns_resolver *));
@@ -366,6 +367,7 @@ main (gint argc, gchar **argv, gchar **env)
 	GPtrArray *all_commands = g_ptr_array_new (); /* Discovered during check */
 	gint i, nargc, targc;
 	worker_t **pworker;
+	gboolean lua_file = FALSE;
 
 	ucl_vars = g_hash_table_new_full (rspamd_strcase_hash,
 		rspamd_strcase_equal, g_free, g_free);
@@ -378,15 +380,6 @@ main (gint argc, gchar **argv, gchar **env)
 	rspamd_main->type = process_quark;
 	rspamd_main->server_pool = rspamd_mempool_new (rspamd_mempool_suggest_size (),
 			"rspamadm");
-
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FLAG
-	struct event_config *ev_cfg;
-	ev_cfg = event_config_new ();
-	event_config_set_flag (ev_cfg, EVENT_BASE_FLAG_NO_CACHE_TIME);
-	rspamd_main->ev_base = event_base_new_with_config (ev_cfg);
-#else
-	rspamd_main->ev_base = event_init ();
-#endif
 
 	rspamadm_fill_internal_commands (all_commands);
 	help_command.command_data = all_commands;
@@ -443,10 +436,12 @@ main (gint argc, gchar **argv, gchar **env)
 			rspamd_main->server_pool);
 	(void) rspamd_log_open (rspamd_main->logger);
 
+	rspamd_main->event_loop = ev_default_loop (EVFLAG_SIGNALFD|EVBACKEND_ALL);
+
 	resolver = rspamd_dns_resolver_init (rspamd_main->logger,
-			rspamd_main->ev_base,
+			rspamd_main->event_loop,
 			cfg);
-	rspamd_main->http_ctx = rspamd_http_context_create (cfg, rspamd_main->ev_base,
+	rspamd_main->http_ctx = rspamd_http_context_create (cfg, rspamd_main->event_loop,
 			NULL);
 
 	g_log_set_default_handler (rspamd_glib_log_function, rspamd_main->logger);
@@ -481,7 +476,7 @@ main (gint argc, gchar **argv, gchar **env)
 	rspamadm_add_lua_globals (resolver);
 
 #ifdef WITH_HIREDIS
-	rspamd_redis_pool_config (cfg->redis_pool, cfg, rspamd_main->ev_base);
+	rspamd_redis_pool_config (cfg->redis_pool, cfg, rspamd_main->event_loop);
 #endif
 
 	/* Init rspamadm global */
@@ -522,6 +517,13 @@ main (gint argc, gchar **argv, gchar **env)
 		cmd_name = "help";
 	}
 
+	gsize cmdlen = strlen (cmd_name);
+
+	if (cmdlen > 4 && memcmp (cmd_name + (cmdlen - 4), ".lua", 4) == 0) {
+		cmd_name = "lua";
+		lua_file = TRUE;
+	}
+
 	cmd = rspamadm_search_command (cmd_name, all_commands);
 
 	if (cmd == NULL) {
@@ -549,11 +551,34 @@ main (gint argc, gchar **argv, gchar **env)
 	}
 
 	if (nargc < argc) {
-		nargv = g_malloc0 (sizeof (gchar *) * (argc - nargc + 1));
+
+		if (lua_file) {
+			nargv = g_malloc0 (sizeof (gchar *) * (argc - nargc + 2));
+			nargv[1] = g_strdup (argv[nargc]);
+			i = 2;
+			argc ++;
+		}
+		else {
+			nargv = g_malloc0 (sizeof (gchar *) * (argc - nargc + 1));
+			i = 1;
+		}
+
 		nargv[0] = g_strdup_printf ("%s %s", argv[0], cmd_name);
 
-		for (i = 1; i < argc - nargc; i ++) {
-			nargv[i] = g_strdup (argv[i + nargc]);
+		for (; i < argc - nargc; i ++) {
+			if (lua_file) {
+				/*
+				 * We append prefix '--arg=' to each argument and shift argv index
+				 */
+				gsize arglen = strlen (argv[i + nargc - 1]);
+
+				arglen += sizeof ("--args="); /* Including \0 */
+				nargv[i] = g_malloc (arglen);
+				rspamd_snprintf (nargv[i], arglen, "--args=%s", argv[i + nargc - 1]);
+			}
+			else {
+				nargv[i] = g_strdup (argv[i + nargc]);
+			}
 		}
 
 		targc = argc - nargc;
@@ -565,10 +590,8 @@ main (gint argc, gchar **argv, gchar **env)
 		cmd->run (0, NULL, cmd);
 	}
 
-	event_base_loopexit (rspamd_main->ev_base, NULL);
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FLAG
-	event_config_free (ev_cfg);
-#endif
+	ev_break (rspamd_main->event_loop, EVBREAK_ALL);
+
 
 	REF_RELEASE (rspamd_main->cfg);
 	rspamd_log_close (rspamd_main->logger, TRUE);

@@ -16,7 +16,8 @@
 #include "task.h"
 #include "rspamd.h"
 #include "filter.h"
-#include "protocol.h"
+#include "libserver/protocol.h"
+#include "libserver/protocol_internal.h"
 #include "message.h"
 #include "lua/lua_common.h"
 #include "email_addr.h"
@@ -40,6 +41,10 @@
 
 #include <math.h>
 
+__KHASH_IMPL (rspamd_req_headers_hash, static inline,
+		rspamd_ftok_t *, struct rspamd_request_header_chain *, 1,
+				rspamd_ftok_icase_hash, rspamd_ftok_icase_equal)
+
 /*
  * Do not print more than this amount of elts
  */
@@ -51,23 +56,6 @@ rspamd_task_quark (void)
 	return g_quark_from_static_string ("task-error");
 }
 
-static void
-rspamd_request_header_dtor (gpointer p)
-{
-	GPtrArray *ar = p;
-	guint i;
-	rspamd_ftok_t *tok;
-
-	if (ar) {
-		for (i = 0; i < ar->len; i ++) {
-			tok = g_ptr_array_index (ar, i);
-			rspamd_fstring_mapped_ftok_free (tok);
-		}
-
-		g_ptr_array_free (ar, TRUE);
-	}
-}
-
 /*
  * Create new task
  */
@@ -75,7 +63,7 @@ struct rspamd_task *
 rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 				 rspamd_mempool_t *pool,
 				 struct rspamd_lang_detector *lang_det,
-				 struct event_base *ev_base)
+				 struct ev_loop *event_loop)
 {
 	struct rspamd_task *new_task;
 
@@ -101,26 +89,9 @@ rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 		}
 	}
 
-	new_task->ev_base = ev_base;
-
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FUNC
-	if (ev_base) {
-		event_base_update_cache_time (ev_base);
-		event_base_gettimeofday_cached (ev_base, &new_task->tv);
-		new_task->time_real = tv_to_double (&new_task->tv);
-	}
-	else {
-		gettimeofday (&new_task->tv, NULL);
-		new_task->time_real = tv_to_double (&new_task->tv);
-	}
-#else
-	gettimeofday (&new_task->tv, NULL);
-	new_task->time_real = tv_to_double (&new_task->tv);
-#endif
-
-	new_task->time_virtual = rspamd_get_virtual_ticks ();
+	new_task->event_loop = event_loop;
+	new_task->task_timestamp = ev_time ();
 	new_task->time_real_finish = NAN;
-	new_task->time_virtual_finish = NAN;
 
 	if (pool == NULL) {
 		new_task->task_pool =
@@ -131,50 +102,12 @@ rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 		new_task->task_pool = pool;
 	}
 
-	new_task->raw_headers = g_hash_table_new_full (rspamd_strcase_hash,
-			rspamd_strcase_equal, NULL, rspamd_ptr_array_free_hard);
-	new_task->headers_order = g_queue_new ();
-	new_task->request_headers = g_hash_table_new_full (rspamd_ftok_icase_hash,
-			rspamd_ftok_icase_equal, rspamd_fstring_mapped_ftok_free,
-			rspamd_request_header_dtor);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-		(rspamd_mempool_destruct_t) g_hash_table_unref,
-		new_task->request_headers);
-	new_task->reply_headers = g_hash_table_new_full (rspamd_ftok_icase_hash,
-			rspamd_ftok_icase_equal, rspamd_fstring_mapped_ftok_free,
-			rspamd_fstring_mapped_ftok_free);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			(rspamd_mempool_destruct_t) g_hash_table_unref,
-			new_task->reply_headers);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			(rspamd_mempool_destruct_t) g_hash_table_unref,
-			new_task->raw_headers);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			(rspamd_mempool_destruct_t) g_queue_free,
-			new_task->headers_order);
-	new_task->emails = g_hash_table_new (rspamd_email_hash, rspamd_emails_cmp);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			(rspamd_mempool_destruct_t) g_hash_table_unref,
-			new_task->emails);
-	new_task->urls = g_hash_table_new (rspamd_url_hash, rspamd_urls_cmp);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			(rspamd_mempool_destruct_t) g_hash_table_unref,
-			new_task->urls);
-	new_task->parts = g_ptr_array_sized_new (4);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			rspamd_ptr_array_free_hard, new_task->parts);
-	new_task->text_parts = g_ptr_array_sized_new (2);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			rspamd_ptr_array_free_hard, new_task->text_parts);
-	new_task->received = g_ptr_array_sized_new (8);
-	rspamd_mempool_add_destructor (new_task->task_pool,
-			rspamd_ptr_array_free_hard, new_task->received);
-
+	new_task->request_headers = kh_init (rspamd_req_headers_hash);
 	new_task->sock = -1;
-	new_task->flags |= (RSPAMD_TASK_FLAG_MIME|RSPAMD_TASK_FLAG_JSON);
+	new_task->flags |= (RSPAMD_TASK_FLAG_MIME);
 	new_task->result = rspamd_create_metric_result (new_task);
 
-	new_task->message_id = new_task->queue_id = "undef";
+	new_task->queue_id = "undef";
 	new_task->messages = ucl_object_typed_new (UCL_OBJECT);
 	new_task->lua_cache = g_hash_table_new (rspamd_str_hash, rspamd_str_equal);
 
@@ -185,11 +118,13 @@ rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 static void
 rspamd_task_reply (struct rspamd_task *task)
 {
+	const ev_tstamp write_timeout = 2.0;
+
 	if (task->fin_callback) {
 		task->fin_callback (task, task->fin_arg);
 	}
 	else {
-		rspamd_protocol_write_reply (task);
+		rspamd_protocol_write_reply (task, write_timeout);
 	}
 }
 
@@ -237,8 +172,6 @@ rspamd_task_restore (void *arg)
 void
 rspamd_task_free (struct rspamd_task *task)
 {
-	struct rspamd_mime_part *p;
-	struct rspamd_mime_text_part *tp;
 	struct rspamd_email_address *addr;
 	struct rspamd_lua_cached_entry *entry;
 	static guint free_iters = 0;
@@ -248,38 +181,6 @@ rspamd_task_free (struct rspamd_task *task)
 
 	if (task) {
 		debug_task ("free pointer %p", task);
-
-		for (i = 0; i < task->parts->len; i ++) {
-			p = g_ptr_array_index (task->parts, i);
-
-			if (p->raw_headers) {
-				g_hash_table_unref (p->raw_headers);
-			}
-
-			if (p->headers_order) {
-				g_queue_free (p->headers_order);
-			}
-
-			if (IS_CT_MULTIPART (p->ct)) {
-				if (p->specific.mp->children) {
-					g_ptr_array_free (p->specific.mp->children, TRUE);
-				}
-			}
-		}
-
-		for (i = 0; i < task->text_parts->len; i ++) {
-			tp = g_ptr_array_index (task->text_parts, i);
-
-			if (tp->utf_words) {
-				g_array_free (tp->utf_words, TRUE);
-			}
-			if (tp->normalized_hashes) {
-				g_array_free (tp->normalized_hashes, TRUE);
-			}
-			if (tp->languages) {
-				g_ptr_array_unref (tp->languages);
-			}
-		}
 
 		if (task->rcpt_envelope) {
 			for (i = 0; i < task->rcpt_envelope->len; i ++) {
@@ -313,6 +214,10 @@ rspamd_task_free (struct rspamd_task *task)
 			ucl_object_unref (task->settings);
 		}
 
+		if (task->settings_elt != NULL) {
+			REF_RELEASE (task->settings_elt);
+		}
+
 		if (task->client_addr) {
 			rspamd_inet_address_free (task->client_addr);
 		}
@@ -325,13 +230,8 @@ rspamd_task_free (struct rspamd_task *task)
 			g_error_free (task->err);
 		}
 
-		if (rspamd_event_pending (&task->timeout_ev, EV_TIMEOUT)) {
-			event_del (&task->timeout_ev);
-		}
-
-		if (task->guard_ev) {
-			event_del (task->guard_ev);
-		}
+		ev_timer_stop (task->event_loop, &task->timeout_ev);
+		ev_io_stop (task->event_loop, &task->guard_ev);
 
 		if (task->sock != -1) {
 			close (task->sock);
@@ -386,6 +286,9 @@ rspamd_task_free (struct rspamd_task *task)
 
 			REF_RELEASE (task->cfg);
 		}
+
+		kh_destroy (rspamd_req_headers_hash, task->request_headers);
+		rspamd_message_unref (task->message);
 
 		if (task->flags & RSPAMD_TASK_FLAG_OWN_POOL) {
 			rspamd_mempool_delete (task->task_pool);
@@ -695,7 +598,7 @@ rspamd_task_load_message (struct rspamd_task *task,
 			rspamd_mempool_add_destructor (task->task_pool, g_free, zout.dst);
 			task->msg.begin = zout.dst;
 			task->msg.len = zout.pos;
-			task->flags |= RSPAMD_TASK_FLAG_COMPRESSED;
+			task->protocol_flags |= RSPAMD_TASK_PROTOCOL_FLAG_COMPRESSED;
 
 			msg_info_task ("loaded message from zstd compressed stream; "
 						   "compressed: %ul; uncompressed: %ul",
@@ -717,16 +620,20 @@ rspamd_task_load_message (struct rspamd_task *task,
 		task->flags |= RSPAMD_TASK_FLAG_EMPTY;
 	}
 
-	if (task->flags & RSPAMD_TASK_FLAG_HAS_CONTROL) {
-		/* We have control chunk, so we need to process it separately */
-		if (task->msg.len < task->message_len) {
+	if (task->protocol_flags & RSPAMD_TASK_PROTOCOL_FLAG_HAS_CONTROL) {
+		rspamd_ftok_t *hv = rspamd_task_get_request_header (task, MLEN_HEADER);
+		gulong message_len = 0;
+
+		if (!hv || !rspamd_strtoul (hv->begin, hv->len, &message_len) ||
+				task->msg.len < message_len) {
 			msg_warn_task ("message has invalid message length: %ul and total len: %ul",
-					task->message_len, task->msg.len);
+					message_len, task->msg.len);
 			g_set_error (&task->err, rspamd_task_quark(), RSPAMD_PROTOCOL_ERROR,
 					"Invalid length");
 			return FALSE;
 		}
-		control_len = task->msg.len - task->message_len;
+
+		control_len = task->msg.len - message_len;
 
 		if (control_len > 0) {
 			parser = ucl_parser_new (UCL_PARSER_KEY_LOWERCASE);
@@ -1001,8 +908,9 @@ rspamd_task_get_principal_recipient (struct rspamd_task *task)
 		}
 	}
 
-	if (task->rcpt_mime != NULL && task->rcpt_mime->len > 0) {
-		PTR_ARRAY_FOREACH (task->rcpt_mime, i, addr) {
+	GPtrArray *rcpt_mime = MESSAGE_FIELD_CHECK (task, rcpt_mime);
+	if (rcpt_mime != NULL && rcpt_mime->len > 0) {
+		PTR_ARRAY_FOREACH (rcpt_mime, i, addr) {
 			if (addr->addr && !(addr->flags & RSPAMD_EMAIL_ADDR_ORIGINAL)) {
 				return rspamd_task_cache_principal_recipient (task, addr->addr,
 						addr->addr_len);
@@ -1039,7 +947,8 @@ rspamd_task_log_check_condition (struct rspamd_task *task,
 
 	switch (lf->type) {
 	case RSPAMD_LOG_MID:
-		if (task->message_id && strcmp (task->message_id, "undef") != 0) {
+		if (MESSAGE_FIELD_CHECK (task, message_id) &&
+			strcmp (MESSAGE_FIELD (task, message_id) , "undef") != 0) {
 			ret = TRUE;
 		}
 		break;
@@ -1066,7 +975,8 @@ rspamd_task_log_check_condition (struct rspamd_task *task,
 		break;
 	case RSPAMD_LOG_MIME_RCPT:
 	case RSPAMD_LOG_MIME_RCPTS:
-		if (task->rcpt_mime && task->rcpt_mime->len > 0) {
+		if (MESSAGE_FIELD_CHECK (task, rcpt_mime) &&
+			MESSAGE_FIELD (task, rcpt_mime)->len > 0) {
 			ret = TRUE;
 		}
 		break;
@@ -1076,7 +986,8 @@ rspamd_task_log_check_condition (struct rspamd_task *task,
 		}
 		break;
 	case RSPAMD_LOG_MIME_FROM:
-		if (task->from_mime && task->from_mime->len > 0) {
+		if (MESSAGE_FIELD_CHECK (task, from_mime) &&
+			MESSAGE_FIELD (task, from_mime)->len > 0) {
 			ret = TRUE;
 		}
 		break;
@@ -1395,8 +1306,8 @@ rspamd_task_log_variable (struct rspamd_task *task,
 	switch (lf->type) {
 	/* String vars */
 	case RSPAMD_LOG_MID:
-		if (task->message_id) {
-			var.begin = task->message_id;
+		if (MESSAGE_FIELD_CHECK (task, message_id)) {
+			var.begin = MESSAGE_FIELD (task, message_id);
 			var.len = strlen (var.begin);
 		}
 		else {
@@ -1446,14 +1357,14 @@ rspamd_task_log_variable (struct rspamd_task *task,
 		var.begin = numbuf;
 		break;
 	case RSPAMD_LOG_TIME_REAL:
-		var.begin = rspamd_log_check_time (task->time_real,
+		var.begin = rspamd_log_check_time (task->task_timestamp,
 				task->time_real_finish,
 				task->cfg->clock_res);
 		var.len = strlen (var.begin);
 		break;
 	case RSPAMD_LOG_TIME_VIRTUAL:
-		var.begin = rspamd_log_check_time (task->time_virtual,
-				task->time_virtual_finish,
+		var.begin = rspamd_log_check_time (task->task_timestamp,
+				task->time_real_finish,
 				task->cfg->clock_res);
 		var.len = strlen (var.begin);
 		break;
@@ -1465,8 +1376,11 @@ rspamd_task_log_variable (struct rspamd_task *task,
 		}
 		break;
 	case RSPAMD_LOG_MIME_FROM:
-		if (task->from_mime) {
-			return rspamd_task_write_ialist (task, task->from_mime, 1, lf,
+		if (MESSAGE_FIELD_CHECK (task, from_mime)) {
+			return rspamd_task_write_ialist (task,
+					MESSAGE_FIELD (task, from_mime),
+					1,
+					lf,
 					logbuf);
 		}
 		break;
@@ -1477,8 +1391,11 @@ rspamd_task_log_variable (struct rspamd_task *task,
 		}
 		break;
 	case RSPAMD_LOG_MIME_RCPT:
-		if (task->rcpt_mime) {
-			return rspamd_task_write_ialist (task, task->rcpt_mime, 1, lf,
+		if (MESSAGE_FIELD_CHECK (task, rcpt_mime)) {
+			return rspamd_task_write_ialist (task,
+					MESSAGE_FIELD (task, rcpt_mime),
+					1,
+					lf,
 					logbuf);
 		}
 		break;
@@ -1489,15 +1406,25 @@ rspamd_task_log_variable (struct rspamd_task *task,
 		}
 		break;
 	case RSPAMD_LOG_MIME_RCPTS:
-		if (task->rcpt_mime) {
-			return rspamd_task_write_ialist (task, task->rcpt_mime, -1, lf,
+		if (MESSAGE_FIELD_CHECK (task, rcpt_mime)) {
+			return rspamd_task_write_ialist (task,
+					MESSAGE_FIELD (task, rcpt_mime),
+					-1, /* All addresses */
+					lf,
 					logbuf);
 		}
 		break;
 	case RSPAMD_LOG_DIGEST:
-		var.len = rspamd_snprintf (numbuf, sizeof (numbuf), "%*xs",
-				(gint)sizeof (task->digest), task->digest);
-		var.begin = numbuf;
+		if (task->message) {
+			var.len = rspamd_snprintf (numbuf, sizeof (numbuf), "%*xs",
+					(gint) sizeof (MESSAGE_FIELD (task, digest)),
+					MESSAGE_FIELD (task, digest));
+			var.begin = numbuf;
+		}
+		else {
+			var.begin = undef;
+			var.len = sizeof (undef) - 1;
+		}
 		break;
 	case RSPAMD_LOG_FILENAME:
 		if (task->msg.fpath) {
@@ -1562,6 +1489,7 @@ rspamd_task_write_log (struct rspamd_task *task)
 
 	if (task->cfg->log_format == NULL ||
 			(task->flags & RSPAMD_TASK_FLAG_NO_LOG)) {
+		msg_debug_task ("skip logging due to no log flag");
 		return;
 	}
 
@@ -1641,32 +1569,33 @@ rspamd_ftok_t *
 rspamd_task_get_request_header (struct rspamd_task *task,
 		const gchar *name)
 {
-	GPtrArray *ret;
-	rspamd_ftok_t srch;
-
-	srch.begin = (gchar *)name;
-	srch.len = strlen (name);
-
-	ret = g_hash_table_lookup (task->request_headers, &srch);
+	struct rspamd_request_header_chain *ret =
+			rspamd_task_get_request_header_multiple (task, name);
 
 	if (ret) {
-		return (rspamd_ftok_t *)g_ptr_array_index (ret, 0);
+		return ret->hdr;
 	}
 
 	return NULL;
 }
 
-GPtrArray*
+struct rspamd_request_header_chain *
 rspamd_task_get_request_header_multiple (struct rspamd_task *task,
 		const gchar *name)
 {
-	GPtrArray *ret;
+	struct rspamd_request_header_chain *ret = NULL;
 	rspamd_ftok_t srch;
+	khiter_t k;
 
 	srch.begin = (gchar *)name;
 	srch.len = strlen (name);
 
-	ret = g_hash_table_lookup (task->request_headers, &srch);
+	k = kh_get (rspamd_req_headers_hash, task->request_headers,
+			&srch);
+
+	if (k != kh_end (task->request_headers)) {
+		ret = kh_value (task->request_headers, k);
+	}
 
 	return ret;
 }
@@ -1676,20 +1605,30 @@ void
 rspamd_task_add_request_header (struct rspamd_task *task,
 		rspamd_ftok_t *name, rspamd_ftok_t *value)
 {
-	GPtrArray *ret;
 
-	ret = g_hash_table_lookup (task->request_headers, name);
+	khiter_t k;
+	gint res;
+	struct rspamd_request_header_chain *chain, *nchain;
 
-	if (ret) {
-		g_ptr_array_add (ret, value);
+	k = kh_put (rspamd_req_headers_hash, task->request_headers,
+		name, &res);
 
-		/* We need to free name token */
-		rspamd_fstring_mapped_ftok_free (name);
+	if (res == 0) {
+		/* Existing name */
+		nchain = rspamd_mempool_alloc (task->task_pool, sizeof (*nchain));
+		nchain->hdr = value;
+		nchain->next = NULL;
+		chain = kh_value (task->request_headers, k);
+
+		/* Slow but OK here */
+		LL_APPEND (chain, nchain);
 	}
 	else {
-		ret = g_ptr_array_sized_new (2);
-		g_ptr_array_add (ret, value);
-		g_hash_table_replace (task->request_headers, name, ret);
+		nchain = rspamd_mempool_alloc (task->task_pool, sizeof (*nchain));
+		nchain->hdr = value;
+		nchain->next = NULL;
+
+		kh_value (task->request_headers, k) = nchain;
 	}
 }
 
@@ -1744,25 +1683,8 @@ rspamd_task_profile_get (struct rspamd_task *task, const gchar *key)
 gboolean
 rspamd_task_set_finish_time (struct rspamd_task *task)
 {
-	struct timeval tv;
-
 	if (isnan (task->time_real_finish)) {
-
-#ifdef HAVE_EVENT_NO_CACHE_TIME_FUNC
-		if (task->ev_base) {
-			event_base_update_cache_time (task->ev_base);
-			event_base_gettimeofday_cached (task->ev_base, &tv);
-			task->time_real_finish = tv_to_double (&tv);
-		}
-		else {
-			gettimeofday (&tv, NULL);
-			task->time_real_finish = tv_to_double (&tv);
-		}
-#else
-		gettimeofday (&tv, NULL);
-		task->time_real_finish = tv_to_double (&tv);
-#endif
-		task->time_virtual_finish = rspamd_get_virtual_ticks ();
+		task->time_real_finish = ev_time ();
 
 		return TRUE;
 	}

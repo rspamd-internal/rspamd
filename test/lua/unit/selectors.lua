@@ -3,11 +3,18 @@ context("Selectors test", function()
   local rspamd_task = require "rspamd_task"
   local logger = require "rspamd_logger"
   local lua_selectors = require "lua_selectors"
+  local lua_maps = require "lua_maps"
   local test_helper = require "rspamd_test_helper"
   local cfg = rspamd_config
   local task
 
   test_helper.init_url_parser()
+
+  lua_selectors.maps.test_map = lua_maps.map_add_from_ucl({
+    'key value',
+    'key1 value1',
+    'key3 value1',
+  }, 'hash', 'test selectors maps')
 
   before(function()
     local res
@@ -33,11 +40,13 @@ context("Selectors test", function()
   local cases = {
     ["ip"] = {
                 selector = "ip",
-                expect = {"198.172.22.91"}},
+                expect = {"198.172.22.91"}
+    },
 
     ["header Subject"] = {
                 selector = "header(Subject)",
-                expect = {"Second, lower-cased header subject"}},
+                expect = {"Second, lower-cased header subject"}
+    },
 
     ["header Subject lower"] = {
                 selector = "header(Subject).lower",
@@ -45,47 +54,68 @@ context("Selectors test", function()
 
     ["header full Subject lower"] = {
                 selector = "header(Subject, 'full').lower",
-                expect = {{"second, lower-cased header subject", "test subject"}}},
+                expect = {{"second, lower-cased header subject", "test subject"}}
+    },
 
     ["header full strong Subject"] = {
                 selector = "header(Subject, 'full,strong')",
-                expect = {{"Test subject"}}},
+                expect = {{"Test subject"}}
+    },
 
     ["header full strong lower-cased Subject"] = {
                 selector = "header(subject, 'full,strong')",
-                expect = {{"Second, lower-cased header subject"}}},
+                expect = {{"Second, lower-cased header subject"}}
+    },
 
     ["digest"] = {
                 selector = "digest",
-                expect = {"c459a21bd1f33fb4ba035481f46ef0c7"}},
+                expect = {"f46ccafe448fe4d7b46076938749695e"}
+    },
 
     ["user"] = {
                 selector = "user",
-                expect = {"cool user name"}},
+                expect = {"cool user name"}
+    },
 
     ["from"] = {
                 selector = "from",
-                expect = {"whoknows@nowhere.com"}},
+                expect = {"whoknows@nowhere.com"}
+    },
 
     ["rcpts"] = {
                 selector = "rcpts",
-                expect = {{"nobody@example.com", "no-one@example.com"}}},
+                expect = {{"nobody@example.com", "no-one@example.com"}}
+    },
 
     ["1st rcpts"] = {
                 selector = "rcpts.nth(1)",
-                expect = {"nobody@example.com"}},
+                expect = {"nobody@example.com"}
+    },
 
     ["lower rcpts"] = {
                 selector = "rcpts.lower.first",
-                expect = {"nobody@example.com"}},
+                expect = {"nobody@example.com"}
+    },
 
     ["first rcpts"] = {
                 selector = "rcpts.first",
-                expect = {"nobody@example.com"}},
+                expect = {"nobody@example.com"}
+    },
 
     ["first addr rcpts"] = {
                 selector = "rcpts:addr.first",
-                expect = {"nobody@example.com"}},
+                expect = {"nobody@example.com"}
+    },
+
+    ["rcpts_uniq_domains"] = {
+      selector = "rcpts:domain.uniq",
+      expect = {{"example.com"}}
+    },
+
+    ["rcpts_sorted"] = {
+      selector = "rcpts:addr.sort",
+      expect = {{"nobody@example.com", "no-one@example.com"}}
+    },
 
     ["to"] = {
                 selector = "to",
@@ -215,7 +245,36 @@ context("Selectors test", function()
 
     ["transformation substring -4"] = {
                 selector = "header(Subject, strong).substring(-4)",
-                expect = {'ject'}},
+                expect = {'ject'}
+    },
+    ["map filter"] = {
+      selector = "id('key').filter_map(test_map)",
+      expect = {'key'}
+    },
+    ["map apply"] = {
+      selector = "id('key').apply_map(test_map)",
+      expect = {'value'}
+    },
+    ["map filter list"] = {
+      selector = "list('key', 'key1', 'key2').filter_map(test_map)",
+      expect = {{'key', 'key1'}}
+    },
+    ["map apply list"] = {
+      selector = "list('key', 'key1', 'key2', 'key3').apply_map(test_map)",
+      expect = {{'value', 'value1', 'value1'}}
+    },
+    ["map apply list uniq"] = {
+      selector = "list('key', 'key1', 'key2', 'key3').apply_map(test_map).uniq",
+      expect = {{'value1', 'value'}}
+    },
+    ["words"] = {
+      selector = "words('norm')",
+      expect = {{'hello', 'world', 'mail', 'me'}}
+    },
+    ["words_full"] = {
+      selector = "words('full'):2",
+      expect = {{'hello', 'world', '', 'mail', 'me'}}
+    },
   }
 
   for case_name, case in pairs(cases) do
@@ -244,7 +303,7 @@ Content-Type: multipart/alternative;
 
 --_000_6be055295eab48a5af7ad4022f33e2d0_
 Content-Type: text/plain; charset="utf-8"
-Content-Transfer-Encoding: base64
+Content-Transfer-Encoding: 7bit
 
 Hello world
 

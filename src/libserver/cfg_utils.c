@@ -193,8 +193,8 @@ rspamd_config_new (enum rspamd_config_init_flags flags)
 	/* Default log line */
 	cfg->log_format_str = "id: <$mid>,$if_qid{ qid: <$>,}$if_ip{ ip: $,}"
 			"$if_user{ user: $,}$if_smtp_from{ from: <$>,} (default: $is_spam "
-			"($action): [$scores] [$symbols_scores_params]), len: $len, time: $time_real real,"
-			" $time_virtual virtual, dns req: $dns_req, digest: <$digest>"
+			"($action): [$scores] [$symbols_scores_params]), len: $len, time: $time_real, "
+			"dns req: $dns_req, digest: <$digest>"
 			"$if_smtp_rcpts{ rcpts: <$>, }$if_mime_rcpt{ mime_rcpt: <$>, }";
 	/* Allow non-mime input by default */
 	cfg->allow_raw_input = TRUE;
@@ -245,17 +245,31 @@ rspamd_config_new (enum rspamd_config_init_flags flags)
 void
 rspamd_config_free (struct rspamd_config *cfg)
 {
-	struct rspamd_config_post_load_script *sc, *sctmp;
+	struct rspamd_config_cfg_lua_script *sc, *sctmp;
+	struct rspamd_config_settings_elt *set, *stmp;
 	struct rspamd_worker_log_pipe *lp, *ltmp;
 
-	DL_FOREACH_SAFE (cfg->finish_callbacks, sc, sctmp) {
+	rspamd_lua_run_config_unload (cfg->lua_state, cfg);
+
+	/* Scripts part */
+	DL_FOREACH_SAFE (cfg->on_term_scripts, sc, sctmp) {
 		luaL_unref (cfg->lua_state, LUA_REGISTRYINDEX, sc->cbref);
-		g_free (sc);
 	}
 
-	DL_FOREACH_SAFE (cfg->on_load, sc, sctmp) {
+	DL_FOREACH_SAFE (cfg->on_load_scripts, sc, sctmp) {
 		luaL_unref (cfg->lua_state, LUA_REGISTRYINDEX, sc->cbref);
-		g_free (sc);
+	}
+
+	DL_FOREACH_SAFE (cfg->post_init_scripts, sc, sctmp) {
+		luaL_unref (cfg->lua_state, LUA_REGISTRYINDEX, sc->cbref);
+	}
+
+	DL_FOREACH_SAFE (cfg->config_unload_scripts, sc, sctmp) {
+		luaL_unref (cfg->lua_state, LUA_REGISTRYINDEX, sc->cbref);
+	}
+
+	DL_FOREACH_SAFE (cfg->setting_ids, set, stmp) {
+		REF_RELEASE (set);
 	}
 
 	rspamd_map_remove_all (cfg);
@@ -819,27 +833,6 @@ rspamd_config_post_load (struct rspamd_config *cfg,
 	}
 
 	if (opts & RSPAMD_CONFIG_INIT_SYMCACHE) {
-		lua_State *L = cfg->lua_state;
-		int err_idx;
-
-		/* Process squeezed Lua rules */
-		lua_pushcfunction (L, &rspamd_lua_traceback);
-		err_idx = lua_gettop (L);
-
-		if (rspamd_lua_require_function (cfg->lua_state, "lua_squeeze_rules",
-				"squeeze_init")) {
-			if (lua_pcall (L, 0, 0, err_idx) != 0) {
-				GString *tb = lua_touserdata (L, -1);
-				msg_err_config ("call to squeeze_init script failed: %v", tb);
-
-				if (tb) {
-					g_string_free (tb, TRUE);
-				}
-			}
-		}
-
-		lua_settop (L, err_idx - 1);
-
 		/* Init config cache */
 		rspamd_symcache_init (cfg->cache);
 
@@ -884,6 +877,10 @@ rspamd_config_post_load (struct rspamd_config *cfg,
 
 	if (opts & RSPAMD_CONFIG_INIT_PRELOAD_MAPS) {
 		rspamd_map_preload (cfg);
+	}
+
+	if (opts & RSPAMD_CONFIG_INIT_POST_LOAD_LUA) {
+		rspamd_lua_run_config_post_init (cfg->lua_state, cfg);
 	}
 
 	return ret;
@@ -1153,7 +1150,6 @@ rspamd_include_map_handler (const guchar *data, gsize len,
 #define RSPAMD_VERSION_MACRO "VERSION"
 #define RSPAMD_VERSION_MAJOR_MACRO "VERSION_MAJOR"
 #define RSPAMD_VERSION_MINOR_MACRO "VERSION_MINOR"
-#define RSPAMD_VERSION_PATCH_MACRO "VERSION_PATCH"
 #define RSPAMD_BRANCH_VERSION_MACRO "BRANCH_VERSION"
 #define RSPAMD_HOSTNAME_MACRO "HOSTNAME"
 
@@ -1195,18 +1191,8 @@ rspamd_ucl_add_conf_variables (struct ucl_parser *parser, GHashTable *vars)
 			RSPAMD_VERSION_MAJOR);
 	ucl_parser_register_variable (parser, RSPAMD_VERSION_MINOR_MACRO,
 			RSPAMD_VERSION_MINOR);
-	ucl_parser_register_variable (parser, RSPAMD_VERSION_PATCH_MACRO,
-			RSPAMD_VERSION_PATCH);
 	ucl_parser_register_variable (parser, RSPAMD_BRANCH_VERSION_MACRO,
 			RSPAMD_VERSION_BRANCH);
-
-#if defined(WITH_TORCH) && defined(WITH_LUAJIT) && defined(__x86_64__)
-	ucl_parser_register_variable (parser, "HAS_TORCH",
-			"yes");
-#else
-	ucl_parser_register_variable (parser, "HAS_TORCH",
-			"no");
-#endif
 
 	hostlen = sysconf (_SC_HOST_NAME_MAX);
 
@@ -2357,4 +2343,123 @@ void
 rspamd_actions_sort (struct rspamd_config *cfg)
 {
 	HASH_SORT (cfg->actions, rspamd_actions_cmp);
+}
+
+static void
+rspamd_config_settings_elt_dtor (struct rspamd_config_settings_elt *e)
+{
+	if (e->symbols_enabled) {
+		ucl_object_unref (e->symbols_enabled);
+	}
+	if (e->symbols_disabled) {
+		ucl_object_unref (e->symbols_disabled);
+	}
+}
+
+guint32
+rspamd_config_name_to_id (const gchar *name, gsize namelen)
+{
+	guint64 h;
+
+	h = rspamd_cryptobox_fast_hash_specific (RSPAMD_CRYPTOBOX_XXHASH64,
+			name, namelen, 0x0);
+	/* Take the lower part of hash as LE number */
+	return ((guint32)GUINT64_TO_LE (h));
+}
+
+struct rspamd_config_settings_elt *
+rspamd_config_find_settings_id_ref (struct rspamd_config *cfg,
+									guint32 id)
+{
+	struct rspamd_config_settings_elt *cur;
+
+	DL_FOREACH (cfg->setting_ids, cur) {
+		if (cur->id == id) {
+			REF_RETAIN (cur);
+			return cur;
+		}
+	}
+
+	return NULL;
+}
+
+struct rspamd_config_settings_elt *rspamd_config_find_settings_name_ref (
+		struct rspamd_config *cfg,
+		const gchar *name, gsize namelen)
+{
+	guint32 id;
+
+	id = rspamd_config_name_to_id (name, namelen);
+
+	return rspamd_config_find_settings_id_ref (cfg, id);
+}
+
+void
+rspamd_config_register_settings_id (struct rspamd_config *cfg,
+									const gchar *name,
+									ucl_object_t *symbols_enabled,
+									ucl_object_t *symbols_disabled,
+									enum rspamd_config_settings_policy policy)
+{
+	struct rspamd_config_settings_elt *elt;
+	guint32 id;
+
+	id = rspamd_config_name_to_id (name, strlen (name));
+	elt = rspamd_config_find_settings_id_ref (cfg, id);
+
+	if (elt) {
+		/* Need to replace */
+		struct rspamd_config_settings_elt *nelt;
+
+		DL_DELETE (cfg->setting_ids, elt);
+
+		nelt = rspamd_mempool_alloc0 (cfg->cfg_pool, sizeof (*nelt));
+
+		nelt->id = id;
+		nelt->name = rspamd_mempool_strdup (cfg->cfg_pool, name);
+
+		if (symbols_enabled) {
+			nelt->symbols_enabled = ucl_object_ref (symbols_enabled);
+		}
+
+		if (symbols_disabled) {
+			nelt->symbols_disabled = ucl_object_ref (symbols_disabled);
+		}
+
+		nelt->policy = policy;
+
+		REF_INIT_RETAIN (nelt, rspamd_config_settings_elt_dtor);
+		msg_warn_config ("replace settings id %ud (%s)", id, name);
+		rspamd_symcache_process_settings_elt (cfg->cache, elt);
+		DL_APPEND (cfg->setting_ids, nelt);
+
+		/*
+		 * Need to unref old element twice as there are two reference holders:
+		 * 1. Config structure as we call REF_INIT_RETAIN
+		 * 2. rspamd_config_find_settings_id_ref also increases refcount
+		 */
+		REF_RELEASE (elt);
+		REF_RELEASE (elt);
+	}
+	else {
+		elt = rspamd_mempool_alloc0 (cfg->cfg_pool, sizeof (*elt));
+
+		elt->id = id;
+		elt->name = rspamd_mempool_strdup (cfg->cfg_pool, name);
+
+		if (symbols_enabled) {
+			elt->symbols_enabled = ucl_object_ref (symbols_enabled);
+		}
+
+		if (symbols_disabled) {
+			elt->symbols_disabled = ucl_object_ref (symbols_disabled);
+		}
+
+		elt->policy = policy;
+
+		msg_info_config ("register new settings id %ud (%s)", id, name);
+		REF_INIT_RETAIN (elt, rspamd_config_settings_elt_dtor);
+		rspamd_symcache_process_settings_elt (cfg->cache, elt);
+		DL_APPEND (cfg->setting_ids, elt);
+	}
 }

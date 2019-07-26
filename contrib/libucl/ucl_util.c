@@ -2749,7 +2749,7 @@ enum ucl_safe_iter_flags {
 	UCL_ITERATE_FLAG_EXCEPTION
 };
 
-const char safe_iter_magic[4] = {'u', 'i', 't', 'e'};
+static const char safe_iter_magic[4] = {'u', 'i', 't', 'e'};
 struct ucl_object_safe_iter {
 	char magic[4]; /* safety check */
 	uint32_t flags;
@@ -3744,6 +3744,14 @@ ucl_object_array_sort (ucl_object_t *ar,
 
 	qsort (vec->a, vec->n, sizeof (ucl_object_t *),
 			(int (*)(const void *, const void *))cmp);
+}
+
+void ucl_object_sort_keys (ucl_object_t *obj,
+		enum ucl_object_keys_sort_flags how)
+{
+	if (obj != NULL && obj->type == UCL_OBJECT) {
+		ucl_hash_sort (obj->value.ov, how);
+	}
 }
 
 #define PRIOBITS 4

@@ -285,6 +285,23 @@ exports.unpack = function(t)
 end
 
 --[[[
+-- @function lua_util.flatten(table)
+-- Flatten underlying tables in a single table
+-- @param {table} table table of tables
+-- @return {table} flattened table
+--]]
+exports.flatten = function(t)
+  local res = {}
+  for _,e in fun.iter(t) do
+    for _,v in fun.iter(e) do
+      res[#res + 1] = v
+    end
+  end
+
+  return res
+end
+
+--[[[
 -- @function lua_util.spairs(table)
 -- Like `pairs` but keys are sorted lexicographically
 -- @param {table} table table containing key/value pairs
@@ -895,7 +912,7 @@ exports.add_debug_alias = function(mod, alias)
 end
 ---[[[
 -- @function lua_util.get_task_verdict(task)
--- Returns verdict for a task, must be called from idempotent filters only
+-- Returns verdict for a task + score if certain, must be called from idempotent filters only
 -- Returns string:
 -- * `spam`: if message have over reject threshold and has more than one positive rule
 -- * `junk`: if a message has between score between [add_header/rewrite subject] to reject thresholds and has more than two positive rules
@@ -909,61 +926,207 @@ exports.get_task_verdict = function(task)
   if result then
 
     if result.passthrough then
-      return 'passthrough'
+      return 'passthrough',nil
     end
+
+    local score = result.score
 
     local action = result.action
 
     if action == 'reject' and result.npositive > 1 then
-      return 'spam'
+      return 'spam',score
     elseif action == 'no action' then
-      if result.score < 0 or result.nnegative > 3 then
-        return 'ham'
+      if score < 0 or result.nnegative > 3 then
+        return 'ham',score
       end
     else
       -- All colors of junk
       if action == 'add header' or action == 'rewrite subject' then
         if result.npositive > 2 then
-          return 'junk'
+          return 'junk',score
         end
       end
     end
-  end
 
-  return 'uncertain'
+    return 'uncertain',score
+  end
 end
 
 ---[[[
 -- @function lua_util.maybe_obfuscate_string(subject, settings, prefix)
--- Obfuscate string if enabled in settings. Also checks utf8 validity.
+-- Obfuscate string if enabled in settings. Also checks utf8 validity - if
+-- string is not valid utf8 then '???' is returned. Empty string returned as is.
 -- Supported settings:
 -- * <prefix>_privacy = false - subject privacy is off
 -- * <prefix>_privacy_alg = 'blake2' - default hash-algorithm to obfuscate subject
 -- * <prefix>_privacy_prefix = 'obf' - prefix to show it's obfuscated
--- * <prefix>_privacy_length = 16 - cut the length of the hash
+-- * <prefix>_privacy_length = 16 - cut the length of the hash; if 0 or fasle full hash is returned
 -- @return obfuscated or validated subject
 --]]
 
 exports.maybe_obfuscate_string = function(subject, settings, prefix)
   local hash = require 'rspamd_cryptobox_hash'
-  if subject and not rspamd_util.is_valid_utf8(subject) then
+  if not subject or subject == '' then
+    return subject
+  elseif not rspamd_util.is_valid_utf8(subject) then
     subject = '???'
   elseif settings[prefix .. '_privacy'] then
     local hash_alg = settings[prefix .. '_privacy_alg'] or 'blake2'
     local subject_hash = hash.create_specific(hash_alg, subject)
-    local strip_len = settings[prefix .. '_privacy_length']
-    local privacy_prefix = settings[prefix .. '_privacy_prefix'] or ''
 
-    if strip_len then
-      subject = privacy_prefix .. ':' ..
-          subject_hash:hex():sub(1, strip_len)
+    local strip_len = settings[prefix .. '_privacy_length']
+    if strip_len and strip_len > 0 then
+      subject = subject_hash:hex():sub(1, strip_len)
     else
-      subject = privacy_prefix .. ':' ..
-          subject_hash:hex()
+      subject = subject_hash:hex()
+    end
+
+    local privacy_prefix = settings[prefix .. '_privacy_prefix']
+    if privacy_prefix and #privacy_prefix > 0 then
+      subject = privacy_prefix .. ':' .. subject
     end
   end
 
   return subject
+end
+
+---[[[
+-- @function lua_util.callback_from_string(str)
+-- Converts a string like `return function(...) end` to lua function or emits error using
+-- `rspamd_config` superglobal
+-- @return function object or nil
+--]]]
+exports.callback_from_string = function(str)
+  local loadstring = loadstring or load
+  local ret, res_or_err = pcall(loadstring(str))
+
+  if not ret or type(res_or_err) ~= 'function' then
+    local rspamd_logger = require "rspamd_logger"
+    rspamd_logger.errx(rspamd_config, 'invalid callback (%s) - must be a function',
+        res_or_err)
+
+    return nil
+  end
+
+  return res_or_err
+end
+
+---[[[
+-- @function lua_util.keys(t)
+-- Returns all keys from a specific table
+-- @param {table} t input table (or iterator triplet)
+-- @return array of keys
+--]]]
+exports.keys = function(gen, param, state)
+  local keys = {}
+  local i = 1
+
+  if param then
+    for k,_ in fun.iter(gen, param, state) do
+      rawset(keys, i, k)
+      i = i + 1
+    end
+  else
+    for k,_ in pairs(gen) do
+      rawset(keys, i, k)
+      i = i + 1
+    end
+  end
+
+  return keys
+end
+
+---[[[
+-- @function lua_util.values(t)
+-- Returns all values from a specific table
+-- @param {table} t input table
+-- @return array of values
+--]]]
+exports.values = function(gen, param, state)
+  local values = {}
+  local i = 1
+
+  if param then
+    for _,v in fun.iter(gen, param, state) do
+      rawset(values, i, v)
+      i = i + 1
+    end
+  else
+    for _,v in pairs(gen) do
+      rawset(values, i, v)
+      i = i + 1
+    end
+  end
+
+  return values
+end
+
+---[[[
+-- @function lua_util.distance_sorted(t1, t2)
+-- Returns distance between two sorted tables t1 and t2
+-- @param {table} t1 input table
+-- @param {table} t2 input table
+-- @return distance between `t1` and `t2`
+--]]]
+exports.distance_sorted = function(t1, t2)
+  local ncomp = #t1
+  local ndiff = 0
+  local i,j = 1,1
+
+  if ncomp < #t2 then
+    ncomp = #t2
+  end
+
+  for _=1,ncomp do
+    if j > #t2 then
+      ndiff = ndiff + ncomp - #t2
+      if i > j then
+        ndiff = ndiff - (i - j)
+      end
+      break
+    elseif i > #t1 then
+      ndiff = ndiff + ncomp - #t1
+      if j > i then
+        ndiff = ndiff - (j - i)
+      end
+      break
+    end
+
+    if t1[i] == t2[j] then
+      i = i + 1
+      j = j + 1
+    elseif t1[i] < t2[j] then
+      i = i + 1
+      ndiff = ndiff + 1
+    else
+      j = j + 1
+      ndiff = ndiff + 1
+    end
+  end
+
+  return ndiff
+end
+
+---[[[
+-- @function lua_util.table_digest(t)
+-- Returns hash of all values if t[1] is string or all keys otherwise
+-- @param {table} t input array or map
+-- @return {string} base32 representation of blake2b hash of all strings
+--]]]
+exports.table_digest = function(t)
+  local cr = require "rspamd_cryptobox_hash"
+  local h = cr.create()
+
+  if t[1] then
+    for _,e in ipairs(t) do
+      h:update(tostring(e))
+    end
+  else
+    for k,_ in pairs(t) do
+      h:update(k)
+    end
+  end
+ return h:base32()
 end
 
 return exports

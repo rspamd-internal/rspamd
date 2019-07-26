@@ -203,41 +203,10 @@ rspamd_ip_is_valid (const rspamd_inet_addr_t *addr)
 	return ret;
 }
 
-static void
-rspamd_enable_accept_event (gint fd, short what, gpointer d)
-{
-	struct event *events = d;
-
-	event_del (&events[1]);
-	event_add (&events[0], NULL);
-}
-
-static void
-rspamd_disable_accept_events (gint sock, GList *accept_events)
-{
-	GList *cur;
-	struct event *events;
-	const gdouble throttling = 0.5;
-	struct timeval tv;
-	struct event_base *ev_base;
-
-	double_to_tv (throttling, &tv);
-
-	for (cur = accept_events; cur != NULL; cur = g_list_next (cur)) {
-		events = cur->data;
-
-		ev_base = event_get_base (&events[0]);
-		event_del (&events[0]);
-		event_set (&events[1], sock, EV_TIMEOUT, rspamd_enable_accept_event,
-				events);
-		event_base_set (ev_base, &events[1]);
-		event_add (&events[1], &tv);
-	}
-}
-
 gint
 rspamd_accept_from_socket (gint sock, rspamd_inet_addr_t **target,
-		GList *accept_events)
+						   rspamd_accept_throttling_handler hdl,
+						   void *hdl_data)
 {
 	gint nfd, serrno;
 	union sa_union su;
@@ -254,7 +223,9 @@ rspamd_accept_from_socket (gint sock, rspamd_inet_addr_t **target,
 		}
 		else if (errno == EMFILE || errno == ENFILE) {
 			/* Temporary disable accept event */
-			rspamd_disable_accept_events (sock, accept_events);
+			if (hdl) {
+				hdl (sock, hdl_data);
+			}
 
 			return 0;
 		}
@@ -510,17 +481,9 @@ rspamd_parse_inet_address_ip6 (const guchar *text, gsize len, gpointer target)
 	g_assert (text != NULL);
 	g_assert (target != NULL);
 
+	p = text;
 	if (len == 0) {
 		len = strlen (text);
-	}
-
-	/* Ignore trailing semicolon */
-	if (text[0] == ':') {
-		p = text + 1;
-		len--;
-	}
-	else {
-		p = text;
 	}
 
 	/* Check IPv6 scope */
@@ -533,6 +496,18 @@ rspamd_parse_inet_address_ip6 (const guchar *text, gsize len, gpointer target)
 		/* Special case, SMTP conformant IPv6 address */
 		p += sizeof ("IPv6:") - 1;
 		len -= sizeof ("IPv6:") - 1;
+	}
+
+	if (*p == '[' && len > 1 && p[len - 1] == ']') {
+		/* Strip [] as well */
+		p ++;
+		len -= 2;
+	}
+
+	/* Ignore leading colon */
+	if (len > 0 && *p == ':') {
+		p++;
+		len--;
 	}
 
 	for (/* void */; len; len--) {
@@ -580,7 +555,7 @@ rspamd_parse_inet_address_ip6 (const guchar *text, gsize len, gpointer target)
 		}
 
 		if (++nibbles > 4) {
-			/* Too many dots */
+			/* Too many digits */
 			return FALSE;
 		}
 

@@ -60,7 +60,7 @@ static struct html_tag_def tag_defs[] = {
 	TAG_DEF(Tag_APPLET, "applet", (CM_OBJECT | CM_IMG | CM_INLINE | CM_PARAM)),
 	TAG_DEF(Tag_AREA, "area", (CM_BLOCK | CM_EMPTY | FL_HREF)),
 	TAG_DEF(Tag_B, "b", (CM_INLINE|FL_BLOCK)),
-	TAG_DEF(Tag_BASE, "base", (CM_HEAD | CM_EMPTY)),
+	TAG_DEF(Tag_BASE, "base", (CM_HEAD | CM_EMPTY | FL_HREF)),
 	TAG_DEF(Tag_BASEFONT, "basefont", (CM_INLINE | CM_EMPTY)),
 	TAG_DEF(Tag_BDO, "bdo", (CM_INLINE)),
 	TAG_DEF(Tag_BIG, "big", (CM_INLINE)),
@@ -222,14 +222,16 @@ rspamd_html_library_init (void)
 				G_N_ELEMENTS (entities_defs));
 
 		for (i = 0; i < G_N_ELEMENTS (entities_defs); i++) {
-			k = kh_put (entity_by_number, html_entity_by_number,
-					entities_defs[i].code, &rc);
-			kh_val (html_entity_by_number, k) = entities_defs[i].replacement;
+			if (entities_defs[i].code != 0) {
+				k = kh_put (entity_by_number, html_entity_by_number,
+						entities_defs[i].code, &rc);
+				kh_val (html_entity_by_number, k) = entities_defs[i].replacement;
+			}
 
 			k = kh_put (entity_by_name, html_entity_by_name,
 					entities_defs[i].name, &rc);
 			kh_val (html_entity_by_name, k) = entities_defs[i].replacement;
-	}
+		}
 
 		html_color_by_name = kh_init (color_by_name);
 		kh_resize (color_by_name, html_color_by_name,
@@ -238,7 +240,7 @@ rspamd_html_library_init (void)
 		rspamd_ftok_t *keys;
 
 		keys = g_malloc0 (sizeof (rspamd_ftok_t) *
-				G_N_ELEMENTS (html_colornames));
+						  G_N_ELEMENTS (html_colornames));
 
 		for (i = 0; i < G_N_ELEMENTS (html_colornames); i ++) {
 			struct html_color c;
@@ -2335,8 +2337,8 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 			case RSPAMD_HTML_COMPONENT_CLASS:
 				fstr.begin = (gchar *) comp->start;
 				fstr.len = comp->len;
-				bl->class = rspamd_mempool_ftokdup (pool, &fstr);
-				msg_debug_html ("got class: %s", bl->class);
+				bl->html_class = rspamd_mempool_ftokdup (pool, &fstr);
+				msg_debug_html ("got class: %s", bl->html_class);
 				break;
 			case RSPAMD_HTML_COMPONENT_SIZE:
 				/* Not supported by html5 */
@@ -3030,9 +3032,13 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 						prev_tag->id == Tag_HTML) {
 						url = rspamd_html_process_url_tag (pool, cur_tag, hc);
 
-						if (url != NULL && hc->base_url == NULL) {
-							/* We have a base tag available */
-							hc->base_url = url;
+						if (url != NULL) {
+							if (hc->base_url == NULL) {
+								/* We have a base tag available */
+								hc->base_url = url;
+							}
+
+							cur_tag->extra = url;
 						}
 					}
 				}

@@ -282,8 +282,8 @@ struct rspamd_lua_process_cbdata {
 	GString *out_buf;
 	goffset out_pos;
 	struct rspamd_worker *wrk;
-	struct event_base *ev_base;
-	struct event ev;
+	struct ev_loop *event_loop;
+	ev_io ev;
 };
 
 static void
@@ -291,9 +291,8 @@ rspamd_lua_execute_lua_subprocess (lua_State *L,
 								   struct rspamd_lua_process_cbdata *cbdata)
 {
 	gint err_idx, r;
-	GString *tb;
 	guint64 wlen = 0;
-	const gchar *ret;
+	const gchar *ret = NULL;
 	gsize retlen;
 
 	lua_pushcfunction (L, &rspamd_lua_traceback);
@@ -302,40 +301,51 @@ rspamd_lua_execute_lua_subprocess (lua_State *L,
 	lua_rawgeti (L, LUA_REGISTRYINDEX, cbdata->func_cbref);
 
 	if (lua_pcall (L, 0, 1, err_idx) != 0) {
-		tb = lua_touserdata (L, -1);
-		msg_err ("call to subprocess failed: %v", tb);
+		const gchar *s = lua_tostring (L, -1);
+		gsize slen = strlen (s);
+
+		msg_err ("call to subprocess failed: %s", s);
 		/* Indicate error */
-		wlen = (1ULL << 63) + tb->len;
+		wlen = (1ULL << 63u) + slen;
 
 		r = write (cbdata->sp[1], &wlen, sizeof (wlen));
 		if (r == -1) {
 			msg_err ("write failed: %s", strerror (errno));
 		}
 
-		r = write (cbdata->sp[1], tb->str, tb->len);
+		r = write (cbdata->sp[1], s, slen);
 		if (r == -1) {
 			msg_err ("write failed: %s", strerror (errno));
 		}
-		g_string_free (tb, TRUE);
-
-		lua_pop (L, 1);
 	}
 	else {
-		ret = lua_tolstring (L, -1, &retlen);
-		wlen = retlen;
+		if (lua_type (L, -1) == LUA_TSTRING) {
+			ret = lua_tolstring (L, -1, &retlen);
+			wlen = retlen;
+		}
+		else {
+			struct rspamd_lua_text *t;
+
+			t = lua_check_text (L, -1);
+
+			if (t) {
+				ret = t->start;
+				wlen = t->len;
+			}
+		}
 
 		r = write (cbdata->sp[1], &wlen, sizeof (wlen));
 		if (r == -1) {
 			msg_err ("write failed: %s", strerror (errno));
 		}
 
-		r = write (cbdata->sp[1], ret, retlen);
+		r = write (cbdata->sp[1], ret, wlen);
 		if (r == -1) {
 			msg_err ("write failed: %s", strerror (errno));
 		}
 	}
 
-	lua_pop (L, 1); /* Error function */
+	lua_settop (L, err_idx - 1);
 }
 
 static void
@@ -345,7 +355,6 @@ rspamd_lua_call_on_complete (lua_State *L,
 							 const gchar *data, gsize datalen)
 {
 	gint err_idx;
-	GString *tb;
 
 	lua_pushcfunction (L, &rspamd_lua_traceback);
 	err_idx = lua_gettop (L);
@@ -367,12 +376,11 @@ rspamd_lua_call_on_complete (lua_State *L,
 	}
 
 	if (lua_pcall (L, 2, 0, err_idx) != 0) {
-		tb = lua_touserdata (L, -1);
-		msg_err ("call to subprocess callback script failed: %v", tb);
-		lua_pop (L, 1);
+		msg_err ("call to on_complete script failed: %s",
+				lua_tostring (L, -1));
 	}
 
-	lua_pop (L, 1); /* Error function */
+	lua_settop (L, err_idx - 1);
 }
 
 static gboolean
@@ -397,9 +405,9 @@ rspamd_lua_cld_handler (struct rspamd_worker_signal_handler *sigh, void *ud)
 
 	if (!cbdata->replied) {
 		/* We still need to call on_complete callback */
+		ev_io_stop (cbdata->event_loop, &cbdata->ev);
 		rspamd_lua_call_on_complete (cbdata->L, cbdata,
 				"Worker has died without reply", NULL, 0);
-		event_del (&cbdata->ev);
 	}
 
 	/* Free structures */
@@ -418,7 +426,7 @@ rspamd_lua_cld_handler (struct rspamd_worker_signal_handler *sigh, void *ud)
 	srv_cmd.cmd.on_fork.state = child_dead;
 	srv_cmd.cmd.on_fork.cpid = cbdata->cpid;
 	srv_cmd.cmd.on_fork.ppid = getpid ();
-	rspamd_srv_send_command (cbdata->wrk, cbdata->ev_base, &srv_cmd, -1,
+	rspamd_srv_send_command (cbdata->wrk, cbdata->event_loop, &srv_cmd, -1,
 			NULL, NULL);
 	g_free (cbdata);
 
@@ -427,9 +435,10 @@ rspamd_lua_cld_handler (struct rspamd_worker_signal_handler *sigh, void *ud)
 }
 
 static void
-rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
+rspamd_lua_subprocess_io (EV_P_ ev_io *w, int revents)
 {
-	struct rspamd_lua_process_cbdata *cbdata = ud;
+	struct rspamd_lua_process_cbdata *cbdata =
+			(struct rspamd_lua_process_cbdata *)w->data;
 	gssize r;
 
 	if (cbdata->sz == (guint64)-1) {
@@ -440,9 +449,9 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 				sizeof (guint64) - cbdata->io_buf->len);
 
 		if (r == 0) {
+			ev_io_stop (cbdata->event_loop, &cbdata->ev);
 			rspamd_lua_call_on_complete (cbdata->L, cbdata,
 					"Unexpected EOF", NULL, 0);
-			event_del (&cbdata->ev);
 			cbdata->replied = TRUE;
 			kill (cbdata->cpid, SIGTERM);
 
@@ -453,9 +462,9 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 				return;
 			}
 			else {
+				ev_io_stop (cbdata->event_loop, &cbdata->ev);
 				rspamd_lua_call_on_complete (cbdata->L, cbdata,
 						strerror (errno), NULL, 0);
-				event_del (&cbdata->ev);
 				cbdata->replied = TRUE;
 				kill (cbdata->cpid, SIGTERM);
 
@@ -485,9 +494,9 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 				cbdata->sz - cbdata->io_buf->len);
 
 		if (r == 0) {
+			ev_io_stop (cbdata->event_loop, &cbdata->ev);
 			rspamd_lua_call_on_complete (cbdata->L, cbdata,
 					"Unexpected EOF", NULL, 0);
-			event_del (&cbdata->ev);
 			cbdata->replied = TRUE;
 			kill (cbdata->cpid, SIGTERM);
 
@@ -498,9 +507,9 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 				return;
 			}
 			else {
+				ev_io_stop (cbdata->event_loop, &cbdata->ev);
 				rspamd_lua_call_on_complete (cbdata->L, cbdata,
 						strerror (errno), NULL, 0);
-				event_del (&cbdata->ev);
 				cbdata->replied = TRUE;
 				kill (cbdata->cpid, SIGTERM);
 
@@ -513,6 +522,7 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 		if (cbdata->io_buf->len == cbdata->sz) {
 			gchar rep[4];
 
+			ev_io_stop (cbdata->event_loop, &cbdata->ev);
 			/* Finished reading data */
 			if (cbdata->is_error) {
 				cbdata->io_buf->str[cbdata->io_buf->len] = '\0';
@@ -524,7 +534,6 @@ rspamd_lua_subprocess_io (gint fd, short what, gpointer ud)
 						NULL, cbdata->io_buf->str, cbdata->io_buf->len);
 			}
 
-			event_del (&cbdata->ev);
 			cbdata->replied = TRUE;
 
 			/* Write reply to the child */
@@ -549,6 +558,7 @@ lua_worker_spawn_process (lua_State *L)
 	gint func_cbref, cb_cbref;
 
 	if (!rspamd_lua_parse_table_arguments (L, 2, &err,
+			RSPAMD_LUA_PARSE_ARGUMENTS_DEFAULT,
 			"func=F;exec=S;stdin=V;*on_complete=F", &func_cbref,
 			&cmdline, &inputlen, &input, &cb_cbref)) {
 		msg_err ("cannot get parameters list: %e", err);
@@ -581,7 +591,7 @@ lua_worker_spawn_process (lua_State *L)
 	actx = w->ctx;
 	cbdata->wrk = w;
 	cbdata->L = L;
-	cbdata->ev_base = actx->ev_base;
+	cbdata->event_loop = actx->event_loop;
 	cbdata->sz = (guint64)-1;
 
 	pid = fork ();
@@ -616,8 +626,9 @@ lua_worker_spawn_process (lua_State *L)
 		close (cbdata->sp[0]);
 		/* Here we assume that we can block on writing results */
 		rspamd_socket_blocking (cbdata->sp[1]);
-		event_reinit (cbdata->ev_base);
 		g_hash_table_remove_all (w->signal_events);
+		ev_loop_destroy (cbdata->event_loop);
+		cbdata->event_loop = ev_loop_new (EVFLAG_SIGNALFD);
 		rspamd_worker_unblock_signals ();
 		rspamd_lua_execute_lua_subprocess (L, cbdata);
 
@@ -643,21 +654,19 @@ lua_worker_spawn_process (lua_State *L)
 	srv_cmd.cmd.on_fork.state = child_create;
 	srv_cmd.cmd.on_fork.cpid = pid;
 	srv_cmd.cmd.on_fork.ppid = getpid ();
-	rspamd_srv_send_command (w, cbdata->ev_base, &srv_cmd, -1, NULL, NULL);
+	rspamd_srv_send_command (w, cbdata->event_loop, &srv_cmd, -1, NULL, NULL);
 
 	close (cbdata->sp[1]);
 	rspamd_socket_nonblocking (cbdata->sp[0]);
 	/* Parent */
-	rspamd_worker_set_signal_handler (SIGCHLD, w, cbdata->ev_base,
+	rspamd_worker_set_signal_handler (SIGCHLD, w, cbdata->event_loop,
 			rspamd_lua_cld_handler,
 			cbdata);
 
 	/* Add result pipe waiting */
-	event_set (&cbdata->ev, cbdata->sp[0], EV_READ | EV_PERSIST,
-			rspamd_lua_subprocess_io, cbdata);
-	event_base_set (cbdata->ev_base, &cbdata->ev);
-	/* TODO: maybe add timeout? */
-	event_add (&cbdata->ev, NULL);
+	ev_io_init (&cbdata->ev, rspamd_lua_subprocess_io, cbdata->sp[0], EV_READ);
+	cbdata->ev.data = cbdata;
+	ev_io_start (cbdata->event_loop, &cbdata->ev);
 
 	return 0;
 }

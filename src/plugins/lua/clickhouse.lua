@@ -19,6 +19,7 @@ local rspamd_lua_utils = require "lua_util"
 local upstream_list = require "rspamd_upstream_list"
 local lua_util = require "lua_util"
 local lua_clickhouse = require "lua_clickhouse"
+local lua_settings = require "lua_settings"
 local fun = require "fun"
 
 local N = "clickhouse"
@@ -30,7 +31,7 @@ end
 local data_rows = {}
 local custom_rows = {}
 local nrows = 0
-local schema_version = 5 -- Current schema version
+local schema_version = 7 -- Current schema version
 
 local settings = {
   limit = 1000,
@@ -76,6 +77,7 @@ local settings = {
   no_ssl_verify = false,
   custom_rules = {},
   enable_digest = false,
+  exceptions = nil,
   retention = {
     enable = false,
     method = 'detach',
@@ -88,52 +90,56 @@ local settings = {
 local clickhouse_schema = {[[
 CREATE TABLE rspamd
 (
-    Date Date,
-    TS DateTime,
-    From String,
-    MimeFrom String,
-    IP String,
-    Score Float32,
-    NRcpt UInt8,
-    Size UInt32,
-    IsWhitelist Enum8('blacklist' = 0, 'whitelist' = 1, 'unknown' = 2) DEFAULT 'unknown',
-    IsBayes Enum8('ham' = 0, 'spam' = 1, 'unknown' = 2) DEFAULT 'unknown',
-    IsFuzzy Enum8('whitelist' = 0, 'deny' = 1, 'unknown' = 2) DEFAULT 'unknown',
-    IsFann Enum8('ham' = 0, 'spam' = 1, 'unknown' = 2) DEFAULT 'unknown',
-    IsDkim Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2, 'dnsfail' = 3, 'na' = 4) DEFAULT 'unknown',
-    IsDmarc Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2, 'softfail' = 3, 'na' = 4, 'quarantine' = 5) DEFAULT 'unknown',
-    IsSpf Enum8('reject' = 0, 'allow' = 1, 'neutral' = 2, 'dnsfail' = 3, 'na' = 4, 'unknown' = 5) DEFAULT 'unknown',
-    NUrls Int32,
-    Action Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4, 'soft reject' = 5, 'custom' = 6) DEFAULT 'no action',
-    CustomAction String,
-    FromUser String,
-    MimeUser String,
-    RcptUser String,
-    RcptDomain String,
-    MimeRecipients Array(String),
-    MessageId String,
-    ListId String,
-    Subject String,
-    `Attachments.FileName` Array(String),
-    `Attachments.ContentType` Array(String),
-    `Attachments.Length` Array(UInt32),
-    `Attachments.Digest` Array(FixedString(16)),
-    `Urls.Tld` Array(String),
-    `Urls.Url` Array(String),
-    Emails Array(String),
-    ASN String,
-    Country FixedString(2),
+    Date Date COMMENT 'Date (used for partitioning)',
+    TS DateTime COMMENT 'Date and time of the request start (UTC)',
+    From String COMMENT 'Domain part of the return address (RFC5321.MailFrom)',
+    MimeFrom String COMMENT 'Domain part of the address in From: header (RFC5322.From)',
+    IP String COMMENT 'SMTP client IP as provided by MTA or from Received: header',
+    Helo String COMMENT 'Full hostname as sent by the SMTP client (RFC5321.HELO/.EHLO)',
+    Score Float32 COMMENT 'Message score',
+    NRcpt UInt8 COMMENT 'Number of envelope recipients (RFC5321.RcptTo)',
+    Size UInt32 COMMENT 'Message size in bytes',
+    IsWhitelist Enum8('blacklist' = 0, 'whitelist' = 1, 'unknown' = 2) DEFAULT 'unknown' COMMENT 'Based on symbols configured in `whitelist_symbols` module option',
+    IsBayes Enum8('ham' = 0, 'spam' = 1, 'unknown' = 2) DEFAULT 'unknown' COMMENT 'Based on symbols configured in `bayes_spam_symbols` and `bayes_ham_symbols` module options',
+    IsFuzzy Enum8('whitelist' = 0, 'deny' = 1, 'unknown' = 2) DEFAULT 'unknown' COMMENT 'Based on symbols configured in `fuzzy_symbols` module option',
+    IsFann Enum8('ham' = 0, 'spam' = 1, 'unknown' = 2) DEFAULT 'unknown' COMMENT 'Based on symbols configured in `ann_symbols_spam` and `ann_symbols_ham` module options',
+    IsDkim Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2, 'dnsfail' = 3, 'na' = 4) DEFAULT 'unknown' COMMENT 'Based on symbols configured in dkim_* module options',
+    IsDmarc Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2, 'softfail' = 3, 'na' = 4, 'quarantine' = 5) DEFAULT 'unknown' COMMENT 'Based on symbols configured in dmarc_* module options',
+    IsSpf Enum8('reject' = 0, 'allow' = 1, 'neutral' = 2, 'dnsfail' = 3, 'na' = 4, 'unknown' = 5) DEFAULT 'unknown' COMMENT 'Based on symbols configured in spf_* module options',
+    NUrls Int32 COMMENT 'Number of URLs and email extracted from the message',
+    Action Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4, 'soft reject' = 5, 'custom' = 6) DEFAULT 'no action' COMMENT 'Action returned for the message; if action is not predefined actual action will be in `CustomAction` field',
+    CustomAction LowCardinality(String) COMMENT 'Action string for custom action',
+    FromUser String COMMENT 'Local part of the return address (RFC5321.MailFrom)',
+    MimeUser String COMMENT 'Local part of the address in From: header (RFC5322.From)',
+    RcptUser String COMMENT '[Deprecated] Local part of the first envelope recipient (RFC5321.RcptTo)',
+    RcptDomain String COMMENT '[Deprecated] Domain part of the first envelope recipient (RFC5321.RcptTo)',
+    SMTPRecipients Array(String) COMMENT 'List of envelope recipients (RFC5321.RcptTo)',
+    MimeRecipients Array(String) COMMENT 'List of recipients from headers (RFC5322.To/.CC/.BCC)',
+    MessageId String COMMENT 'Message-ID header',
+    ListId String COMMENT 'List-Id header',
+    Subject String COMMENT 'Subject header (or hash if `subject_privacy` module option enabled)',
+    `Attachments.FileName` Array(String) COMMENT 'Attachment name',
+    `Attachments.ContentType` Array(String) COMMENT 'Attachment Content-Type',
+    `Attachments.Length` Array(UInt32) COMMENT 'Attachment size in bytes',
+    `Attachments.Digest` Array(FixedString(16)) COMMENT 'First 16 characters of hash returned by mime_part:get_digest()',
+    `Urls.Tld` Array(String) COMMENT 'Effective second level domain part of the URL host',
+    `Urls.Url` Array(String) COMMENT 'Full URL if `full_urls` module option enabled, host part of URL otherwise',
+    Emails Array(String) COMMENT 'List of emails extracted from the message',
+    ASN UInt32 COMMENT 'BGP AS number for SMTP client IP (returned by asn.rspamd.com or asn6.rspamd.com)',
+    Country FixedString(2) COMMENT 'Country for SMTP client IP (returned by asn.rspamd.com or asn6.rspamd.com)',
     IPNet String,
-    `Symbols.Names` Array(String),
-    `Symbols.Scores` Array(Float64),
-    `Symbols.Options` Array(String),
-    ScanTimeReal UInt32,
-    ScanTimeVirtual UInt32,
-    Digest FixedString(32),
-    SMTPFrom ALIAS if(From = '', '', concat(FromUser, '@', From)),
-    SMTPRcpt ALIAS if(RcptDomain = '', '', concat(RcptUser, '@', RcptDomain)),
-    MIMEFrom ALIAS if(MimeFrom = '', '', concat(MimeUser, '@', MimeFrom)),
-    MIMERcpt ALIAS MimeRecipients[1]
+    `Symbols.Names` Array(LowCardinality(String)) COMMENT 'Symbol name',
+    `Symbols.Scores` Array(Float32) COMMENT 'Symbol score',
+    `Symbols.Options` Array(String) COMMENT 'Symbol options (comma separated list)',
+    ScanTimeReal UInt32 COMMENT 'Request time in milliseconds',
+    ScanTimeVirtual UInt32 COMMENT 'Deprecated do not use',
+    AuthUser String COMMENT 'Username for authenticated SMTP client',
+    SettingsId LowCardinality(String) COMMENT 'ID for the settings profile',
+    Digest FixedString(32) COMMENT '[Deprecated]',
+    SMTPFrom ALIAS if(From = '', '', concat(FromUser, '@', From)) COMMENT 'Return address (RFC5321.MailFrom)',
+    SMTPRcpt ALIAS SMTPRecipients[1] COMMENT 'The first envelope recipient (RFC5321.RcptTo)',
+    MIMEFrom ALIAS if(MimeFrom = '', '', concat(MimeUser, '@', MimeFrom)) COMMENT 'Address in From: header (RFC5322.From)',
+    MIMERcpt ALIAS MimeRecipients[1] COMMENT 'The first recipient from headers (RFC5322.To/.CC/.BCC)'
 ) ENGINE = MergeTree()
 PARTITION BY toMonday(Date)
 ORDER BY TS
@@ -154,7 +160,7 @@ local migrations = {
       ADD COLUMN `Urls.Tld` Array(String) AFTER `Attachments.Digest`,
       ADD COLUMN `Urls.Url` Array(String) AFTER `Urls.Tld`,
       ADD COLUMN Emails Array(String) AFTER `Urls.Url`,
-      ADD COLUMN ASN String AFTER Emails,
+      ADD COLUMN ASN UInt32 AFTER Emails,
       ADD COLUMN Country FixedString(2) AFTER ASN,
       ADD COLUMN IPNet String AFTER Country,
       ADD COLUMN `Symbols.Names` Array(String) AFTER IPNet,
@@ -198,6 +204,28 @@ local migrations = {
     -- New version
     [[INSERT INTO rspamd_version (Version) Values (5)]],
   },
+  [5] = {
+    [[ALTER TABLE rspamd
+      ADD COLUMN AuthUser String AFTER ScanTimeVirtual,
+      ADD COLUMN SettingsId LowCardinality(String) AFTER AuthUser
+    ]],
+    -- New version
+    [[INSERT INTO rspamd_version (Version) Values (6)]],
+  },
+  [6] = {
+    -- Add new columns
+    [[ALTER TABLE rspamd
+      ADD COLUMN Helo String AFTER IP,
+      ADD COLUMN SMTPRecipients Array(String) AFTER RcptDomain
+    ]],
+    -- Modify SMTPRcpt alias
+    [[
+    ALTER TABLE rspamd
+      MODIFY COLUMN SMTPRcpt ALIAS SMTPRecipients[1]
+    ]],
+    -- New version
+    [[INSERT INTO rspamd_version (Version) Values (7)]],
+  },
 }
 
 local predefined_actions = {
@@ -216,6 +244,7 @@ local function clickhouse_main_row(res)
     'From',
     'MimeFrom',
     'IP',
+    'Helo',
     'Score',
     'NRcpt',
     'Size',
@@ -231,6 +260,7 @@ local function clickhouse_main_row(res)
     'MimeUser',
     'RcptUser',
     'RcptDomain',
+    'SMTPRecipients',
     'ListId',
     'Subject',
     'Digest',
@@ -239,9 +269,11 @@ local function clickhouse_main_row(res)
     'MimeRecipients',
     'MessageId',
     'ScanTimeReal',
-    'ScanTimeVirtual',
     -- 1.9.3 +
     'CustomAction',
+    -- 2.0 +
+    'AuthUser',
+    'SettingsId',
   }
 
   for _,v in ipairs(fields) do table.insert(res, v) end
@@ -380,12 +412,27 @@ local function clickhouse_send_data(task, ev_base)
 end
 
 local function clickhouse_collect(task)
-  if task:has_flag('skip') then return end
-  if not settings.allow_local and rspamd_lua_utils.is_rspamc_or_controller(task) then return end
+  if task:has_flag('skip') then
+    return
+  end
+
+  if not settings.allow_local and rspamd_lua_utils.is_rspamc_or_controller(task) then
+    return
+  end
 
   for _,sym in ipairs(settings.stop_symbols) do
     if task:has_symbol(sym) then
-      lua_util.debugm(N, task, 'skip collection as symbol %s has fired', sym)
+      rspamd_logger.infox(task, 'skip Clickhouse storage for message: symbol %s has fired', sym)
+      return
+    end
+  end
+
+  if settings.exceptions then
+    local excepted,trace = settings.exceptions:process(task)
+    if excepted then
+      rspamd_logger.infox(task, 'skipped Clickhouse storage for message: excepted (%s)',
+          trace)
+      -- Excepted
       return
     end
   end
@@ -396,18 +443,8 @@ local function clickhouse_collect(task)
     local from = task:get_from('smtp')[1]
 
     if from then
-      from_domain = from['domain']
+      from_domain = from['domain']:lower()
       from_user = from['user']
-    end
-
-    if from_domain == '' then
-      if task:get_helo() then
-        from_domain = task:get_helo()
-      end
-    end
-  else
-    if task:get_helo() then
-      from_domain = task:get_helo()
     end
   end
 
@@ -416,15 +453,17 @@ local function clickhouse_collect(task)
   if task:has_from('mime') then
     local from = task:get_from({'mime','orig'})[1]
     if from then
-      mime_domain = from['domain']
+      mime_domain = from['domain']:lower()
       mime_user = from['user']
     end
   end
 
-  local mime_rcpt = {}
+  local mime_recipients = {}
   if task:has_recipients('mime') then
-    local from = task:get_recipients({'mime','orig'})
-    mime_rcpt = fun.totable(fun.map(function (f) return f.addr or '' end, from))
+    local recipients = task:get_recipients({'mime','orig'})
+    for _, rcpt in ipairs(recipients) do
+      table.insert(mime_recipients, rcpt['user'] .. '@' .. rcpt['domain']:lower())
+    end
   end
 
   local ip_str = 'undefined'
@@ -439,12 +478,20 @@ local function clickhouse_collect(task)
     ip_str = ipnet:to_string()
   end
 
+  local helo = task:get_helo() or ''
+
   local rcpt_user = ''
   local rcpt_domain = ''
+  local smtp_recipients = {}
   if task:has_recipients('smtp') then
-    local rcpt = task:get_recipients('smtp')[1]
-    rcpt_user = rcpt['user']
-    rcpt_domain = rcpt['domain']
+    local recipients = task:get_recipients('smtp')
+    -- for compatibility with an old table structure
+    rcpt_user = recipients[1]['user']
+    rcpt_domain = recipients[1]['domain']:lower()
+
+    for _, rcpt in ipairs(recipients) do
+      table.insert(smtp_recipients, rcpt['user'] .. '@' .. rcpt['domain']:lower())
+    end
   end
 
   local list_id = task:get_header('List-Id') or ''
@@ -574,13 +621,29 @@ local function clickhouse_collect(task)
     subject = lua_util.maybe_obfuscate_string(task:get_subject() or '', settings, 'subject')
   end
 
-  local scan_real,scan_virtual = task:get_scan_time()
-  scan_real,scan_virtual = math.floor(scan_real * 1000), math.floor(scan_virtual * 1000)
+  local scan_real = task:get_scan_time()
+  scan_real = math.floor(scan_real * 1000)
   if scan_real < 0 then
     rspamd_logger.messagex(task,
-        'clock skew detected for message: %s ms real scan time (reset to 0), %s virtual scan time',
-        scan_real, scan_virtual)
+        'clock skew detected for message: %s ms real scan time (reset to 0)',
+        scan_real)
     scan_real = 0
+  end
+
+  local auth_user = task:get_user() or ''
+  local settings_id = task:get_settings_id()
+
+  if settings_id then
+    -- Convert to string
+    settings_id = lua_settings.settings_by_id(settings_id)
+
+    if settings_id then
+      settings_id = settings_id.name
+    end
+  end
+
+  if not settings_id then
+    settings_id = ''
   end
 
   local row = {
@@ -589,6 +652,7 @@ local function clickhouse_collect(task)
     from_domain,
     mime_domain,
     ip_str,
+    helo,
     score,
     nrcpts,
     task:get_size(),
@@ -604,15 +668,17 @@ local function clickhouse_collect(task)
     mime_user,
     rcpt_user,
     rcpt_domain,
+    smtp_recipients,
     list_id,
     subject,
     digest,
     fields.spf,
-    mime_rcpt,
+    mime_recipients,
     message_id,
     scan_real,
-    scan_virtual,
-    custom_action
+    custom_action,
+    auth_user,
+    settings_id
   }
 
   -- Attachments step
@@ -683,7 +749,7 @@ local function clickhouse_collect(task)
   end
 
   -- ASN information
-  local asn, country, ipnet = '--', '--', '--'
+  local asn, country, ipnet = 0, '--', '--'
   local pool = task:get_mempool()
   ret = pool:get_variable("asn")
   if ret then
@@ -1067,6 +1133,13 @@ if opts then
             settings['server'] or settings['servers'])
         rspamd_lua_utils.disable_module(N, "config")
         return
+      end
+
+      if settings.exceptions then
+        local maps_expressions = require "lua_maps_expressions"
+
+        settings.exceptions = maps_expressions.create(rspamd_config,
+            settings.exceptions, N)
       end
 
       rspamd_config:register_symbol({

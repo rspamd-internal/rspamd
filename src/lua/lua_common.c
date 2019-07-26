@@ -47,7 +47,7 @@ lua_error_quark (void)
 
 /* Util functions */
 /**
- * Create new class and store metatable on top of the stack
+ * Create new class and store metatable on top of the stack (must be popped if not needed)
  * @param L
  * @param classname name of class
  * @param func table of class methods
@@ -62,10 +62,14 @@ rspamd_lua_new_class (lua_State * L,
 	lua_pushvalue (L, -2);      /* pushes the metatable */
 	lua_settable (L, -3);       /* metatable.__index = metatable */
 
-	lua_pushstring (L, "class");    /* mt,"__index",it,"class" */
-	lua_pushstring (L, classname);  /* mt,"__index",it,"class",classname */
-	lua_rawset (L, -3);         /* mt,"__index",it */
-	luaL_register (L, NULL, methods);
+	lua_pushstring (L, "class");    /* mt,"class" */
+	lua_pushstring (L, classname);  /* mt,"class",classname */
+	lua_rawset (L, -3);         /* mt */
+
+	if (methods) {
+		luaL_register (L, NULL, methods); /* pushes all methods as MT fields */
+	}
+	/* MT is left on stack ! */
 }
 
 /**
@@ -407,11 +411,6 @@ rspamd_lua_rspamd_version_cmp (lua_State *L)
 			goto set;
 		}
 
-		if (components[2]) {
-			ret = rspamd_lua_cmp_version_components (components[2],
-					RSPAMD_VERSION_PATCH);
-		}
-
 		/*
 		 * XXX: we don't compare git releases assuming that it is meaningless
 		 */
@@ -437,8 +436,7 @@ rspamd_lua_rspamd_version_numeric (lua_State *L)
 		type = lua_tostring (L, 1);
 		if (g_ascii_strcasecmp (type, "short") == 0) {
 			version_num = RSPAMD_VERSION_MAJOR_NUM * 1000 +
-						  RSPAMD_VERSION_MINOR_NUM * 100 +
-						  RSPAMD_VERSION_PATCH_NUM * 10;
+						  RSPAMD_VERSION_MINOR_NUM * 100;
 		}
 		else if (g_ascii_strcasecmp (type, "main") == 0) {
 			version_num = RSPAMD_VERSION_MAJOR_NUM * 1000 +
@@ -449,9 +447,6 @@ rspamd_lua_rspamd_version_numeric (lua_State *L)
 		}
 		else if (g_ascii_strcasecmp (type, "minor") == 0) {
 			version_num = RSPAMD_VERSION_MINOR_NUM;
-		}
-		else if (g_ascii_strcasecmp (type, "patch") == 0) {
-			version_num = RSPAMD_VERSION_PATCH_NUM;
 		}
 	}
 
@@ -474,8 +469,7 @@ rspamd_lua_rspamd_version (lua_State *L)
 
 		if (g_ascii_strcasecmp (type, "short") == 0) {
 			result = RSPAMD_VERSION_MAJOR
-					 "." RSPAMD_VERSION_MINOR
-					 "." RSPAMD_VERSION_PATCH;
+					 "." RSPAMD_VERSION_MINOR;
 		}
 		else if (g_ascii_strcasecmp (type, "main") == 0) {
 			result = RSPAMD_VERSION_MAJOR "." RSPAMD_VERSION_MINOR;
@@ -485,9 +479,6 @@ rspamd_lua_rspamd_version (lua_State *L)
 		}
 		else if (g_ascii_strcasecmp (type, "minor") == 0) {
 			result = RSPAMD_VERSION_MINOR;
-		}
-		else if (g_ascii_strcasecmp (type, "patch") == 0) {
-			result = RSPAMD_VERSION_PATCH;
 		}
 		else if (g_ascii_strcasecmp (type, "id") == 0) {
 			result = RID;
@@ -523,13 +514,10 @@ rspamd_lua_load_env (lua_State *L, const char *fname, gint tbl_pos, GError **err
 	}
 
 	if (ret && lua_pcall (L, 0, 1, err_idx) != 0) {
-		GString *tb = lua_touserdata (L, -1);
 		g_set_error (err, g_quark_from_static_string ("lua_env"), errno,
 				"cannot init lua file %s: %s",
 				fname,
-				tb->str);
-		g_string_free (tb, TRUE);
-
+				lua_tostring (L, -1));
 		ret = FALSE;
 	}
 
@@ -729,7 +717,6 @@ rspamd_lua_set_env (lua_State *L, GHashTable *vars, char **lua_env, GError **err
 		rspamd_lua_table_set (L, "version", RVERSION);
 		rspamd_lua_table_set (L, "ver_major", RSPAMD_VERSION_MAJOR);
 		rspamd_lua_table_set (L, "ver_minor", RSPAMD_VERSION_MINOR);
-		rspamd_lua_table_set (L, "ver_patch", RSPAMD_VERSION_PATCH);
 		rspamd_lua_table_set (L, "ver_id", RID);
 		lua_pushstring (L, "ver_num");
 		lua_pushinteger (L, RSPAMD_VERSION_NUM);
@@ -927,12 +914,12 @@ rspamd_lua_init (bool wipe_mem)
 	luaopen_util (L);
 	luaopen_tcp (L);
 	luaopen_html (L);
-	luaopen_fann (L);
 	luaopen_sqlite3 (L);
 	luaopen_cryptobox (L);
 	luaopen_dns (L);
 	luaopen_udp (L);
 	luaopen_worker (L);
+	luaopen_kann (L);
 
 	luaL_newmetatable (L, "rspamd{ev_base}");
 	lua_pushstring (L, "class");
@@ -1062,7 +1049,6 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 	GList *cur;
 	struct script_module *module;
 	lua_State *L = cfg->lua_state;
-	GString *tb;
 	gint err_idx;
 
 	cur = g_list_first (cfg->script_modules);
@@ -1081,10 +1067,17 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 			lua_pushcfunction (L, &rspamd_lua_traceback);
 			err_idx = lua_gettop (L);
 
-			if (luaL_loadfile (L, module->path) != 0) {
-				msg_err_config ("load of %s failed: %s", module->path,
-					lua_tostring (L, -1));
-				lua_pop (L, 1); /*  Error function */
+			gsize fsize;
+			guint8 *data = rspamd_file_xmap (module->path,
+					PROT_READ, &fsize, TRUE);
+			guchar digest[rspamd_cryptobox_HASHBYTES];
+			gchar *lua_fname;
+
+			if (data == NULL) {
+				msg_err_config ("cannot mmap %s failed: %s", module->path,
+						strerror (errno));
+
+				lua_settop (L, err_idx - 1); /*  Error function */
 
 				rspamd_plugins_table_push_elt (L, "disabled_failed",
 						module->name);
@@ -1092,6 +1085,33 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 				cur = g_list_next (cur);
 				continue;
 			}
+
+			module->digest = rspamd_mempool_alloc (cfg->cfg_pool,
+				rspamd_cryptobox_HASHBYTES * 2 + 1);
+			rspamd_cryptobox_hash (digest, data, fsize, NULL, 0);
+			rspamd_encode_hex_buf (digest, sizeof (digest),
+					module->digest, rspamd_cryptobox_HASHBYTES * 2 + 1);
+			module->digest[rspamd_cryptobox_HASHBYTES * 2] = '\0';
+			lua_fname = g_malloc (strlen (module->path) + 2);
+			rspamd_snprintf (lua_fname, strlen (module->path) + 2, "@%s",
+				module->path);
+
+			if (luaL_loadbuffer (L, data, fsize, lua_fname) != 0) {
+				msg_err_config ("load of %s failed: %s", module->path,
+					lua_tostring (L, -1));
+				lua_settop (L, err_idx - 1); /*  Error function */
+
+				rspamd_plugins_table_push_elt (L, "disabled_failed",
+						module->name);
+				munmap (data, fsize);
+				g_free (lua_fname);
+
+				cur = g_list_next (cur);
+				continue;
+			}
+
+			munmap (data, fsize);
+			g_free (lua_fname);
 
 			/* Initialize config structure */
 			pcfg = lua_newuserdata (L, sizeof (struct rspamd_config *));
@@ -1100,14 +1120,11 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 			lua_setglobal (L, "rspamd_config");
 
 			if (lua_pcall (L, 0, 0, err_idx) != 0) {
-				tb = lua_touserdata (L, -1);
-				msg_err_config ("init of %s failed: %v",
+				msg_err_config ("init of %s failed: %s",
 						module->path,
-						tb);
+						lua_tostring (L, -1));
 
-				g_string_free (tb, TRUE);
-				lua_pop (L, 2); /* Result and error function */
-
+				lua_settop (L, err_idx - 1);
 				rspamd_plugins_table_push_elt (L, "disabled_failed",
 						module->name);
 
@@ -1116,7 +1133,10 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 			}
 
 			if (!force_load) {
-				msg_info_config ("init lua module %s", module->name);
+				msg_info_config ("init lua module %s from %s; digest: %*s",
+						module->name,
+						module->path,
+						10, module->digest);
 			}
 
 			lua_pop (L, 1); /* Error function */
@@ -1218,7 +1238,9 @@ rspamd_lua_add_preload (lua_State *L, const gchar *name, lua_CFunction func)
 
 gboolean
 rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
-		GError **err, const gchar *extraction_pattern, ...)
+								  GError **err,
+								  enum rspamd_lua_parse_arguments_flags how,
+								  const gchar *extraction_pattern, ...)
 {
 	const gchar *p, *key = NULL, *end, *cls;
 	va_list ap;
@@ -1294,7 +1316,13 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap, const gchar **)) = NULL;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, const gchar **)) = NULL;
+					}
+					else {
+						(void)va_arg (ap, gchar **);
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1317,11 +1345,16 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 
 			case 'I':
 				if (t == LUA_TNUMBER) {
-					*(va_arg (ap, gint64 *)) = lua_tonumber (L, idx);
+					*(va_arg (ap, gint64 *)) = lua_tointeger (L, idx);
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap,  gint64 *)) = 0;
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, gint64 *)) = 0;
+					}
+					else {
+						(void)va_arg (ap, gint64 *);
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1352,7 +1385,14 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap,  gint *)) = -1;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, gint *)) = -1;
+					}
+					else {
+						(void)va_arg (ap, gint *);
+					}
+
 					if (is_table) {
 						lua_pop (L, 1);
 					}
@@ -1384,7 +1424,10 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap,  gboolean *)) = 0;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, gboolean *)) = 0;
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1412,7 +1455,13 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap,  gdouble *)) = 0;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, gdouble *)) = 0;
+					}
+					else {
+						(void)va_arg (ap, gdouble *);
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1440,7 +1489,13 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap,  gdouble *)) = NAN;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, gdouble *)) = NAN;
+					}
+					else {
+						(void)va_arg (ap, gdouble *);
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1471,8 +1526,14 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap, const char **)) = NULL;
-					*valuelen = 0;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, const char **)) = NULL;
+						*valuelen = 0;
+					}
+					else {
+						(void)va_arg (ap, const char **);
+					}
 				}
 				else {
 					g_set_error (err,
@@ -1500,7 +1561,13 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 				}
 				else {
 					failed = TRUE;
-					*(va_arg (ap, ucl_object_t **)) = NULL;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, ucl_object_t **)) = NULL;
+					}
+					else {
+						(void)va_arg (ap, ucl_object_t **);
+					}
 				}
 
 				if (is_table) {
@@ -1510,7 +1577,13 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 			case 'U':
 				if (t == LUA_TNIL || t == LUA_TNONE) {
 					failed = TRUE;
-					*(va_arg (ap, void **)) = NULL;
+
+					if (how != RSPAMD_LUA_PARSE_ARGUMENTS_IGNORE_MISSING) {
+						*(va_arg (ap, void **)) = NULL;
+					}
+					else {
+						(void)va_arg (ap, void **);
+					}
 				}
 				else if (t != LUA_TUSERDATA) {
 					g_set_error (err,
@@ -1681,44 +1754,42 @@ rspamd_lua_parse_table_arguments (lua_State *L, gint pos,
 }
 
 static void
-rspamd_lua_traceback_string (lua_State *L, GString *s)
+rspamd_lua_traceback_string (lua_State *L, luaL_Buffer *buf)
 {
-	gint i = 1;
+	gint i = 1, r;
 	lua_Debug d;
+	gchar tmp[256];
 
 	while (lua_getstack (L, i++, &d)) {
 		lua_getinfo (L, "nSl", &d);
-		g_string_append_printf (s, " [%d]:{%s:%d - %s [%s]};",
+		r = rspamd_snprintf (tmp, sizeof (tmp), " [%d]:{%s:%d - %s [%s]};",
 				i - 1, d.short_src, d.currentline,
 				(d.name ? d.name : "<unknown>"), d.what);
+		luaL_addlstring (buf, tmp, r);
 	}
 }
 
 gint
 rspamd_lua_traceback (lua_State *L)
 {
+	luaL_Buffer b;
 
-	GString *tb;
-
-	tb = rspamd_lua_get_traceback_string (L);
-
-	lua_pushlightuserdata (L, tb);
+	luaL_buffinit (L, &b);
+	rspamd_lua_get_traceback_string (L, &b);
+	luaL_pushresult (&b);
 
 	return 1;
 }
 
-GString *
-rspamd_lua_get_traceback_string (lua_State *L)
+void
+rspamd_lua_get_traceback_string (lua_State *L, luaL_Buffer *buf)
 {
-	GString *tb;
 	const gchar *msg = lua_tostring (L, -1);
 
-	tb = g_string_sized_new (100);
-	g_string_append_printf (tb, "%s; trace:", msg);
-
-	rspamd_lua_traceback_string (L, tb);
-
-	return tb;
+	luaL_addstring (buf, msg);
+	lua_pop (L, 1); /* Error string */
+	luaL_addstring (buf, "; trace:");
+	rspamd_lua_traceback_string (L, buf);
 }
 
 guint
@@ -1744,7 +1815,6 @@ rspamd_lua_check_udata_common (lua_State *L, gint pos, const gchar *classname,
 		gboolean fatal)
 {
 	void *p = lua_touserdata (L, pos);
-	GString *err_msg;
 	guint i, top = lua_gettop (L);
 
 	if (p == NULL) {
@@ -1783,12 +1853,19 @@ err:
 			actual_classname = lua_typename (L, lua_type (L, pos));
 		}
 
-		err_msg = g_string_sized_new (100);
-		rspamd_printf_gstring (err_msg, "expected %s at position %d, but userdata has "
-										"%s metatable; trace: ",
+		luaL_Buffer buf;
+		gchar tmp[512];
+		gint r;
+
+		luaL_buffinit (L, &buf);
+		r = rspamd_snprintf (tmp, sizeof (tmp),
+				"expected %s at position %d, but userdata has "
+				"%s metatable; trace: ",
 				classname, pos, actual_classname);
-		rspamd_lua_traceback_string (L, err_msg);
-		rspamd_printf_gstring (err_msg, " stack(%d): ", top);
+		luaL_addlstring (&buf, tmp, r);
+		rspamd_lua_traceback_string (L, &buf);
+		r = rspamd_snprintf (tmp, sizeof (tmp), " stack(%d): ", top);
+		luaL_addlstring (&buf, tmp, r);
 
 		for (i = 1; i <= MIN (top, 10); i ++) {
 			if (lua_type (L, i) == LUA_TUSERDATA) {
@@ -1805,17 +1882,19 @@ err:
 					clsname = lua_typename (L, lua_type (L, i));
 				}
 
-				rspamd_printf_gstring (err_msg, "[%d: ud=%s] ", i,
+				r = rspamd_snprintf (tmp, sizeof (tmp), "[%d: ud=%s] ", i,
 						clsname);
+				luaL_addlstring (&buf, tmp, r);
 			}
 			else {
-				rspamd_printf_gstring (err_msg, "[%d: %s] ", i,
+				r = rspamd_snprintf (tmp, sizeof (tmp), "[%d: %s] ", i,
 						lua_typename (L, lua_type (L, i)));
+				luaL_addlstring (&buf, tmp, r);
 			}
 		}
 
-		msg_err ("lua type error: %v", err_msg);
-		g_string_free (err_msg, TRUE);
+		luaL_pushresult (&buf);
+		msg_err ("lua type error: %s", lua_tostring (L, -1));
 	}
 
 	lua_settop (L, top);
@@ -1843,27 +1922,27 @@ lua_check_session (lua_State * L, gint pos)
 	return ud ? *((struct rspamd_async_session **)ud) : NULL;
 }
 
-struct event_base*
+struct ev_loop*
 lua_check_ev_base (lua_State * L, gint pos)
 {
 	void *ud = rspamd_lua_check_udata (L, pos, "rspamd{ev_base}");
 	luaL_argcheck (L, ud != NULL, pos, "'event_base' expected");
-	return ud ? *((struct event_base **)ud) : NULL;
+	return ud ? *((struct ev_loop **)ud) : NULL;
 }
 
 static void rspamd_lua_run_postloads_error (struct thread_entry *thread, int ret, const char *msg);
 
 void
 rspamd_lua_run_postloads (lua_State *L, struct rspamd_config *cfg,
-		struct event_base *ev_base, struct rspamd_worker *w)
+		struct ev_loop *ev_base, struct rspamd_worker *w)
 {
-	struct rspamd_config_post_load_script *sc;
+	struct rspamd_config_cfg_lua_script *sc;
 	struct rspamd_config **pcfg;
-	struct event_base **pev_base;
+	struct ev_loop **pev_base;
 	struct rspamd_worker **pw;
 
 	/* Execute post load scripts */
-	LL_FOREACH (cfg->on_load, sc) {
+	LL_FOREACH (cfg->on_load_scripts, sc) {
 		struct thread_entry *thread = lua_thread_pool_get_for_config (cfg);
 		thread->error_callback = rspamd_lua_run_postloads_error;
 		L = thread->lua_state;
@@ -1885,6 +1964,55 @@ rspamd_lua_run_postloads (lua_State *L, struct rspamd_config *cfg,
 	}
 }
 
+
+void
+rspamd_lua_run_config_post_init (lua_State *L, struct rspamd_config *cfg)
+{
+	struct rspamd_config_cfg_lua_script *sc;
+	struct rspamd_config **pcfg;
+
+	LL_FOREACH (cfg->post_init_scripts, sc) {
+		lua_pushcfunction (L, &rspamd_lua_traceback);
+		gint err_idx = lua_gettop (L);
+
+		lua_rawgeti (L, LUA_REGISTRYINDEX, sc->cbref);
+		pcfg = lua_newuserdata (L, sizeof (*pcfg));
+		*pcfg = cfg;
+		rspamd_lua_setclass (L, "rspamd{config}", -1);
+
+		if (lua_pcall (L, 1, 0, err_idx) != 0) {
+			msg_err_config ("cannot run config post init script: %s",
+					lua_tostring (L, -1));
+		}
+
+		lua_settop (L, err_idx - 1);
+	}
+}
+
+
+void
+rspamd_lua_run_config_unload (lua_State *L, struct rspamd_config *cfg)
+{
+	struct rspamd_config_cfg_lua_script *sc;
+	struct rspamd_config **pcfg;
+
+	LL_FOREACH (cfg->config_unload_scripts, sc) {
+		lua_pushcfunction (L, &rspamd_lua_traceback);
+		gint err_idx = lua_gettop (L);
+
+		lua_rawgeti (L, LUA_REGISTRYINDEX, sc->cbref);
+		pcfg = lua_newuserdata (L, sizeof (*pcfg));
+		*pcfg = cfg;
+		rspamd_lua_setclass (L, "rspamd{config}", -1);
+
+		if (lua_pcall (L, 1, 0, err_idx) != 0) {
+			msg_err_config ("cannot run config post init script: %s",
+					lua_tostring (L, -1));
+		}
+
+		lua_settop (L, err_idx - 1);
+	}
+}
 
 static void
 rspamd_lua_run_postloads_error (struct thread_entry *thread, int ret, const char *msg)
@@ -1996,11 +2124,8 @@ rspamd_lua_try_load_redis (lua_State *L, const ucl_object_t *obj,
 	lua_pushboolean (L, false); /* no_fallback */
 
 	if (lua_pcall (L, 3, 1, err_idx) != 0) {
-		GString *tb;
-
-		tb = lua_touserdata (L, -1);
-		msg_err_config ("cannot call lua try_load_redis_servers script: %s", tb->str);
-		g_string_free (tb, TRUE);
+		msg_err_config ("cannot call lua try_load_redis_servers script: %s",
+				lua_tostring (L, -1));
 		lua_settop (L, 0);
 
 		return FALSE;
@@ -2141,6 +2266,8 @@ rspamd_lua_push_words (lua_State *L, GArray *words,
 			rspamd_lua_push_full_word (L, w);
 			/* Push to the resulting vector */
 			lua_rawseti (L, -2, cnt ++);
+			break;
+		default:
 			break;
 		}
 	}
