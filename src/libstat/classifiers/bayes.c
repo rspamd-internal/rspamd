@@ -308,7 +308,7 @@ bayes_classify (struct rspamd_classifier * ctx,
 
 	/* Check max learns */
 	if (ctx->cfg->min_learns > 0) {
-		msg_debug_bayes ("<%s> Inside max learns check", task->message_id);
+		msg_debug_bayes ("Inside max learns check");
 		if (ctx->ham_learns > 2) {
 			msg_info_task ("run script as ham class has more enough "
 					"learns: %ul",
