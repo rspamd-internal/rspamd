@@ -256,10 +256,7 @@ static void
 lua_udp_io_handler (gint fd, short what, gpointer p)
 {
 	struct lua_udp_cbdata *cbd = (struct lua_udp_cbdata *)p;
-	lua_State *L;
 	gssize r;
-
-	L = cbd->L;
 
 	if (what == EV_TIMEOUT) {
 		if (cbd->sent && cbd->retransmits > 0) {
@@ -373,7 +370,8 @@ lua_udp_sendto (lua_State *L) {
 		if (lua_type (L, -1) == LUA_TSTRING) {
 			host = luaL_checkstring (L, -1);
 
-			if (rspamd_parse_inet_address (&addr, host, 0)) {
+			if (rspamd_parse_inet_address (&addr,
+					host, strlen (host), RSPAMD_INET_ADDRESS_PARSE_DEFAULT)) {
 				if (port != 0) {
 					rspamd_inet_address_set_port (addr, port);
 				}

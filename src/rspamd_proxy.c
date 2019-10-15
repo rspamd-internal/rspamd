@@ -1728,6 +1728,12 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 			session->pool, session->ctx->lang_det,
 			session->ctx->event_loop);
 	task->flags |= RSPAMD_TASK_FLAG_MIME;
+
+	if (session->ctx->milter) {
+		task->protocol_flags |= RSPAMD_TASK_PROTOCOL_FLAG_MILTER|
+				RSPAMD_TASK_PROTOCOL_FLAG_BODY_BLOCK;
+	}
+
 	task->sock = -1;
 
 	if (session->client_milter_conn) {
@@ -1773,7 +1779,8 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 	if (session->ctx->default_upstream->timeout > 0.0) {
 		task->timeout_ev.data = task;
 		ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
-				session->ctx->default_upstream->timeout, 0.0);
+				session->ctx->default_upstream->timeout,
+				session->ctx->default_upstream->timeout);
 		ev_timer_start (task->event_loop, &task->timeout_ev);
 
 	}
@@ -1781,7 +1788,8 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 		if (session->ctx->cfg->task_timeout > 0) {
 			task->timeout_ev.data = task;
 			ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
-					session->ctx->cfg->task_timeout, 0.0);
+					session->ctx->cfg->task_timeout,
+					session->ctx->default_upstream->timeout);
 			ev_timer_start (task->event_loop, &task->timeout_ev);
 		}
 	}
@@ -2208,6 +2216,7 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 {
 	struct rspamd_proxy_ctx *ctx = worker->ctx;
 
+	g_assert (rspamd_worker_check_context (worker->ctx, rspamd_rspamd_proxy_magic));
 	ctx->cfg = worker->srv->cfg;
 	ctx->event_loop = rspamd_prepare_worker (worker, "rspamd_proxy",
 			proxy_accept_socket);
@@ -2222,6 +2231,9 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 
 	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->event_loop,
 			ctx->cfg->ups_ctx);
+	rspamd_mempool_add_destructor (ctx->cfg->cfg_pool,
+			(rspamd_mempool_destruct_t)rspamd_http_context_free,
+			ctx->http_ctx);
 
 	if (ctx->has_self_scan) {
 		/* Additional initialisation needed */
@@ -2255,9 +2267,7 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 		rspamd_stat_close ();
 	}
 
-	struct rspamd_http_context *http_ctx = ctx->http_ctx;
 	REF_RELEASE (ctx->cfg);
-	rspamd_http_context_free (http_ctx);
 	rspamd_log_close (worker->srv->logger, TRUE);
 
 	exit (EXIT_SUCCESS);

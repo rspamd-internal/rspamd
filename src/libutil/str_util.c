@@ -62,7 +62,7 @@ const guchar lc_map[256] = {
 		0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
 };
 
-void
+guint
 rspamd_str_lc (gchar *str, guint size)
 {
 	guint leftover = size % 4;
@@ -93,6 +93,7 @@ rspamd_str_lc (gchar *str, guint size)
 		*dest = lc_map[(guchar)str[i]];
 	}
 
+	return size;
 }
 
 gint
@@ -144,42 +145,33 @@ rspamd_lc_cmp (const gchar *s, const gchar *d, gsize l)
  * string to lower case, so some locale peculiarities are simply ignored
  * If the target string is longer than initial one, then we just trim it
  */
-void
+guint
 rspamd_str_lc_utf8 (gchar *str, guint size)
 {
-	const gchar *s = str, *p;
-	gchar *d = str, tst[6];
-	gint remain = size;
-	gint r;
-	gunichar uc;
+	guchar *d = (guchar *)str, tst[6];
+	gint32 i = 0, prev = 0;
+	UChar32 uc;
 
-	while (remain > 0) {
-		p = g_utf8_next_char (s);
+	while (i < size) {
+		prev = i;
 
-		if (p - s > remain) {
-			break;
-		}
+		U8_NEXT ((guint8*)str, i, size, uc);
+		uc = u_tolower (uc);
 
-		uc = g_utf8_get_char (s);
-		uc = g_unichar_tolower (uc);
+		gint32 olen = 0;
+		U8_APPEND_UNSAFE (tst, olen, uc);
 
-		if (remain >= 6) {
-			r = g_unichar_to_utf8 (uc, d);
+		if (olen <= (i - prev)) {
+			memcpy (d, tst, olen);
+			d += olen;
 		}
 		else {
-			/* We must be cautious here to avoid broken unicode being append */
-			r = g_unichar_to_utf8 (uc, tst);
-			if (r > remain) {
-				break;
-			}
-			else {
-				memcpy (d, tst, r);
-			}
+			/* Lowercasing has increased the length, so we need to ignore it */
+			d += i - prev;
 		}
-		remain -= r;
-		s = p;
-		d += r;
 	}
+
+	return d - (guchar *)str;
 }
 
 gboolean
@@ -255,7 +247,7 @@ rspamd_strcase_hash (gconstpointer key)
 
 	len = strlen (p);
 
-	return rspamd_icase_hash (p, len, rspamd_hash_seed ());
+	return (guint)rspamd_icase_hash (p, len, rspamd_hash_seed ());
 }
 
 guint
@@ -293,7 +285,7 @@ rspamd_ftok_icase_hash (gconstpointer key)
 {
 	const rspamd_ftok_t *f = key;
 
-	return rspamd_icase_hash (f->begin, f->len, rspamd_hash_seed ());
+	return (guint)rspamd_icase_hash (f->begin, f->len, rspamd_hash_seed ());
 }
 
 gboolean
@@ -791,7 +783,7 @@ while (0)
 	cols = 0;
 
 	while (inlen > 6) {
-		n = *(guint64 *)in;
+		memcpy (&n, in, sizeof (n));
 		n = GUINT64_TO_BE (n);
 
 		if (str_len <= 0 || cols <= str_len - 8) {
@@ -2089,15 +2081,22 @@ rspamd_decode_qp_buf (const gchar *in, gsize inlen,
 
 	while (remain > 0 && o < end) {
 		if (*p == '=') {
-			p ++;
 			remain --;
 
 			if (remain == 0) {
+				/* Last '=' character, bugon */
 				if (end - o > 0) {
 					*o++ = *p;
-					break;
 				}
+				else {
+					/* Buffer overflow */
+					return (-1);
+				}
+
+				break;
 			}
+
+			p ++;
 decode:
 			/* Decode character after '=' */
 			c = *p++;
@@ -2154,9 +2153,29 @@ decode:
 					processed = pos - o;
 					remain -= processed;
 					p += processed;
-					o = pos - 1;
-					/* Skip comparison, as we know that we have found match */
-					goto decode;
+
+					if (remain > 0) {
+						o = pos - 1;
+						/*
+						 * Skip comparison and jump inside decode branch,
+						 * as we know that we have found match
+						 */
+						goto decode;
+					}
+					else {
+						/* Last '=' character, bugon */
+						o = pos;
+
+						if (end - o > 0) {
+							*o = '=';
+						}
+						else {
+							/* Buffer overflow */
+							return (-1);
+						}
+
+						break;
+					}
 				}
 			}
 			else {
@@ -3032,4 +3051,64 @@ const gchar* rspamd_string_len_strip (const gchar *in,
 	}
 
 	return in;
+}
+
+gchar **
+rspamd_string_len_split (const gchar *in, gsize len, const gchar *spill,
+		gint max_elts, rspamd_mempool_t *pool)
+{
+	const gchar *p = in, *end = in + len;
+	gsize detected_elts = 0;
+	gchar **res;
+
+	/* Detect number of elements */
+	while (p < end) {
+		gsize cur_fragment = rspamd_memcspn (p, spill, end - p);
+
+		if (cur_fragment > 0) {
+			detected_elts ++;
+			p += cur_fragment;
+
+			if (max_elts > 0 && detected_elts >= max_elts) {
+				break;
+			}
+		}
+
+		/* Something like a,,b produces {'a', 'b'} not {'a', '', 'b'} */
+		p += rspamd_memspn (p, spill, end - p);
+	}
+
+	res = pool ?
+			rspamd_mempool_alloc (pool, sizeof (gchar *) * (detected_elts + 1)) :
+			g_malloc (sizeof (gchar *) * (detected_elts + 1));
+	/* Last one */
+	res[detected_elts] = NULL;
+	detected_elts = 0;
+	p = in;
+
+	while (p < end) {
+		gsize cur_fragment = rspamd_memcspn (p, spill, end - p);
+
+		if (cur_fragment > 0) {
+			gchar *elt;
+
+			elt = pool ?
+				  rspamd_mempool_alloc (pool, cur_fragment + 1) :
+				  g_malloc (cur_fragment + 1);
+
+			memcpy (elt, p, cur_fragment);
+			elt[cur_fragment] = '\0';
+
+			res[detected_elts ++] = elt;
+			p += cur_fragment;
+
+			if (max_elts > 0 && detected_elts >= max_elts) {
+				break;
+			}
+		}
+
+		p += rspamd_memspn (p, spill, end - p);
+	}
+
+	return res;
 }

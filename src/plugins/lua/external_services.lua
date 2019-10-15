@@ -126,14 +126,7 @@ local function add_scanner_rule(sym, opts)
     return nil
   end
 
-  if not opts.symbol_fail then
-    opts.symbol_fail = opts.symbol .. '_FAIL'
-  end
-
   local rule = cfg.configure(opts)
-  rule.type = opts.type
-  rule.symbol_fail = opts.symbol_fail
-  rule.redis_params = redis_params
 
   if not rule then
     rspamd_logger.errx(rspamd_config, 'cannot configure %s for %s',
@@ -141,10 +134,20 @@ local function add_scanner_rule(sym, opts)
     return nil
   end
 
+  rule.type = opts.type
+
+  if not rule.symbol_fail then
+    rule.symbol_fail = rule.symbol .. '_FAIL'
+  end
+
+  rule.redis_params = redis_params
+
   -- if any mime_part filter defined, do not scan all attachments
   if opts.mime_parts_filter_regex ~= nil
-    or opts.mime_parts_filter_ext ~= nil then
-      rule.scan_all_mime_parts = false
+      or opts.mime_parts_filter_ext ~= nil then
+    rule.scan_all_mime_parts = false
+  else
+    rule.scan_all_mime_parts = true
   end
 
   rule.patterns = common.create_regex_table(opts.patterns or {})
@@ -211,13 +214,34 @@ if opts and type(opts) == 'table' then
 
         local id = rspamd_config:register_symbol(t)
 
-        rspamd_config:register_symbol({
-          type = 'virtual,nostat',
-          name = m['symbol_fail'],
-          parent = id,
-          score = 0.0,
-          group = N
-        })
+        if m.symbol_fail then
+          rspamd_config:register_symbol({
+            type = 'virtual',
+            name = m['symbol_fail'],
+            parent = id,
+            score = 0.0,
+            group = N
+          })
+        end
+
+        if m.symbol_encrypted then
+          rspamd_config:register_symbol({
+            type = 'virtual',
+            name = m['symbol_encrypted'],
+            parent = id,
+            score = 0.0,
+            group = N
+          })
+        end
+        if m.symbol_macro then
+          rspamd_config:register_symbol({
+            type = 'virtual',
+            name = m['symbol_macro'],
+            parent = id,
+            score = 0.0,
+            group = N
+          })
+        end
         has_valid = true
         if type(m['patterns']) == 'table' then
           if m['patterns'][1] then

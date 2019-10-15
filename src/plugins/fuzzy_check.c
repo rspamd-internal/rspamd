@@ -467,7 +467,9 @@ fuzzy_parse_rule (struct rspamd_config *cfg, const ucl_object_t *obj,
 		/* pass max_error and revive_time configuration in upstream for fuzzy storage
 		 * it allows to configure error_rate threshold and upstream dead timer
 		 */
-		rspamd_upstreams_set_limits (rule->servers, (gdouble) fuzzy_module_ctx->revive_time, NAN, NAN, NAN, (guint) fuzzy_module_ctx->max_errors, NAN);
+		rspamd_upstreams_set_limits (rule->servers,
+				(gdouble) fuzzy_module_ctx->revive_time, NAN, NAN, NAN,
+				(guint) fuzzy_module_ctx->max_errors, 0);
 
 		rspamd_mempool_add_destructor (cfg->cfg_pool,
 				(rspamd_mempool_destruct_t)rspamd_upstreams_destroy,
@@ -2121,7 +2123,9 @@ fuzzy_insert_metric_results (struct rspamd_task *task, GPtrArray *results)
 {
 	struct fuzzy_client_result *res;
 	guint i;
-	gboolean seen_text_hash = FALSE, seen_img_hash = FALSE, seen_text = FALSE,
+	gboolean seen_text_hash = FALSE,
+			seen_img_hash = FALSE,
+			seen_text_part = FALSE,
 			seen_long_text = FALSE;
 	gdouble prob_txt = 0.0, mult;
 	struct rspamd_mime_text_part *tp;
@@ -2141,18 +2145,21 @@ fuzzy_insert_metric_results (struct rspamd_task *task, GPtrArray *results)
 
 	if (task->message) {
 		PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, text_parts), i, tp) {
-			if (!IS_PART_EMPTY (tp)) {
-				seen_text = TRUE;
-			}
-			else if (tp->utf_stripped_text.magic == UTEXT_MAGIC) {
-				if (utext_isLengthExpensive (&tp->utf_stripped_text)) {
-					seen_long_text =
-							utext_nativeLength (&tp->utf_stripped_text) > text_length_cutoff;
-				}
-				else {
-					/* Cannot directly calculate length */
-					seen_long_text =
-							tp->utf_stripped_content->len / 2 > text_length_cutoff;
+			if (!IS_PART_EMPTY (tp) && tp->utf_words->len > 0) {
+				seen_text_part = TRUE;
+
+				if (tp->utf_stripped_text.magic == UTEXT_MAGIC) {
+					if (utext_isLengthExpensive (&tp->utf_stripped_text)) {
+						seen_long_text =
+								utext_nativeLength (&tp->utf_stripped_text) >
+								text_length_cutoff;
+					}
+					else {
+						/* Cannot directly calculate length */
+						seen_long_text =
+								(tp->utf_stripped_content->len / 2) >
+								text_length_cutoff;
+					}
 				}
 			}
 		}
@@ -2166,7 +2173,7 @@ fuzzy_insert_metric_results (struct rspamd_task *task, GPtrArray *results)
 				if (seen_long_text) {
 					mult *= 0.25;
 				}
-				else if (seen_text) {
+				else if (seen_text_part) {
 					/* We have some short text + image */
 					mult *= 0.9;
 				}
@@ -2495,7 +2502,7 @@ fuzzy_controller_io_callback (gint fd, short what, void *arg)
 							(gint)sizeof (rep->digest), rep->digest,
 							symbol,
 							rep->v1.flag,
-							MESSAGE_FIELD (session->task, message_id));
+							MESSAGE_FIELD_CHECK (session->task, message_id));
 				}
 				else {
 					if (rep->v1.value == 401) {
@@ -2903,7 +2910,7 @@ register_fuzzy_controller_call (struct rspamd_http_connection_entry *entry,
 
 	/* Get upstream */
 
-	while ((selected = rspamd_upstream_get (rule->servers,
+	while ((selected = rspamd_upstream_get_forced (rule->servers,
 			RSPAMD_UPSTREAM_SEQUENTIAL, NULL, 0))) {
 		/* Create UDP socket */
 		addr = rspamd_upstream_addr_next (selected);

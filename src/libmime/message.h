@@ -56,19 +56,21 @@ struct rspamd_mime_multipart {
 struct rspamd_mime_part {
 	struct rspamd_content_type *ct;
 	struct rspamd_content_type *detected_ct;
+	gchar *detected_type;
+	gchar *detected_ext;
 	struct rspamd_content_disposition *cd;
 	rspamd_ftok_t raw_data;
 	rspamd_ftok_t parsed_data;
 	struct rspamd_mime_part *parent_part;
 
 	struct rspamd_mime_header *headers_order;
-	khash_t(rspamd_mime_headers_htb) *raw_headers;
+	struct rspamd_mime_headers_table *raw_headers;
 
 	gchar *raw_headers_str;
 	gsize raw_headers_len;
 
 	enum rspamd_cte cte;
-	enum rspamd_mime_part_flags flags;
+	guint flags;
 	guint id;
 
 	union {
@@ -148,7 +150,7 @@ struct rspamd_message {
 	struct rspamd_received_header *received;	/**< list of received headers						*/
 	GHashTable *urls;							/**< list of parsed urls							*/
 	GHashTable *emails;							/**< list of parsed emails							*/
-	khash_t(rspamd_mime_headers_htb) *raw_headers;	/**< list of raw headers						*/
+	struct rspamd_mime_headers_table *raw_headers;	/**< list of raw headers						*/
 	struct rspamd_mime_header *headers_order;	/**< order of raw headers							*/
 	GPtrArray *rcpt_mime;
 	GPtrArray *from_mime;

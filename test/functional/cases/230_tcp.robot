@@ -21,8 +21,8 @@ Simple TCP request
 
 SSL TCP request
   ${result} =  Scan Message With Rspamc  ${MESSAGE}
-  Check Rspamc  ${result}  TCP_SSL_RESPONSE (0.00)[test]
-  Check Rspamc  ${result}  TCP_SSL_RESPONSE_2 (0.00)[test2]
+  Check Rspamc  ${result}  TCP_SSL_RESPONSE (0.00)[hello]
+  Check Rspamc  ${result}  TCP_SSL_RESPONSE_2 (0.00)[hello]
 
 SSL Large TCP request
   ${result} =  Scan Message With Rspamc  ${MESSAGE}
@@ -47,7 +47,7 @@ Sync API TCP post request
 *** Keywords ***
 Lua Setup
   [Arguments]  ${LUA_SCRIPT}
-  Set Global Variable  ${LUA_SCRIPT}
+  Set Suite Variable  ${LUA_SCRIPT}
   Generic Setup
 
 Servers Setup

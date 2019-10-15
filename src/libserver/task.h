@@ -42,25 +42,27 @@ enum rspamd_task_stage {
 	RSPAMD_TASK_STAGE_CONNECT = (1u << 0u),
 	RSPAMD_TASK_STAGE_ENVELOPE = (1u << 1u),
 	RSPAMD_TASK_STAGE_READ_MESSAGE = (1u << 2u),
-	RSPAMD_TASK_STAGE_PRE_FILTERS = (1u << 3u),
+	RSPAMD_TASK_STAGE_PRE_FILTERS_EMPTY = (1u << 3u),
 	RSPAMD_TASK_STAGE_PROCESS_MESSAGE = (1u << 4u),
-	RSPAMD_TASK_STAGE_FILTERS = (1u << 5u),
-	RSPAMD_TASK_STAGE_CLASSIFIERS_PRE = (1u << 6u),
-	RSPAMD_TASK_STAGE_CLASSIFIERS = (1u << 7u),
-	RSPAMD_TASK_STAGE_CLASSIFIERS_POST = (1u << 8u),
-	RSPAMD_TASK_STAGE_COMPOSITES = (1u << 9u),
-	RSPAMD_TASK_STAGE_POST_FILTERS = (1u << 10u),
-	RSPAMD_TASK_STAGE_LEARN_PRE = (1u << 11u),
-	RSPAMD_TASK_STAGE_LEARN = (1u << 12u),
-	RSPAMD_TASK_STAGE_LEARN_POST = (1u << 13u),
-	RSPAMD_TASK_STAGE_COMPOSITES_POST = (1u << 14u),
-	RSPAMD_TASK_STAGE_IDEMPOTENT = (1u << 15u),
-	RSPAMD_TASK_STAGE_DONE = (1u << 16u),
-	RSPAMD_TASK_STAGE_REPLIED = (1u << 17u)
+	RSPAMD_TASK_STAGE_PRE_FILTERS = (1u << 5u),
+	RSPAMD_TASK_STAGE_FILTERS = (1u << 6u),
+	RSPAMD_TASK_STAGE_CLASSIFIERS_PRE = (1u << 7u),
+	RSPAMD_TASK_STAGE_CLASSIFIERS = (1u << 8u),
+	RSPAMD_TASK_STAGE_CLASSIFIERS_POST = (1u << 9u),
+	RSPAMD_TASK_STAGE_COMPOSITES = (1u << 10u),
+	RSPAMD_TASK_STAGE_POST_FILTERS = (1u << 11u),
+	RSPAMD_TASK_STAGE_LEARN_PRE = (1u << 12u),
+	RSPAMD_TASK_STAGE_LEARN = (1u << 13u),
+	RSPAMD_TASK_STAGE_LEARN_POST = (1u << 14u),
+	RSPAMD_TASK_STAGE_COMPOSITES_POST = (1u << 15u),
+	RSPAMD_TASK_STAGE_IDEMPOTENT = (1u << 16u),
+	RSPAMD_TASK_STAGE_DONE = (1u << 17u),
+	RSPAMD_TASK_STAGE_REPLIED = (1u << 18u)
 };
 
 #define RSPAMD_TASK_PROCESS_ALL (RSPAMD_TASK_STAGE_CONNECT | \
         RSPAMD_TASK_STAGE_ENVELOPE | \
+        RSPAMD_TASK_STAGE_PRE_FILTERS_EMPTY | \
         RSPAMD_TASK_STAGE_READ_MESSAGE | \
         RSPAMD_TASK_STAGE_PRE_FILTERS | \
         RSPAMD_TASK_STAGE_PROCESS_MESSAGE | \
@@ -128,7 +130,9 @@ enum rspamd_task_stage {
 #define RSPAMD_TASK_PROTOCOL_FLAG_EXT_URLS (1u << 4u)
 /* Client allows body block (including headers in no FLAG_MILTER) */
 #define RSPAMD_TASK_PROTOCOL_FLAG_BODY_BLOCK (1u << 5u)
-#define RSPAMD_TASK_PROTOCOL_FLAG_MAX_SHIFT (5u)
+/* Emit groups information */
+#define RSPAMD_TASK_PROTOCOL_FLAG_GROUPS (1u << 6u)
+#define RSPAMD_TASK_PROTOCOL_FLAG_MAX_SHIFT (6u)
 
 #define RSPAMD_TASK_IS_SKIPPED(task) (((task)->flags & RSPAMD_TASK_FLAG_SKIP))
 #define RSPAMD_TASK_IS_SPAMC(task) (((task)->cmd == CMD_CHECK_SPAMC))
@@ -178,7 +182,7 @@ struct rspamd_task {
 	struct rspamd_task_data_storage msg;            /**< message buffer									*/
 	struct rspamd_http_connection *http_conn;        /**< HTTP server connection							*/
 	struct rspamd_async_session *s;                /**< async session object							*/
-	struct rspamd_metric_result *result;            /**< Metric result									*/
+	struct rspamd_scan_result *result;            /**< Metric result									*/
 	GHashTable *lua_cache;                            /**< cache of lua objects							*/
 	GPtrArray *tokens;                                /**< statistics tokens */
 	GArray *meta_words;                                /**< rspamd_stat_token_t produced from meta headers
@@ -301,10 +305,10 @@ gboolean rspamd_learn_task_spam (struct rspamd_task *task,
  * @param m
  * @return
  */
-struct rspamd_metric_result;
+struct rspamd_scan_result;
 
 gdouble rspamd_task_get_required_score (struct rspamd_task *task,
-										struct rspamd_metric_result *m);
+										struct rspamd_scan_result *m);
 
 /**
  * Returns the first header as value for a header

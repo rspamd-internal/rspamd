@@ -46,7 +46,7 @@ local function register_settings_cb()
     local symnames = lua_util.list_to_hash(lua_util.keys(all_symbols))
 
     for _,set in pairs(known_ids) do
-      local s = set.settings.apply
+      local s = set.settings.apply or {}
       set.symbols = lua_util.shallowcopy(symnames)
       local enabled_symbols = {}
       local seen_enabled = false
@@ -170,6 +170,60 @@ local function numeric_settings_id(str)
   return ret
 end
 
+-- Used to do the following:
+-- If there is a group of symbols_allowed, it checks if that is an array
+-- If that is a hash table then we transform it to a normal list, probably adding symbols to adjust scores
+local function transform_settings_maybe(settings, name)
+  if settings.apply then
+    local apply = settings.apply
+
+    if apply.symbols_enabled then
+      local senabled = apply.symbols_enabled
+
+      if not senabled[1] then
+        -- Transform map to a list
+        local nlist = {}
+        if not apply.scores then
+          apply.scores = {}
+        end
+        for k,v in pairs(senabled) do
+          if tonumber(v) then
+            -- Move to symbols as well
+            apply.scores[k] = tonumber(v)
+            lua_util.debugm('settings', rspamd_config,
+                'set symbol %s -> %s for settings %s', k, v, name)
+          end
+          nlist[#nlist + 1] = k
+        end
+        -- Convert
+        apply.symbols_enabled = nlist
+      end
+
+      local symhash = lua_util.list_to_hash(apply.symbols_enabled)
+
+      if apply.symbols then
+        -- Check if added symbols are enabled
+        for k,v in pairs(apply.symbols) do
+          local s
+          -- Check if we have ["sym1", "sym2" ...] or {"sym1": xx, "sym2": yy}
+          if type(k) == 'string' then
+            s = k
+          else
+            s = v
+          end
+          if not symhash[s] then
+            lua_util.debugm('settings', rspamd_config,
+                'added symbol %s to symbols_enabled for %s', s, name)
+            apply.symbols_enabled[#apply.symbols_enabled + 1] = s
+          end
+        end
+      end
+    end
+  end
+
+  return settings
+end
+
 local function register_settings_id(str, settings)
   local numeric_id = numeric_settings_id(str)
 
@@ -186,13 +240,21 @@ local function register_settings_id(str, settings)
   else
     known_ids[numeric_id] = {
       name = str,
-      settings = settings,
+      settings = transform_settings_maybe(settings, str),
       symbols = {}
     }
   end
 
   if not post_init_added then
     rspamd_config:add_post_init(register_settings_cb)
+    rspamd_config:add_config_unload(function()
+      if post_init_added then
+        known_ids = {}
+        post_init_added = false
+      end
+      post_init_performed = false
+    end)
+
     post_init_added = true
   end
 

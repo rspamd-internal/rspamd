@@ -87,9 +87,11 @@ local function add_antivirus_rule(sym, opts)
   if not opts.symbol_fail then
     opts.symbol_fail = opts.symbol .. '_FAIL'
   end
-
   if not opts.symbol_encrypted then
     opts.symbol_encrypted = opts.symbol .. '_ENCRYPTED'
+  end
+  if not opts.symbol_macro then
+    opts.symbol_macro = opts.symbol .. '_MACRO'
   end
 
   -- WORKAROUND for deprecated attachments_only
@@ -176,6 +178,13 @@ if opts and type(opts) == 'table' then
         rspamd_config:register_symbol({
           type = 'virtual',
           name = m['symbol_encrypted'],
+          parent = id,
+          score = 0.0,
+          group = N
+        })
+        rspamd_config:register_symbol({
+          type = 'virtual',
+          name = m['symbol_macro'],
           parent = id,
           score = 0.0,
           group = N

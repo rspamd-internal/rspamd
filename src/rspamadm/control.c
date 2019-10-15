@@ -185,8 +185,11 @@ rspamadm_control (gint argc, gchar **argv, const struct rspamadm_command *_cmd)
 	if (!g_option_context_parse (context, &argc, &argv, &error)) {
 		rspamd_fprintf (stderr, "option parsing failed: %s\n", error->message);
 		g_error_free (error);
+		g_option_context_free (context);
 		exit (1);
 	}
+
+	g_option_context_free (context);
 
 	if (argc <= 1) {
 		rspamd_fprintf (stderr, "command required\n");
@@ -220,7 +223,8 @@ rspamadm_control (gint argc, gchar **argv, const struct rspamadm_command *_cmd)
 		exit (1);
 	}
 
-	if (!rspamd_parse_inet_address (&addr, control_path, 0)) {
+	if (!rspamd_parse_inet_address (&addr,
+			control_path, strlen (control_path), RSPAMD_INET_ADDRESS_PARSE_DEFAULT)) {
 		rspamd_fprintf (stderr, "bad control path: %s\n", control_path);
 		exit (1);
 	}
@@ -233,6 +237,13 @@ rspamadm_control (gint argc, gchar **argv, const struct rspamadm_command *_cmd)
 			rspamd_control_finish_handler,
 			RSPAMD_HTTP_CLIENT_SIMPLE,
 			addr);
+
+	if (!conn) {
+		rspamd_fprintf (stderr, "cannot open connection to %s: %s\n",
+				control_path, strerror (errno));
+		exit (-errno);
+	}
+
 	msg = rspamd_http_new_message (HTTP_REQUEST);
 	msg->url = rspamd_fstring_new_init (path, strlen (path));
 

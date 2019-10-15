@@ -39,6 +39,7 @@ local settings = {}
 local N = "settings"
 local settings_initialized = false
 local max_pri = 0
+local module_sym_id -- Main module symbol
 
 local function apply_settings(task, to_apply, id)
   task:set_settings(to_apply)
@@ -65,18 +66,19 @@ local function apply_settings(task, to_apply, id)
   if to_apply.symbols then
     -- Add symbols, specified in the settings
     if #to_apply.symbols > 0 then
-      fun.each(function(val)
+      -- Array like symbols
+      for _,val in ipairs(to_apply.symbols) do
         task:insert_result(val, 1.0)
-      end,
-          fun.filter(function(elt) return type(elt) == 'string' end,
-              to_apply.symbols))
+      end
     else
       -- Object like symbols
-      fun.each(function(k, val)
-        task:insert_result(k, val.score or 1.0, val.options or {})
-      end,
-          fun.filter(function(_, elt) return type(elt) == 'table' end,
-              to_apply.symbols))
+      for k,v in pairs(to_apply.symbols) do
+        if type(v) == 'table' then
+          task:insert_result(k, v.score or 1.0, v.options or {})
+        elseif tonumber(v) then
+          task:insert_result(k, tonumber(v))
+        end
+      end
     end
   end
 
@@ -97,11 +99,17 @@ end
 -- settings are overridden
 local function check_query_settings(task)
   -- Try 'settings' attribute
+  local settings_id = task:get_settings_id()
   local query_set = task:get_request_header('settings')
   if query_set then
+
     local parser = ucl.parser()
     local res,err = parser:parse_string(tostring(query_set))
     if res then
+      if settings_id then
+        rspamd_logger.warnx(task, "both settings-id '%s' and settings headers are presented, ignore settings-id; ",
+            tostring(settings_id))
+      end
       local settings_obj = parser:get_object()
       apply_settings(task, settings_obj, nil)
 
@@ -112,7 +120,6 @@ local function check_query_settings(task)
   end
 
   local query_maxscore = task:get_request_header('maxscore')
-  local settings_id = task:get_settings_id()
   local nset
 
   if query_maxscore then
@@ -145,10 +152,10 @@ local function check_query_settings(task)
   end
 
   if settings_id and settings_initialized then
-    local elt = lua_settings.settings_by_id(settings_id)
+    local cached = lua_settings.settings_by_id(settings_id)
 
-    if elt then
-      elt = elt.settings
+    if cached then
+      local elt = cached.settings
       if elt['whitelist'] then
         elt['apply'] = {whitelist = true}
       end
@@ -158,7 +165,8 @@ local function check_query_settings(task)
           elt.apply = lua_util.override_defaults(nset, elt.apply)
         end
         apply_settings(task, elt['apply'], settings_id)
-        rspamd_logger.infox(task, "applied settings id %s", settings_id)
+        rspamd_logger.infox(task, "applied settings id %s(%s)",
+            cached.name, settings_id)
         return true
       end
     else
@@ -544,7 +552,7 @@ local function process_settings_table(tbl, allow_ids, mempool)
           check = gen_check_closure(convert_to_table(elt.ip, ips_table), check_ip_setting),
           extract = function(task)
             local ip = task:get_from_ip()
-            if ip:is_valid() then return ip end
+            if ip and ip:is_valid() then return ip end
             return nil
           end,
         }
@@ -916,13 +924,22 @@ local function process_settings_table(tbl, allow_ids, mempool)
             name, elt.id, out.id)
       end
 
-      if elt.apply.symbols then
+      if elt.apply and elt.apply.symbols then
         -- Register virtual symbols
-        for _,sym in ipairs(elt.apply.symbols) do
-          rspamd_config:register_symbol{
-            name = sym,
-            type = 'virtual,ghost',
+        for k,v in pairs(elt.apply.symbols) do
+          local rtb = {
+            type = 'virtual',
+            parent = module_sym_id,
           }
+          if type(k) == 'number' and type(v) == 'string' then
+            rtb.name = v
+          elseif type(k) == 'string' then
+            rtb.name = k
+          end
+          if out.id then
+            rtb.allowed_ids = tostring(elt.id)
+          end
+          rspamd_config:register_symbol(rtb)
         end
       end
     else
@@ -1089,6 +1106,14 @@ if redis_section then
   end, redis_key_handlers)
 end
 
+module_sym_id = rspamd_config:register_symbol({
+  name = 'SETTINGS_CHECK',
+  type = 'prefilter',
+  callback = check_settings,
+  priority = 10,
+  flags = 'empty,nostat,explicit_disable,ignore_passthrough',
+})
+
 local set_section = rspamd_config:get_all_opt("settings")
 
 if set_section and set_section[1] and type(set_section[1]) == "string" then
@@ -1100,14 +1125,6 @@ elseif set_section and type(set_section) == "table" then
   settings_map_pool = rspamd_mempool.create()
   process_settings_table(set_section, true, settings_map_pool)
 end
-
-rspamd_config:register_symbol({
-  name = 'SETTINGS_CHECK',
-  type = 'prefilter',
-  callback = check_settings,
-  priority = 10,
-  flags = 'empty,nostat,explicit_disable,ignore_passthrough',
-})
 
 rspamd_config:add_config_unload(function()
   if settings_map_pool then

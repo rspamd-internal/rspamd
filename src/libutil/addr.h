@@ -86,6 +86,13 @@ rspamd_inet_addr_t *rspamd_inet_address_from_rnds (
 gboolean rspamd_parse_inet_address_ip6 (const guchar *text, gsize len,
 										gpointer target);
 
+enum rspamd_inet_address_parse_flags {
+	RSPAMD_INET_ADDRESS_PARSE_DEFAULT = 0,
+	RSPAMD_INET_ADDRESS_PARSE_REMOTE = 1u << 0u,
+	RSPAMD_INET_ADDRESS_PARSE_NO_UNIX = 1u << 1u,
+	RSPAMD_INET_ADDRESS_PARSE_NO_PORT = 1u << 2u,
+};
+
 /**
  * Parse string with ipv4 address of length `len` to `target` which should be
  * at least sizeof (in4_addr_t)
@@ -105,7 +112,8 @@ gboolean rspamd_parse_inet_address_ip4 (const guchar *text, gsize len,
  * @return
  */
 gboolean rspamd_parse_inet_address_ip (const char *src,
-									   gsize srclen, rspamd_inet_addr_t *target);
+									   gsize srclen,
+									   rspamd_inet_addr_t *target);
 
 /**
  * Try to parse address from string
@@ -115,7 +123,8 @@ gboolean rspamd_parse_inet_address_ip (const char *src,
  */
 gboolean rspamd_parse_inet_address (rspamd_inet_addr_t **target,
 									const char *src,
-									gsize srclen);
+									gsize srclen,
+									enum rspamd_inet_address_parse_flags how);
 
 /**
  * Use memory pool allocated inet address
@@ -126,7 +135,8 @@ gboolean rspamd_parse_inet_address (rspamd_inet_addr_t **target,
  */
 rspamd_inet_addr_t *rspamd_parse_inet_address_pool (const char *src,
 													gsize srclen,
-													rspamd_mempool_t *pool);
+													rspamd_mempool_t *pool,
+													enum rspamd_inet_address_parse_flags how);
 
 /**
  * Returns string representation of inet address
@@ -240,17 +250,23 @@ gint rspamd_accept_from_socket (gint sock,
 								rspamd_accept_throttling_handler hdl,
 								void *hdl_data);
 
+enum rspamd_parse_host_port_result {
+	RSPAMD_PARSE_ADDR_FAIL = 0,
+	RSPAMD_PARSE_ADDR_RESOLVED = 1,
+	RSPAMD_PARSE_ADDR_NUMERIC = 2,
+};
 /**
  * Parse host[:port[:priority]] line
  * @param ina host address
  * @param port port
  * @param priority priority
- * @return TRUE if string was parsed
+ * @return RSPAMD_PARSE_ADDR_FAIL in case of error, RSPAMD_PARSE_ADDR_NUMERIC in case of pure ip/unix socket
  */
-gboolean rspamd_parse_host_port_priority (const gchar *str,
-										  GPtrArray **addrs,
-										  guint *priority, gchar **name, guint default_port,
-										  rspamd_mempool_t *pool);
+enum rspamd_parse_host_port_result
+rspamd_parse_host_port_priority (const gchar *str,
+								 GPtrArray **addrs,
+								 guint *priority, gchar **name, guint default_port,
+								 rspamd_mempool_t *pool);
 
 /**
  * Destroy the specified IP address

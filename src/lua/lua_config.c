@@ -810,6 +810,13 @@ LUA_FUNCTION_DEF (config, init_subsystem);
  */
 LUA_FUNCTION_DEF (config, get_tld_path);
 
+/***
+ * @method rspamd_config:get_dns_max_requests()
+ * Returns limit of DNS requests per task
+ * @return {number} number of dns requests allowed
+ */
+LUA_FUNCTION_DEF (config, get_dns_max_requests);
+
 static const struct luaL_reg configlib_m[] = {
 	LUA_INTERFACE_DEF (config, get_module_opt),
 	LUA_INTERFACE_DEF (config, get_mempool),
@@ -882,6 +889,7 @@ static const struct luaL_reg configlib_m[] = {
 	LUA_INTERFACE_DEF (config, init_modules),
 	LUA_INTERFACE_DEF (config, init_subsystem),
 	LUA_INTERFACE_DEF (config, get_tld_path),
+	LUA_INTERFACE_DEF (config, get_dns_max_requests),
 	{"__tostring", rspamd_lua_class_tostring},
 	{"__newindex", lua_config_newindex},
 	{NULL, NULL}
@@ -1524,6 +1532,17 @@ rspamd_register_symbol_fromlua (lua_State *L,
 		ids = rspamd_process_id_list (allowed_ids, &nids);
 
 		if (nids > 0) {
+			GString *dbg = g_string_new ("");
+
+			for (guint i = 0; i < nids; i ++) {
+				rspamd_printf_gstring (dbg, "%ud,", ids[i]);
+			}
+
+			dbg->len --;
+
+			msg_debug_config ("allowed ids for %s are: %v", name, dbg);
+			g_string_free (dbg, TRUE);
+
 			rspamd_symcache_set_allowed_settings_ids (cfg->cache, name,
 					ids, nids);
 
@@ -1535,6 +1554,17 @@ rspamd_register_symbol_fromlua (lua_State *L,
 		ids = rspamd_process_id_list (forbidden_ids, &nids);
 
 		if (nids > 0) {
+			GString *dbg = g_string_new ("");
+
+			for (guint i = 0; i < nids; i ++) {
+				rspamd_printf_gstring (dbg, "%ud,", ids[i]);
+			}
+
+			dbg->len --;
+
+			msg_debug_config ("forbidden ids for %s are: %v", name, dbg);
+			g_string_free (dbg, TRUE);
+
 			rspamd_symcache_set_forbidden_settings_ids (cfg->cache, name,
 					ids, nids);
 
@@ -2206,7 +2236,8 @@ lua_config_register_dependency (lua_State * L)
 
 		if (child_id > 0 && parent != NULL) {
 
-			rspamd_symcache_add_dependency (cfg->cache, child_id, parent);
+			rspamd_symcache_add_dependency (cfg->cache, child_id, parent,
+					-1);
 		}
 	}
 	else {
@@ -4134,7 +4165,12 @@ lua_config_init_subsystem (lua_State *L)
 				rspamd_init_filters (cfg, FALSE);
 			}
 			else if (strcmp (parts[i], "langdet") == 0) {
-				cfg->lang_det = rspamd_language_detector_init (cfg);
+				if (!cfg->lang_det) {
+					cfg->lang_det = rspamd_language_detector_init (cfg);
+					rspamd_mempool_add_destructor (cfg->cfg_pool,
+							(rspamd_mempool_destruct_t) rspamd_language_detector_unref,
+							cfg->lang_det);
+				}
 			}
 			else if (strcmp (parts[i], "stat") == 0) {
 				rspamd_stat_init (cfg, NULL);
@@ -4265,6 +4301,22 @@ lua_config_get_tld_path (lua_State *L)
 
 	if (cfg != NULL) {
 		lua_pushstring (L, cfg->tld_file);
+	}
+	else {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	return 1;
+}
+
+static gint
+lua_config_get_dns_max_requests (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_config *cfg = lua_check_config (L, 1);
+
+	if (cfg != NULL) {
+		lua_pushinteger (L, cfg->dns_max_requests);
 	}
 	else {
 		return luaL_error (L, "invalid arguments");

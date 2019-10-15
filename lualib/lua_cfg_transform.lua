@@ -233,6 +233,116 @@ local function check_statistics_sanity()
   end
 end
 
+-- Converts surbl module config to rbl module
+local function surbl_section_convert(cfg, section)
+  local rbl_section = cfg.rbl.rbls
+  local wl = section.whitelist
+  for name,value in pairs(section.rules or {}) do
+    if rbl_section[name] then
+      logger.warnx(rspamd_config, 'conflicting names in surbl and rbl rules: %s, prefer surbl rule!',
+          name)
+    end
+    local converted = {
+      urls = true,
+      ignore_defaults = true,
+    }
+
+    if wl then
+      converted.whitelist = wl
+    end
+
+    for k,v in pairs(value) do
+      local skip = false
+      -- Rename
+      if k == 'suffix' then k = 'rbl' end
+      if k == 'ips' then k = 'returncodes' end
+      if k == 'bits' then k = 'returnbits' end
+      if k == 'noip' then k = 'no_ip' end
+      -- Crappy legacy
+      if k == 'options' then
+        if v == 'noip' or v == 'no_ip' then
+          converted.no_ip = true
+          skip = true
+        end
+      end
+      if k:match('check_') then
+        local n = k:match('check_(.*)')
+        k = n
+      end
+
+      if k == 'dkim' and v then
+        converted.dkim_domainonly = false
+        converted.dkim_match_from = true
+      end
+
+      if k == 'emails' and v then
+        -- To match surbl behaviour
+        converted.emails_domainonly = true
+      end
+
+      if not skip then
+        converted[k] = lua_util.deepcopy(v)
+      end
+    end
+    rbl_section[name] = lua_util.override_defaults(rbl_section[name], converted)
+  end
+end
+
+-- Converts surbl module config to rbl module
+local function emails_section_convert(cfg, section)
+  local rbl_section = cfg.rbl.rbls
+  local wl = section.whitelist
+  for name,value in pairs(section.rules or {}) do
+    if rbl_section[name] then
+      logger.warnx(rspamd_config, 'conflicting names in emails and rbl rules: %s, prefer emails rule!',
+          name)
+    end
+    local converted = {
+      emails = true,
+      ignore_defaults = true,
+    }
+
+    if wl then
+      converted.whitelist = wl
+    end
+
+    for k,v in pairs(value) do
+      local skip = false
+      -- Rename
+      if k == 'dnsbl' then k = 'rbl' end
+      if k == 'check_replyto' then k = 'replyto' end
+      if k == 'hashlen' then k = 'hash_len' end
+      if k == 'encoding' then k = 'hash_format' end
+      if k == 'domain_only' then k = 'emails_domainonly' end
+      if k == 'delimiter' then k = 'emails_delimiter' end
+      if k == 'skip_body' then
+        skip = true
+        if v then
+          -- Hack
+          converted.emails = false
+          converted.replyto = true
+        else
+          converted.emails = true
+        end
+      end
+      if k == 'expect_ip' then
+        -- Another stupid hack
+        if not converted.return_codes then
+          converted.returncodes = {}
+        end
+        local symbol = value.symbol or name
+        converted.returncodes[symbol] = { v }
+        skip = true
+      end
+
+      if not skip then
+        converted[k] = lua_util.deepcopy(v)
+      end
+    end
+    rbl_section[name] = lua_util.override_defaults(rbl_section[name], converted)
+  end
+end
+
 return function(cfg)
   local ret = false
 
@@ -360,7 +470,7 @@ return function(cfg)
   end
 
   -- Deal with IP_SCORE
-  if cfg.ip_score then
+  if cfg.ip_score and (cfg.ip_score.servers or cfg.redis.servers) then
     logger.warnx(rspamd_config, 'ip_score module is deprecated in honor of reputation module!')
 
     if not cfg.reputation then
@@ -368,6 +478,8 @@ return function(cfg)
         rules = {}
       }
     end
+
+    if not cfg.reputation.rules then cfg.reputation.rules = {} end
 
     if not fun.any(function(_, v) return v.selector and v.selector.ip end,
         cfg.reputation.rules) then
@@ -382,7 +494,11 @@ return function(cfg)
         }
       }
 
-      if cfg.symbols['IP_SCORE'] then
+      if cfg.ip_score.servers then
+        cfg.reputation.rules.ip_score.backend.redis.servers = cfg.ip_score.servers
+      end
+
+      if cfg.symbols and cfg.symbols['IP_SCORE'] then
         local t = cfg.symbols['IP_SCORE']
 
         if not cfg.symbols['SENDER_REP_SPAM'] then
@@ -394,6 +510,34 @@ return function(cfg)
     else
       logger.infox(rspamd_config, 'ip reputation already exists, do not do any IP_SCORE transforms')
     end
+  end
+
+  if cfg.surbl then
+    if not cfg.rbl then
+      cfg.rbl = {
+        rbls = {}
+      }
+    end
+    if not cfg.rbl.rbls then
+      cfg.rbl.rbls = {}
+    end
+    surbl_section_convert(cfg, cfg.surbl)
+    logger.infox(rspamd_config, 'converted surbl rules to rbl rules')
+    cfg.surbl = {}
+  end
+
+  if cfg.emails then
+    if not cfg.rbl then
+      cfg.rbl = {
+        rbls = {}
+      }
+    end
+    if not cfg.rbl.rbls then
+      cfg.rbl.rbls = {}
+    end
+    emails_section_convert(cfg, cfg.emails)
+    logger.infox(rspamd_config, 'converted emails rules to rbl rules')
+    cfg.emails = {}
   end
 
   return ret, cfg

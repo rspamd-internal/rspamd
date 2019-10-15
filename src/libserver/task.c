@@ -15,7 +15,7 @@
  */
 #include "task.h"
 #include "rspamd.h"
-#include "filter.h"
+#include "scan_result.h"
 #include "libserver/protocol.h"
 #include "libserver/protocol_internal.h"
 #include "message.h"
@@ -29,7 +29,7 @@
 #include "libserver/mempool_vars_internal.h"
 #include "libserver/cfg_file_private.h"
 #include "libmime/lang_detection.h"
-#include "libmime/filter_private.h"
+#include "libmime/scan_result_private.h"
 
 #ifdef WITH_JEMALLOC
 #include <jemalloc/jemalloc.h>
@@ -66,8 +66,20 @@ rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 				 struct ev_loop *event_loop)
 {
 	struct rspamd_task *new_task;
+	rspamd_mempool_t *task_pool;
+	guint flags = 0;
 
-	new_task = g_malloc0 (sizeof (struct rspamd_task));
+	if (pool == NULL) {
+		task_pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "task");
+		flags |= RSPAMD_TASK_FLAG_OWN_POOL;
+	}
+	else {
+		task_pool = pool;
+	}
+
+	new_task = rspamd_mempool_alloc0 (task_pool, sizeof (struct rspamd_task));
+	new_task->task_pool = task_pool;
+	new_task->flags = flags;
 	new_task->worker = worker;
 	new_task->lang_det = lang_det;
 
@@ -93,15 +105,6 @@ rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
 	new_task->task_timestamp = ev_time ();
 	new_task->time_real_finish = NAN;
 
-	if (pool == NULL) {
-		new_task->task_pool =
-				rspamd_mempool_new (rspamd_mempool_suggest_size (), "task");
-		new_task->flags |= RSPAMD_TASK_FLAG_OWN_POOL;
-	}
-	else {
-		new_task->task_pool = pool;
-	}
-
 	new_task->request_headers = kh_init (rspamd_req_headers_hash);
 	new_task->sock = -1;
 	new_task->flags |= (RSPAMD_TASK_FLAG_MIME);
@@ -124,7 +127,9 @@ rspamd_task_reply (struct rspamd_task *task)
 		task->fin_callback (task, task->fin_arg);
 	}
 	else {
-		rspamd_protocol_write_reply (task, write_timeout);
+		if (!(task->processed_stages & RSPAMD_TASK_STAGE_REPLIED)) {
+			rspamd_protocol_write_reply (task, write_timeout);
+		}
 	}
 }
 
@@ -293,8 +298,6 @@ rspamd_task_free (struct rspamd_task *task)
 		if (task->flags & RSPAMD_TASK_FLAG_OWN_POOL) {
 			rspamd_mempool_delete (task->task_pool);
 		}
-
-		g_free (task);
 	}
 }
 
@@ -693,7 +696,7 @@ gboolean
 rspamd_task_process (struct rspamd_task *task, guint stages)
 {
 	gint st;
-	gboolean ret = TRUE;
+	gboolean ret = TRUE, all_done = TRUE;
 	GError *stat_error = NULL;
 
 	/* Avoid nested calls */
@@ -716,20 +719,17 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 		}
 		break;
 
+	case RSPAMD_TASK_STAGE_PRE_FILTERS_EMPTY:
 	case RSPAMD_TASK_STAGE_PRE_FILTERS:
-		rspamd_symcache_process_symbols (task, task->cfg->cache,
-				RSPAMD_TASK_STAGE_PRE_FILTERS);
+	case RSPAMD_TASK_STAGE_FILTERS:
+	case RSPAMD_TASK_STAGE_IDEMPOTENT:
+		all_done = rspamd_symcache_process_symbols (task, task->cfg->cache, st);
 		break;
 
 	case RSPAMD_TASK_STAGE_PROCESS_MESSAGE:
 		if (!(task->flags & RSPAMD_TASK_FLAG_SKIP_PROCESS)) {
 			rspamd_message_process (task);
 		}
-		break;
-
-	case RSPAMD_TASK_STAGE_FILTERS:
-		rspamd_symcache_process_symbols (task, task->cfg->cache,
-				RSPAMD_TASK_STAGE_FILTERS);
 		break;
 
 	case RSPAMD_TASK_STAGE_CLASSIFIERS:
@@ -749,10 +749,10 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 		break;
 
 	case RSPAMD_TASK_STAGE_POST_FILTERS:
-		rspamd_symcache_process_symbols (task, task->cfg->cache,
-				RSPAMD_TASK_STAGE_POST_FILTERS);
+		all_done = rspamd_symcache_process_symbols (task, task->cfg->cache,
+				st);
 
-		if ((task->flags & RSPAMD_TASK_FLAG_LEARN_AUTO) &&
+		if (all_done && (task->flags & RSPAMD_TASK_FLAG_LEARN_AUTO) &&
 				!RSPAMD_TASK_IS_EMPTY (task) &&
 				!(task->flags & (RSPAMD_TASK_FLAG_LEARN_SPAM|RSPAMD_TASK_FLAG_LEARN_HAM))) {
 			rspamd_stat_check_autolearn (task);
@@ -806,10 +806,6 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 		/* Second run of composites processing before idempotent filters */
 		rspamd_make_composites (task);
 		break;
-	case RSPAMD_TASK_STAGE_IDEMPOTENT:
-		rspamd_symcache_process_symbols (task, task->cfg->cache,
-				RSPAMD_TASK_STAGE_IDEMPOTENT);
-		break;
 
 	case RSPAMD_TASK_STAGE_DONE:
 		task->processed_stages |= RSPAMD_TASK_STAGE_DONE;
@@ -838,17 +834,24 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 		return ret;
 	}
 
-	if (rspamd_session_events_pending (task->s) != 0) {
-		/* We have events pending, so we consider this stage as incomplete */
-		msg_debug_task ("need more work on stage %d", st);
-	}
-	else {
-		/* Mark the current stage as done and go to the next stage */
-		msg_debug_task ("completed stage %d", st);
-		task->processed_stages |= st;
+	if (ret) {
+		if (rspamd_session_events_pending (task->s) != 0) {
+			/* We have events pending, so we consider this stage as incomplete */
+			msg_debug_task ("need more work on stage %d", st);
+		}
+		else {
+			if (all_done) {
+				/* Mark the current stage as done and go to the next stage */
+				msg_debug_task ("completed stage %d", st);
+				task->processed_stages |= st;
+			}
+			else {
+				msg_debug_task ("need more processing on stage %d", st);
+			}
 
-		/* Tail recursion */
-		return rspamd_task_process (task, stages);
+			/* Tail recursion */
+			return rspamd_task_process (task, stages);
+		}
 	}
 
 	return ret;
@@ -1001,6 +1004,11 @@ rspamd_task_log_check_condition (struct rspamd_task *task,
 			ret = TRUE;
 		}
 		break;
+	case RSPAMD_LOG_SETTINGS_ID:
+		if (task->settings_elt) {
+			ret = TRUE;
+		}
+		break;
 	default:
 		ret = TRUE;
 		break;
@@ -1030,19 +1038,31 @@ rspamd_task_compare_log_sym (gconstpointer a, gconstpointer b)
 	return (w2 - w1) * 1000.0;
 }
 
+static gint
+rspamd_task_compare_log_group (gconstpointer a, gconstpointer b)
+{
+	const struct rspamd_symbols_group *s1 = *(const struct rspamd_symbols_group **)a,
+			*s2 = *(const struct rspamd_symbols_group **)b;
+
+	return strcmp (s1->name, s2->name);
+}
+
+
 static rspamd_ftok_t
 rspamd_task_log_metric_res (struct rspamd_task *task,
 		struct rspamd_log_format *lf)
 {
 	static gchar scorebuf[32];
 	rspamd_ftok_t res = {.begin = NULL, .len = 0};
-	struct rspamd_metric_result *mres;
+	struct rspamd_scan_result *mres;
 	gboolean first = TRUE;
 	rspamd_fstring_t *symbuf;
 	struct rspamd_symbol_result *sym;
 	GPtrArray *sorted_symbols;
 	struct rspamd_action *act;
+	struct rspamd_symbols_group *gr;
 	guint i, j;
+	khiter_t k;
 
 	mres = task->result;
 	act = rspamd_check_action_metric (task);
@@ -1127,6 +1147,51 @@ rspamd_task_log_metric_res (struct rspamd_task *task,
 
 			rspamd_mempool_add_destructor (task->task_pool,
 					(rspamd_mempool_destruct_t)rspamd_fstring_free,
+					symbuf);
+			res.begin = symbuf->str;
+			res.len = symbuf->len;
+			break;
+
+		case RSPAMD_LOG_GROUPS:
+		case RSPAMD_LOG_PUBLIC_GROUPS:
+
+			symbuf = rspamd_fstring_sized_new (128);
+			sorted_symbols = g_ptr_array_sized_new (kh_size (mres->sym_groups));
+
+			kh_foreach_key (mres->sym_groups, gr,{
+				if (!(gr->flags & RSPAMD_SYMBOL_GROUP_PUBLIC)) {
+					if (lf->type == RSPAMD_LOG_PUBLIC_GROUPS) {
+						continue;
+					}
+				}
+
+				g_ptr_array_add (sorted_symbols, gr);
+			});
+
+			g_ptr_array_sort (sorted_symbols, rspamd_task_compare_log_group);
+
+			for (i = 0; i < sorted_symbols->len; i++) {
+				gr = g_ptr_array_index (sorted_symbols, i);
+
+				if (first) {
+					rspamd_printf_fstring (&symbuf, "%s", gr->name);
+				}
+				else {
+					rspamd_printf_fstring (&symbuf, ",%s", gr->name);
+				}
+
+				k = kh_get (rspamd_symbols_group_hash, mres->sym_groups, gr);
+
+				rspamd_printf_fstring (&symbuf, "(%.2f)",
+						kh_value (mres->sym_groups, k));
+
+				first = FALSE;
+			}
+
+			g_ptr_array_free (sorted_symbols, TRUE);
+
+			rspamd_mempool_add_destructor (task->task_pool,
+					(rspamd_mempool_destruct_t) rspamd_fstring_free,
 					symbuf);
 			res.begin = symbuf->str;
 			res.len = symbuf->len;
@@ -1462,6 +1527,16 @@ rspamd_task_log_variable (struct rspamd_task *task,
 			var.len = sizeof (undef) - 1;
 		}
 		break;
+	case RSPAMD_LOG_SETTINGS_ID:
+		if (task->settings_elt) {
+			var.begin = task->settings_elt->name;
+			var.len = strlen (task->settings_elt->name);
+		}
+		else {
+			var.begin = undef;
+			var.len = sizeof (undef) - 1;
+		}
+		break;
 	default:
 		var = rspamd_task_log_metric_res (task, lf);
 		break;
@@ -1540,7 +1615,7 @@ rspamd_task_write_log (struct rspamd_task *task)
 }
 
 gdouble
-rspamd_task_get_required_score (struct rspamd_task *task, struct rspamd_metric_result *m)
+rspamd_task_get_required_score (struct rspamd_task *task, struct rspamd_scan_result *m)
 {
 	gint i;
 

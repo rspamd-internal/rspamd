@@ -786,7 +786,7 @@ rspamd_pass_signal (GHashTable * workers, gint signo)
 #ifndef HAVE_SETPROCTITLE
 
 #ifdef LINUX
-static gchar *title_buffer = 0;
+static gchar *title_buffer = NULL;
 static size_t title_buffer_size = 0;
 static gchar *title_progname, *title_progname_full;
 #endif
@@ -1076,7 +1076,6 @@ setproctitle (const gchar *fmt, ...)
 	ssize_t written;
 
 	if (fmt) {
-		ssize_t written2;
 		va_list ap;
 
 		written = rspamd_snprintf (title_buffer,
@@ -1087,13 +1086,11 @@ setproctitle (const gchar *fmt, ...)
 			return -1;
 
 		va_start (ap, fmt);
-		written2 = rspamd_vsnprintf (title_buffer + written,
+		rspamd_vsnprintf (title_buffer + written,
 				title_buffer_size - written,
 				fmt,
 				ap);
 		va_end (ap);
-		if (written2 < 0 || (size_t) written2 >= title_buffer_size - written)
-			return -1;
 	}
 	else {
 		written = rspamd_snprintf (title_buffer,
@@ -2364,35 +2361,6 @@ rspamd_init_libs (void)
 	rlim.rlim_max = rlim.rlim_cur;
 	setrlimit (RLIMIT_STACK, &rlim);
 
-	gint magic_flags = 0;
-
-	/* Unless trusty and other crap is supported... */
-#if 0
-#ifdef MAGIC_NO_CHECK_BUILTIN
-	magic_flags = MAGIC_NO_CHECK_BUILTIN;
-#endif
-#endif
-	magic_flags |= MAGIC_MIME|MAGIC_NO_CHECK_COMPRESS|
-				   MAGIC_NO_CHECK_ELF|MAGIC_NO_CHECK_TAR;
-#ifdef MAGIC_NO_CHECK_CDF
-	magic_flags |= MAGIC_NO_CHECK_CDF;
-#endif
-#ifdef MAGIC_NO_CHECK_ENCODING
-	magic_flags |= MAGIC_NO_CHECK_ENCODING;
-#endif
-#ifdef MAGIC_NO_CHECK_TAR
-	magic_flags |= MAGIC_NO_CHECK_TAR;
-#endif
-#ifdef MAGIC_NO_CHECK_TEXT
-	magic_flags |= MAGIC_NO_CHECK_TEXT;
-#endif
-#ifdef MAGIC_NO_CHECK_TOKENS
-	magic_flags |= MAGIC_NO_CHECK_TOKENS;
-#endif
-#ifdef MAGIC_NO_CHECK_JSON
-	magic_flags |= MAGIC_NO_CHECK_JSON;
-#endif
-	ctx->libmagic = magic_open (magic_flags);
 	ctx->local_addrs = rspamd_inet_library_init ();
 	REF_INIT_RETAIN (ctx, rspamd_deinit_libs);
 
@@ -2433,6 +2401,14 @@ rspamd_free_zstd_dictionary (struct zstd_dictionary *dict)
 	}
 }
 
+#ifdef HAVE_CBLAS
+#ifdef HAVE_CBLAS_H
+#include "cblas.h"
+#else
+extern void openblas_set_num_threads(int num_threads);
+#endif
+#endif
+
 void
 rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
 		struct rspamd_config *cfg)
@@ -2471,10 +2447,6 @@ rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
 				/* Default settings */
 				SSL_CTX_set_cipher_list (ctx->ssl_ctx, secure_ciphers);
 			}
-		}
-
-		if (ctx->libmagic) {
-			magic_load (ctx->libmagic, cfg->magic_file);
 		}
 
 		rspamd_free_zstd_dictionary (ctx->in_dict);
@@ -2530,6 +2502,9 @@ rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
 			ZSTD_freeCStream (ctx->out_zstream);
 			ctx->out_zstream = NULL;
 		}
+#ifdef HAVE_CBLAS
+		openblas_set_num_threads (cfg->max_blas_threads);
+#endif
 	}
 }
 
@@ -2586,10 +2561,6 @@ void
 rspamd_deinit_libs (struct rspamd_external_libs_ctx *ctx)
 {
 	if (ctx != NULL) {
-		if (ctx->libmagic) {
-			magic_close (ctx->libmagic);
-		}
-
 		g_free (ctx->ottery_cfg);
 
 #ifdef HAVE_OPENSSL
@@ -2609,6 +2580,8 @@ rspamd_deinit_libs (struct rspamd_external_libs_ctx *ctx)
 		if (ctx->in_zstream) {
 			ZSTD_freeDStream (ctx->in_zstream);
 		}
+
+		rspamd_cryptobox_deinit (ctx->crypto_ctx);
 
 		g_free (ctx);
 	}
@@ -2662,17 +2635,22 @@ xoroshiro_rotl (const guint64 x, int k) {
 	return (x << k) | (x >> (64 - k));
 }
 
-
 gdouble
 rspamd_random_double_fast (void)
 {
-	const guint64 s0 = xorshifto_seed[0];
-	guint64 s1 = xorshifto_seed[1];
+	return rspamd_random_double_fast_seed (xorshifto_seed);
+}
+
+gdouble
+rspamd_random_double_fast_seed (guint64 seed[2])
+{
+	const guint64 s0 = seed[0];
+	guint64 s1 = seed[1];
 	const guint64 result = s0 + s1;
 
 	s1 ^= s0;
-	xorshifto_seed[0] = xoroshiro_rotl(s0, 55) ^ s1 ^ (s1 << 14);
-	xorshifto_seed[1] = xoroshiro_rotl (s1, 36);
+	seed[0] = xoroshiro_rotl(s0, 55) ^ s1 ^ (s1 << 14);
+	seed[1] = xoroshiro_rotl (s1, 36);
 
 	return rspamd_double_from_int64 (result);
 }

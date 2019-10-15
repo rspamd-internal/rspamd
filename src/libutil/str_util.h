@@ -20,12 +20,14 @@
 #include "ucl.h"
 #include "fstring.h"
 
+#include <stdalign.h>
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
 
 enum rspamd_newlines_type {
-	RSPAMD_TASK_NEWLINES_CR,
+	RSPAMD_TASK_NEWLINES_CR = 0,
 	RSPAMD_TASK_NEWLINES_LF,
 	RSPAMD_TASK_NEWLINES_CRLF,
 	RSPAMD_TASK_NEWLINES_MAX
@@ -39,12 +41,12 @@ gint rspamd_lc_cmp (const gchar *s, const gchar *d, gsize l);
 /**
  * Convert string to lowercase in-place using ASCII conversion
  */
-void rspamd_str_lc (gchar *str, guint size);
+guint rspamd_str_lc (gchar *str, guint size);
 
 /**
  * Convert string to lowercase in-place using utf (limited) conversion
  */
-void rspamd_str_lc_utf8 (gchar *str, guint size);
+guint rspamd_str_lc_utf8 (gchar *str, guint size);
 
 /*
  * Hash table utility functions for case insensitive hashing
@@ -422,23 +424,35 @@ gsize rspamd_memspn (const gchar *s, const gchar *e, gsize len);
 
 /* https://graphics.stanford.edu/~seander/bithacks.html#HasMoreInWord */
 #define rspamd_str_hasmore(x, n) ((((x)+~0UL/255*(127-(n)))|(x))&~0UL/255*128)
+/*
+ * Check if a pointer is aligned; n must be power of two
+ */
+#define rspamd_is_aligned(p, n) (((uintptr_t)(p) & ((uintptr_t)(n) - 1)) == 0)
+#define rspamd_is_aligned_as(p, v) rspamd_is_aligned(p, _Alignof(__typeof((v))))
 
 static inline gboolean
-rspamd_str_has_8bit (const guchar *beg, gsize len) {
+rspamd_str_has_8bit (const guchar *beg, gsize len)
+{
 	unsigned long *w;
-	gsize i, leftover = len % sizeof (*w);
+	gsize i, leftover;
 
-	w = (unsigned long *) beg;
+	if (rspamd_is_aligned_as (beg, *w)) {
+		leftover = len % sizeof (*w);
+		w = (unsigned long *) beg;
 
-	for (i = 0; i < len / sizeof (*w); i++) {
-		if (rspamd_str_hasmore (*w, 127)) {
-			return TRUE;
+		for (i = 0; i < len / sizeof (*w); i++) {
+			if (rspamd_str_hasmore (*w, 127)) {
+				return TRUE;
+			}
+
+			w++;
 		}
 
-		w++;
+		beg = (const guchar *) w;
 	}
-
-	beg = (const guchar *) w;
+	else {
+		leftover = len;
+	}
 
 	for (i = 0; i < leftover; i++) {
 		if (beg[i] > 127) {
@@ -518,6 +532,20 @@ gsize rspamd_gstring_strip (GString *s, const gchar *strip_chars);
  */
 const gchar *rspamd_string_len_strip (const gchar *in,
 									  gsize *len, const gchar *strip_chars);
+
+/**
+ * Returns a NULL terminated list of zero terminated strings based on splitting of
+ * the base string into parts. If pool is not NULL then memory is allocated from
+ * the pool. Otherwise, it is allocated from the heap using `g_malloc` (so
+ * g_strfreev could be used to free stuff)
+ * @param in
+ * @param len
+ * @param spill
+ * @param max_elts
+ * @return
+ */
+gchar ** rspamd_string_len_split (const gchar *in, gsize len,
+		const gchar *spill, gint max_elts, rspamd_mempool_t *pool);
 
 #define IS_ZERO_WIDTH_SPACE(uc) ((uc) == 0x200B || \
                                 (uc) == 0x200C || \

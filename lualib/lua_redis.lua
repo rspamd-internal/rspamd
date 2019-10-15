@@ -92,6 +92,11 @@ local function redis_query_sentinel(ev_base, params, initialised)
     for _,m in ipairs(result) do
       local master = flatten_redis_table(m)
 
+      -- Wrap IPv6-adresses in brackets
+      if (master.ip:match(":")) then
+        master.ip = "["..master.ip.."]"
+      end
+
       if params.sentinel_masters_pattern then
         if master.name:match(params.sentinel_masters_pattern) then
           lutil.debugm(N, 'found master %s with ip %s and port %s',
@@ -120,8 +125,12 @@ local function redis_query_sentinel(ev_base, params, initialised)
         for _,s in ipairs(slave_result) do
           local slave = flatten_redis_table(s)
           lutil.debugm(N, rspamd_config,
-              'found slave form master %s with ip %s and port %s',
+              'found slave for master %s with ip %s and port %s',
               v.name, slave.ip, slave.port)
+          -- Wrap IPv6-adresses in brackets
+          if (slave.ip:match(":")) then
+            slave.ip = "["..slave.ip.."]"
+          end
           v.slaves[#v.slaves + 1] = slave
         end
       end
@@ -308,6 +317,11 @@ local function process_redis_opts(options, redis_params)
   if not redis_params.sentinels and options.sentinels then
     redis_params.sentinels = options.sentinels
   end
+
+  if options['sentinel_masters_pattern'] and not redis_params['sentinel_masters_pattern'] then
+    redis_params['sentinel_masters_pattern'] = options['sentinel_masters_pattern']
+  end
+
 end
 
 local function enrich_defaults(rspamd_config, module, redis_params)
@@ -865,7 +879,9 @@ local function rspamd_redis_make_request(task, redis_params, key, is_write,
     else
       addr:ok()
     end
-    callback(err, data, addr)
+    if callback then
+      callback(err, data, addr)
+    end
   end
   if not task or not redis_params or not callback or not command then
     return false,nil,nil
@@ -965,7 +981,9 @@ local function redis_make_request_taskless(ev_base, cfg, redis_params, key,
     else
       addr:ok()
     end
-    callback(err, data, addr)
+    if callback then
+      callback(err, data, addr)
+    end
   end
 
   local rspamd_redis = require "rspamd_redis"

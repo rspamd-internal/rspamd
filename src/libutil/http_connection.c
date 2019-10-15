@@ -374,7 +374,8 @@ rspamd_http_on_headers_complete (http_parser * parser)
 	 *
 	 * Hence, we skip body setup here
 	 */
-	if (parser->content_length != ULLONG_MAX && parser->content_length != 0) {
+	if (parser->content_length != ULLONG_MAX && parser->content_length != 0 &&
+			msg->method != HTTP_HEAD) {
 		if (conn->max_size > 0 &&
 				parser->content_length > conn->max_size) {
 			/* Too large message */
@@ -774,7 +775,13 @@ rspamd_http_write_helper (struct rspamd_http_connection *conn)
 	niov = priv->outlen;
 	remain = priv->wr_pos;
 	/* We know that niov is small enough for that */
-	cur_iov = alloca (niov * sizeof (struct iovec));
+	if (priv->ssl) {
+		/* Might be recursive! */
+		cur_iov = g_malloc (niov * sizeof (struct iovec));
+	}
+	else {
+		cur_iov = alloca (niov * sizeof (struct iovec));
+	}
 	memcpy (cur_iov, priv->out, niov * sizeof (struct iovec));
 	for (i = 0; i < priv->outlen && remain > 0; i++) {
 		/* Find out the first iov required */
@@ -801,6 +808,7 @@ rspamd_http_write_helper (struct rspamd_http_connection *conn)
 
 	if (priv->ssl) {
 		r = rspamd_ssl_writev (priv->ssl, msg.msg_iov, msg.msg_iovlen);
+		g_free (cur_iov);
 	}
 	else {
 		r = sendmsg (conn->fd, &msg, flags);
@@ -827,11 +835,19 @@ rspamd_http_write_helper (struct rspamd_http_connection *conn)
 	else {
 		/* Want to write more */
 		priv->flags &= ~RSPAMD_HTTP_CONN_FLAG_RESETED;
+
+		if (priv->ssl && r > 0) {
+			/* We can write more data... */
+			rspamd_http_write_helper (conn);
+			return;
+		}
 	}
 
 	return;
 
 call_finish_handler:
+	rspamd_ev_watcher_stop (priv->ctx->event_loop, &priv->ev);
+
 	if ((conn->opts & RSPAMD_HTTP_CLIENT_SIMPLE) == 0) {
 		rspamd_http_connection_ref (conn);
 		conn->finished = TRUE;
@@ -940,6 +956,14 @@ rspamd_http_event_handler (int fd, short what, gpointer ud)
 				else if (priv->flags & RSPAMD_HTTP_CONN_FLAG_ENCRYPTION_NEEDED) {
 					err = g_error_new (HTTP_ERROR, 400,
 							"Encryption required");
+				}
+				else if (priv->parser.http_errno == HPE_CLOSED_CONNECTION) {
+					msg_err ("got garbage after end of the message, ignore it");
+
+					REF_RELEASE (pbuf);
+					rspamd_http_connection_unref (conn);
+
+					return;
 				}
 				else {
 					err = g_error_new (HTTP_ERROR, 500 + priv->parser.http_errno,
@@ -2222,7 +2246,8 @@ rspamd_http_connection_write_message_common (struct rspamd_http_connection *conn
 			}
 
 			priv->ssl = rspamd_ssl_connection_new (ssl_ctx, priv->ctx->event_loop,
-					!(msg->flags & RSPAMD_HTTP_FLAG_SSL_NOVERIFY));
+					!(msg->flags & RSPAMD_HTTP_FLAG_SSL_NOVERIFY),
+					conn->log_tag);
 			g_assert (priv->ssl != NULL);
 
 			if (!rspamd_ssl_connect_fd (priv->ssl, conn->fd, host, &priv->ev,

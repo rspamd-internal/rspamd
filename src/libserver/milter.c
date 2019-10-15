@@ -26,7 +26,7 @@
 #include "libutil/http_private.h"
 #include "libserver/protocol_internal.h"
 #include "libserver/cfg_file_private.h"
-#include "libmime/filter.h"
+#include "libmime/scan_result.h"
 #include "libserver/worker_util.h"
 #include "utlist.h"
 
@@ -133,11 +133,6 @@ rspamd_milter_session_reset (struct rspamd_milter_session *session,
 			msg_debug_milter ("cleanup from");
 			rspamd_email_address_free (session->from);
 			session->from = NULL;
-		}
-
-		if (session->helo) {
-			msg_debug_milter ("cleanup helo");
-			session->helo->len = 0;
 		}
 
 		if (priv->headers) {

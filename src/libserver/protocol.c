@@ -20,7 +20,7 @@
 #include "http_private.h"
 #include "worker_private.h"
 #include "libserver/cfg_file_private.h"
-#include "libmime/filter_private.h"
+#include "libmime/scan_result_private.h"
 #include "contrib/zstd/zstd.h"
 #include "lua/lua_common.h"
 #include "unix-std.h"
@@ -177,6 +177,8 @@ rspamd_protocol_handle_url (struct rspamd_task *task,
 		if (COMPARE_CMD (p, MSG_CMD_PING, pathlen)) {
 			msg_debug_protocol ("got ping command");
 			task->cmd = CMD_PING;
+			task->flags |= RSPAMD_TASK_FLAG_SKIP;
+			task->processed_stages |= RSPAMD_TASK_STAGE_DONE; /* Skip all */
 		}
 		else if (COMPARE_CMD (p, MSG_CMD_PROCESS, pathlen)) {
 			msg_debug_protocol ("got process -> old check command");
@@ -380,6 +382,7 @@ rspamd_protocol_handle_flag (struct rspamd_task *task, const gchar *str,
 	CHECK_PROTOCOL_FLAG("zstd", RSPAMD_TASK_PROTOCOL_FLAG_COMPRESSED);
 	CHECK_PROTOCOL_FLAG("ext_urls", RSPAMD_TASK_PROTOCOL_FLAG_EXT_URLS);
 	CHECK_PROTOCOL_FLAG("body_block", RSPAMD_TASK_PROTOCOL_FLAG_BODY_BLOCK);
+	CHECK_PROTOCOL_FLAG("groups", RSPAMD_TASK_PROTOCOL_FLAG_GROUPS);
 
 	if (!known) {
 		msg_warn_protocol ("unknown flag: %*s", (gint)len, str);
@@ -445,7 +448,7 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 	struct rspamd_http_message *msg)
 {
 	rspamd_ftok_t *hn_tok, *hv_tok, srch;
-	gboolean has_ip = FALSE;
+	gboolean has_ip = FALSE, seen_settings_header = FALSE;
 	struct rspamd_http_header *header, *h, *htmp;
 	gchar *ntok;
 
@@ -542,7 +545,8 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 			case 'I':
 				IF_HEADER (IP_ADDR_HEADER) {
 					if (!rspamd_parse_inet_address (&task->from_addr,
-							hv_tok->begin, hv_tok->len)) {
+							hv_tok->begin, hv_tok->len,
+							RSPAMD_INET_ADDRESS_PARSE_DEFAULT)) {
 						msg_err_protocol ("bad ip header: '%T'", hv_tok);
 					}
 					else {
@@ -599,6 +603,10 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 						msg_debug_protocol ("applied settings id %T -> %ud", hv_tok,
 								task->settings_elt->id);
 					}
+				}
+				IF_HEADER (SETTINGS_HEADER) {
+					msg_debug_protocol ("read settings header, value: %T", hv_tok);
+					seen_settings_header = TRUE;
 				}
 				break;
 			case 'u':
@@ -693,6 +701,14 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 
 			rspamd_task_add_request_header (task, hn_tok, hv_tok);
 		}
+	}
+
+	if (seen_settings_header && task->settings_elt) {
+		msg_warn_task ("ignore settings id %s as settings header is also presented",
+				task->settings_elt->name);
+		REF_RELEASE (task->settings_elt);
+
+		task->settings_elt = NULL;
 	}
 
 	if (!has_ip) {
@@ -860,9 +876,9 @@ rspamd_protocol_extended_url (struct rspamd_task *task,
 	elt = ucl_object_fromlstring (encoded, enclen);
 	ucl_object_insert_key (obj, elt, "url", 0, false);
 
-	if (url->surbllen > 0) {
-		elt = ucl_object_fromlstring (url->surbl, url->surbllen);
-		ucl_object_insert_key (obj, elt, "surbl", 0, false);
+	if (url->tldlen > 0) {
+		elt = ucl_object_fromlstring (url->tld, url->tldlen);
+		ucl_object_insert_key (obj, elt, "tld", 0, false);
 	}
 	if (url->hostlen > 0) {
 		elt = ucl_object_fromlstring (url->host, url->hostlen);
@@ -1108,8 +1124,8 @@ rspamd_metric_symbol_ucl (struct rspamd_task *task, struct rspamd_symbol_result 
 	}
 
 	if (description) {
-		ucl_object_insert_key (obj, ucl_object_fromstring (
-				description), "description", 0, false);
+		ucl_object_insert_key (obj, ucl_object_fromstring (description),
+				"description", 0, false);
 	}
 
 	if (sym->options != NULL) {
@@ -1126,8 +1142,26 @@ rspamd_metric_symbol_ucl (struct rspamd_task *task, struct rspamd_symbol_result 
 }
 
 static ucl_object_t *
-rspamd_metric_result_ucl (struct rspamd_task *task,
-	struct rspamd_metric_result *mres, ucl_object_t *top)
+rspamd_metric_group_ucl (struct rspamd_task *task,
+		struct rspamd_symbols_group *gr, gdouble score)
+{
+	ucl_object_t *obj = NULL;
+
+	obj = ucl_object_typed_new (UCL_OBJECT);
+	ucl_object_insert_key (obj, ucl_object_fromdouble (score),
+			"score", 0, false);
+
+	if (gr->description) {
+		ucl_object_insert_key (obj, ucl_object_fromstring (gr->description),
+				"description", 0, false);
+	}
+
+	return obj;
+}
+
+static ucl_object_t *
+rspamd_scan_result_ucl (struct rspamd_task *task,
+						struct rspamd_scan_result *mres, ucl_object_t *top)
 {
 	struct rspamd_symbol_result *sym;
 	gboolean is_spam;
@@ -1189,6 +1223,7 @@ rspamd_metric_result_ucl (struct rspamd_task *task,
 
 	/* Now handle symbols */
 	if (task->cmd != CMD_CHECK) {
+		/* For checkv2 we insert symbols as a separate object */
 		obj = ucl_object_typed_new (UCL_OBJECT);
 	}
 
@@ -1200,10 +1235,32 @@ rspamd_metric_result_ucl (struct rspamd_task *task,
 	})
 
 	if (task->cmd != CMD_CHECK) {
+		/* For checkv2 we insert symbols as a separate object */
 		ucl_object_insert_key (top, obj, "symbols", 0, false);
 	}
 	else {
+		/* For legacy check we just insert it as "default" all together */
 		ucl_object_insert_key (top, obj, DEFAULT_METRIC, 0, false);
+	}
+
+	/* Handle groups if needed */
+	if (task->protocol_flags & RSPAMD_TASK_PROTOCOL_FLAG_GROUPS) {
+		struct rspamd_symbols_group *gr;
+		gdouble gr_score;
+
+		obj = ucl_object_typed_new (UCL_OBJECT);
+		ucl_object_reserve (obj, kh_size (mres->sym_groups));
+
+		kh_foreach (mres->sym_groups, gr, gr_score,{
+			if (task->cfg->public_groups_only &&
+				!(gr->flags & RSPAMD_SYMBOL_GROUP_PUBLIC)) {
+				continue;
+			}
+			sobj = rspamd_metric_group_ucl (task, gr, gr_score);
+			ucl_object_insert_key (obj, sobj, gr->name, 0, false);
+		});
+
+		ucl_object_insert_key (top, obj, "groups", 0, false);
 	}
 
 	return obj;
@@ -1349,7 +1406,7 @@ rspamd_protocol_write_ucl (struct rspamd_task *task,
 			(rspamd_mempool_destruct_t)ucl_object_unref, top);
 
 	if (flags & RSPAMD_PROTOCOL_METRICS) {
-		rspamd_metric_result_ucl (task, task->result, top);
+		rspamd_scan_result_ucl (task, task->result, top);
 	}
 
 	if (flags & RSPAMD_PROTOCOL_MESSAGES) {
@@ -1488,7 +1545,7 @@ void
 rspamd_protocol_http_reply (struct rspamd_http_message *msg,
 		struct rspamd_task *task, ucl_object_t **pobj)
 {
-	struct rspamd_metric_result *metric_res;
+	struct rspamd_scan_result *metric_res;
 	const struct rspamd_re_cache_stat *restat;
 
 	ucl_object_t *top = NULL;
@@ -1723,7 +1780,7 @@ rspamd_protocol_write_log_pipe (struct rspamd_task *task)
 	struct rspamd_worker_log_pipe *lp;
 	struct rspamd_protocol_log_message_sum *ls;
 	lua_State *L = task->cfg->lua_state;
-	struct rspamd_metric_result *mres;
+	struct rspamd_scan_result *mres;
 	struct rspamd_symbol_result *sym;
 	gint id, i;
 	guint32 n = 0, nextra = 0;
@@ -1956,9 +2013,6 @@ rspamd_protocol_write_reply (struct rspamd_task *task, ev_tstamp timeout)
 		msg->flags |= RSPAMD_HTTP_FLAG_SPAMC;
 	}
 
-	ev_now_update (task->event_loop);
-	msg->date = ev_time ();
-
 	if (task->err != NULL) {
 		msg_debug_protocol ("writing error reply to client");
 		ucl_object_t *top = NULL;
@@ -1999,6 +2053,9 @@ rspamd_protocol_write_reply (struct rspamd_task *task, ev_tstamp timeout)
 			break;
 		}
 	}
+
+	ev_now_update (task->event_loop);
+	msg->date = ev_time ();
 
 	rspamd_http_connection_reset (task->http_conn);
 	rspamd_http_connection_write_message (task->http_conn, msg, NULL,

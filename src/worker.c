@@ -76,7 +76,7 @@ rspamd_worker_finalize (gpointer user_data)
 
 	if (!(task->flags & RSPAMD_TASK_FLAG_PROCESSING)) {
 		msg_info_task ("finishing actions has been processed, terminating");
-		ev_break (task->event_loop, EVBREAK_ALL);
+		/* ev_break (task->event_loop, EVBREAK_ALL); */
 		rspamd_session_destroy (task->s);
 
 		return TRUE;
@@ -168,7 +168,43 @@ rspamd_task_timeout (EV_P_ ev_timer *w, int revents)
 			}
 		}
 
+		ev_timer_again (EV_A_ w);
 		task->processed_stages |= RSPAMD_TASK_STAGE_FILTERS;
+		rspamd_session_cleanup (task->s);
+		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
+		rspamd_session_pending (task->s);
+	}
+	else {
+		/* Postprocessing timeout */
+		msg_info_task ("post-processing of task time out: %.1f second spent; forced processing",
+				ev_now (task->event_loop) - task->task_timestamp);
+
+		if (task->cfg->soft_reject_on_timeout) {
+			struct rspamd_action *action, *soft_reject;
+
+			action = rspamd_check_action_metric (task);
+
+			if (action->action_type != METRIC_ACTION_REJECT) {
+				soft_reject = rspamd_config_get_action_by_type (task->cfg,
+						METRIC_ACTION_SOFT_REJECT);
+				rspamd_add_passthrough_result (task,
+						soft_reject,
+						0,
+						NAN,
+						"timeout post-processing message",
+						"task timeout",
+						0);
+
+				ucl_object_replace_key (task->messages,
+						ucl_object_fromstring_common ("timeout post-processing message",
+								0, UCL_STRING_RAW),
+						"smtp_message", 0,
+						false);
+			}
+		}
+
+		ev_timer_stop (EV_A_ w);
+		task->processed_stages |= RSPAMD_TASK_STAGE_DONE;
 		rspamd_session_cleanup (task->s);
 		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
 		rspamd_session_pending (task->s);
@@ -247,7 +283,8 @@ rspamd_worker_body_handler (struct rspamd_http_connection *conn,
 	if (ctx->task_timeout > 0.0) {
 		task->timeout_ev.data = task;
 		ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
-				ctx->task_timeout, 0.0);
+				ctx->task_timeout,
+				ctx->task_timeout);
 		ev_timer_start (task->event_loop, &task->timeout_ev);
 	}
 
@@ -488,7 +525,6 @@ init_worker (struct rspamd_config *cfg)
 	GQuark type;
 
 	type = g_quark_try_string ("normal");
-
 	ctx = rspamd_mempool_alloc0 (cfg->cfg_pool,
 			sizeof (struct rspamd_worker_ctx));
 
@@ -608,6 +644,7 @@ start_worker (struct rspamd_worker *worker)
 {
 	struct rspamd_worker_ctx *ctx = worker->ctx;
 
+	g_assert (rspamd_worker_check_context (worker->ctx, rspamd_worker_magic));
 	ctx->cfg = worker->srv->cfg;
 	ctx->event_loop = rspamd_prepare_worker (worker, "normal", accept_socket);
 	rspamd_symcache_start_refresh (worker->srv->cfg->cache, ctx->event_loop,
@@ -631,6 +668,9 @@ start_worker (struct rspamd_worker *worker)
 
 	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->event_loop,
 			ctx->cfg->ups_ctx);
+	rspamd_mempool_add_destructor (ctx->cfg->cfg_pool,
+			(rspamd_mempool_destruct_t)rspamd_http_context_free,
+			ctx->http_ctx);
 	rspamd_worker_init_scanner (worker, ctx->event_loop, ctx->resolver,
 			&ctx->lang_det);
 	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop,
@@ -640,9 +680,7 @@ start_worker (struct rspamd_worker *worker)
 	rspamd_worker_block_signals ();
 
 	rspamd_stat_close ();
-	struct rspamd_http_context *http_ctx = ctx->http_ctx;
 	REF_RELEASE (ctx->cfg);
-	rspamd_http_context_free (http_ctx);
 	rspamd_log_close (worker->srv->logger, TRUE);
 
 	exit (EXIT_SUCCESS);

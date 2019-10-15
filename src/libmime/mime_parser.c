@@ -258,12 +258,13 @@ rspamd_mime_part_get_cte_heuristic (struct rspamd_task *task,
 
 static void
 rspamd_mime_part_get_cte (struct rspamd_task *task,
-						  khash_t(rspamd_mime_headers_htb) *hdrs,
+						  struct rspamd_mime_headers_table *hdrs,
 						  struct rspamd_mime_part *part,
 						  gboolean apply_heuristic)
 {
 	struct rspamd_mime_header *hdr, *cur;
 	enum rspamd_cte cte = RSPAMD_CTE_UNKNOWN;
+	gboolean parent_propagated = FALSE;
 
 	hdr = rspamd_message_get_header_from_hash (hdrs, "Content-Transfer-Encoding");
 
@@ -271,6 +272,7 @@ rspamd_mime_part_get_cte (struct rspamd_task *task,
 		if (part->parent_part && part->parent_part->cte != RSPAMD_CTE_UNKNOWN &&
 				!(part->parent_part->flags & RSPAMD_MIME_PART_MISSING_CTE)) {
 			part->cte = part->parent_part->cte;
+			parent_propagated = TRUE;
 
 			goto check_cte;
 		}
@@ -318,6 +320,11 @@ check_cte:
 							rspamd_cte_to_string (cte));
 					part->cte = cte;
 					part->flags |= RSPAMD_MIME_PART_BAD_CTE;
+				}
+				else if (cte != part->cte && parent_propagated) {
+					part->cte = cte;
+					msg_info_task ("detected missing CTE for part as: %s",
+							rspamd_cte_to_string (part->cte));
 				}
 			}
 			else {
@@ -436,7 +443,8 @@ rspamd_mime_parse_normal_part (struct rspamd_task *task,
 
 	g_assert (part != NULL);
 
-	rspamd_mime_part_get_cte (task, part->raw_headers, part, TRUE);
+	rspamd_mime_part_get_cte (task, part->raw_headers, part,
+			!(part->ct->flags & RSPAMD_CONTENT_TYPE_MESSAGE));
 	rspamd_mime_part_get_cd (task, part);
 
 	switch (part->cte) {
@@ -687,10 +695,11 @@ rspamd_mime_parse_multipart_cb (struct rspamd_task *task,
 		st->pos = cb->part_start;
 	}
 	else {
-		/* We have seen the start of the boundary */
-		if (cb->part_start < pos) {
-			/* We should have seen some boundary */
-			g_assert (cb->cur_boundary != NULL);
+		/*
+		 * We have seen the start of the boundary,
+		 * but it might be unsuitable (e.g. in broken headers)
+		 */
+		if (cb->part_start < pos && cb->cur_boundary) {
 
 			if ((ret = rspamd_mime_process_multipart_node (task, cb->st,
 					cb->multipart, cb->part_start, pos, TRUE, cb->err))
@@ -926,17 +935,19 @@ rspamd_mime_preprocess_cb (struct rspamd_multipattern *mp,
 				bend ++;
 			}
 
-			if (*bend == '\r') {
-				bend ++;
+			if (bend < end) {
+				if (*bend == '\r') {
+					bend++;
 
-				/* \r\n */
-				if (*bend == '\n') {
-					bend ++;
+					/* \r\n */
+					if (*bend == '\n') {
+						bend++;
+					}
 				}
-			}
-			else {
-				/* \n */
-				bend ++;
+				else {
+					/* \n */
+					bend++;
+				}
 			}
 
 			b.boundary = p - st->start - 2;
@@ -1155,6 +1166,8 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 						MESSAGE_FIELD (task, raw_headers_content).begin,
 						MESSAGE_FIELD (task, raw_headers_content).len,
 						TRUE);
+				npart->raw_headers = rspamd_message_headers_ref (
+						MESSAGE_FIELD (task, raw_headers));
 			}
 
 			hdr = rspamd_message_get_header_from_hash (
@@ -1178,6 +1191,8 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 							MESSAGE_FIELD (task, raw_headers_content).begin,
 							MESSAGE_FIELD (task, raw_headers_content).len,
 							TRUE);
+					npart->raw_headers = rspamd_message_headers_ref (
+							MESSAGE_FIELD (task, raw_headers));
 				}
 
 				hdr = rspamd_message_get_header_from_hash (
@@ -1192,8 +1207,6 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 
 		pbegin = st->start + body_pos;
 		plen = st->end - pbegin;
-		/* TODO: check if it is correct */
-		npart->raw_headers = NULL;
 		npart->headers_order = NULL;
 	}
 	else {
@@ -1295,15 +1308,16 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 		ret = rspamd_mime_parse_multipart_part (task, npart, nst, err);
 	}
 	else if (sel->flags & RSPAMD_CONTENT_TYPE_MESSAGE) {
-		g_ptr_array_add (nst->stack, npart);
-		nst->nesting ++;
-		ret = rspamd_mime_parse_message (task, npart, nst, err);
+		if ((ret = rspamd_mime_parse_normal_part (task, npart, nst, err))
+			== RSPAMD_MIME_PARSE_OK) {
+			ret = rspamd_mime_parse_message (task, npart, nst, err);
+		}
 	}
 	else {
 		ret = rspamd_mime_parse_normal_part (task, npart, nst, err);
 	}
 
-	if (part) {
+	if (part && st->stack->len > 0) {
 		/* Remove message part from the parent stack */
 		g_ptr_array_remove_index_fast (st->stack, st->stack->len - 1);
 		st->nesting --;
@@ -1350,7 +1364,7 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 				start = nst->start + start_boundary->start;
 
 				if (end > start &&
-					(ret = rspamd_mime_process_multipart_node (task, st,
+					(ret = rspamd_mime_process_multipart_node (task, nst,
 						NULL, start, end, FALSE, err)) != RSPAMD_MIME_PARSE_OK) {
 
 					if (nst != st) {

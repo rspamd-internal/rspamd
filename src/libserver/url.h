@@ -33,6 +33,7 @@ enum rspamd_url_flags {
 	RSPAMD_URL_FLAG_UNNORMALISED = 1u << 16u,
 	RSPAMD_URL_FLAG_ZW_SPACES = 1u << 17u,
 	RSPAMD_URL_FLAG_DISPLAY_URL = 1u << 18u,
+	RSPAMD_URL_FLAG_IMAGE = 1u << 19u,
 };
 
 struct rspamd_url_tag {
@@ -51,7 +52,6 @@ struct rspamd_url {
 	gchar *data;
 	gchar *query;
 	gchar *fragment;
-	gchar *surbl;
 	gchar *tld;
 	gchar *visible_part;
 
@@ -63,14 +63,12 @@ struct rspamd_url {
 	guint datalen;
 	guint querylen;
 	guint fragmentlen;
-	guint surbllen;
 	guint tldlen;
 	guint urllen;
 	guint rawlen;
 
 	enum rspamd_url_flags flags;
 	guint count;
-	GHashTable *tags;
 };
 
 enum uri_errno {
@@ -169,7 +167,7 @@ const gchar *rspamd_url_strerror (int err);
  */
 gboolean rspamd_url_find_tld (const gchar *in, gsize inlen, rspamd_ftok_t *out);
 
-typedef void (*url_insert_function) (struct rspamd_url *url,
+typedef gboolean (*url_insert_function) (struct rspamd_url *url,
 									 gsize start_offset, gsize end_offset, void *ud);
 
 /**
@@ -210,19 +208,9 @@ void rspamd_url_find_single (rspamd_mempool_t *pool,
  * @param end_offset
  * @param ud
  */
-void rspamd_url_task_subject_callback (struct rspamd_url *url,
+gboolean rspamd_url_task_subject_callback (struct rspamd_url *url,
 									   gsize start_offset,
 									   gsize end_offset, gpointer ud);
-
-/**
- * Adds a tag for url
- * @param url
- * @param tag
- * @param pool
- */
-void rspamd_url_add_tag (struct rspamd_url *url, const gchar *tag,
-						 const gchar *value,
-						 rspamd_mempool_t *pool);
 
 guint rspamd_url_hash (gconstpointer u);
 

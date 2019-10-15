@@ -105,10 +105,11 @@ enum lua_var_type {
 };
 
 enum rspamd_symbol_group_flags {
-	RSPAMD_SYMBOL_GROUP_NORMAL = 0,
-	RSPAMD_SYMBOL_GROUP_DISABLED = (1 << 0),
-	RSPAMD_SYMBOL_GROUP_ONE_SHOT = (1 << 1),
-	RSPAMD_SYMBOL_GROUP_UNGROUPED = (1 << 2),
+	RSPAMD_SYMBOL_GROUP_NORMAL = 0u,
+	RSPAMD_SYMBOL_GROUP_DISABLED = (1u << 0u),
+	RSPAMD_SYMBOL_GROUP_ONE_SHOT = (1u << 1u),
+	RSPAMD_SYMBOL_GROUP_UNGROUPED = (1u << 2u),
+	RSPAMD_SYMBOL_GROUP_PUBLIC = (1u << 3u),
 };
 
 /**
@@ -117,9 +118,10 @@ enum rspamd_symbol_group_flags {
 struct rspamd_symbol;
 struct rspamd_symbols_group {
 	gchar *name;
+	gchar *description;
 	GHashTable *symbols;
 	gdouble max_score;
-	enum rspamd_symbol_group_flags flags;
+	guint flags;
 };
 
 enum rspamd_symbol_flags {
@@ -140,7 +142,7 @@ struct rspamd_symbol {
 	guint priority;
 	struct rspamd_symbols_group *gr; /* Main group */
 	GPtrArray *groups; /* Other groups */
-	enum rspamd_symbol_flags flags;
+	guint flags;
 	struct rspamd_symcache_item *cache_item;
 	gint nshots;
 };
@@ -200,7 +202,7 @@ struct rspamd_worker_bind_conf {
 	GPtrArray *addrs;
 	guint cnt;
 	gchar *name;
-	const gchar *bind_line;
+	gchar *bind_line;
 	gboolean is_systemd;
 	struct rspamd_worker_bind_conf *next;
 };
@@ -255,6 +257,9 @@ enum rspamd_log_format_type {
 	RSPAMD_LOG_DIGEST,
 	RSPAMD_LOG_FILENAME,
 	RSPAMD_LOG_FORCED_ACTION,
+	RSPAMD_LOG_SETTINGS_ID,
+	RSPAMD_LOG_GROUPS,
+	RSPAMD_LOG_PUBLIC_GROUPS,
 };
 
 enum rspamd_log_format_flags {
@@ -365,6 +370,7 @@ struct rspamd_config {
 	gboolean disable_pcre_jit;                      /**< Disable pcre JIT									*/
 	gboolean own_lua_state;                         /**< True if we have created lua_state internally		*/
 	gboolean soft_reject_on_timeout;                /**< If true emit soft reject on task timeout (if not reject) */
+	gboolean public_groups_only;                    /**< Output merely public groups everywhere				*/
 
 	gsize max_cores_size;                           /**< maximum size occupied by rspamd core files			*/
 	gsize max_cores_count;                          /**< maximum number of core files						*/
@@ -374,6 +380,8 @@ struct rspamd_config {
 	gsize images_cache_size;                        /**< size of LRU cache for DCT data from images			*/
 	gdouble task_timeout;                           /**< maximum message processing time					*/
 	gint default_max_shots;                         /**< default maximum count of symbols hits permitted (-1 for unlimited) */
+	gint32 heartbeats_loss_max;                     /**< number of heartbeats lost to consider worker's termination */
+	gdouble heartbeat_interval;                     /**< interval for heartbeats for workers				*/
 
 	enum rspamd_log_type log_type;                  /**< log type											*/
 	gint log_facility;                              /**< log facility in case of syslog						*/
@@ -410,10 +418,6 @@ struct rspamd_config {
 	GHashTable *cfg_params;                        /**< all cfg params indexed by its name in this structure */
 	gchar *dynamic_conf;                            /**< path to dynamic configuration						*/
 	ucl_object_t *current_dynamic_conf;             /**< currently loaded dynamic configuration				*/
-	GHashTable *domain_settings;                   /**< settings per-domains                               */
-	GHashTable *user_settings;                     /**< settings per-user                                  */
-	gchar *domain_settings_str;                    /**< string representation of settings					*/
-	gchar *user_settings_str;
 	gint clock_res;                                 /**< resolution of clock used							*/
 
 	GList *maps;                                    /**< maps active										*/
@@ -428,7 +432,6 @@ struct rspamd_config {
 	gchar *cache_filename;                          /**< filename of cache file								*/
 	gdouble cache_reload_time;                      /**< how often cache reload should be performed			*/
 	gchar *checksum;                               /**< real checksum of config file						*/
-	gchar *dump_checksum;                          /**< dump checksum of config file						*/
 	gpointer lua_state;                             /**< pointer to lua state								*/
 	gpointer lua_thread_pool;                       /**< pointer to lua thread (coroutine) pool				*/
 
@@ -436,12 +439,9 @@ struct rspamd_config {
 	gchar *history_file;                           /**< file to save rolling history						*/
 	gchar *tld_file;                               /**< file to load effective tld list from				*/
 	gchar *hs_cache_dir;                           /**< directory to save hyperscan databases				*/
-	gchar *magic_file;                             /**< file to initialize libmagic						*/
 
 	gdouble dns_timeout;                            /**< timeout in milliseconds for waiting for dns reply	*/
 	guint32 dns_retransmits;                        /**< maximum retransmits count							*/
-	guint32 dns_throttling_errors;                  /**< maximum errors for starting resolver throttling	*/
-	guint32 dns_throttling_time;                    /**< time in seconds for DNS throttling					*/
 	guint32 dns_io_per_server;                      /**< number of sockets per DNS server					*/
 	const ucl_object_t *nameservers;                /**< list of nameservers or NULL to parse resolv.conf	*/
 	guint32 dns_max_requests;                       /**< limit of DNS requests per task 					*/
@@ -450,6 +450,7 @@ struct rspamd_config {
 	guint upstream_max_errors;                        /**< upstream max errors before shutting off			*/
 	gdouble upstream_error_time;                    /**< rate of upstream errors							*/
 	gdouble upstream_revive_time;                    /**< revive timeout for upstreams						*/
+	gdouble upstream_lazy_resolve_time;              /**< lazy resolve time for upstreams					*/
 	struct upstream_ctx *ups_ctx;                    /**< upstream context									*/
 	struct rspamd_dns_resolver *dns_resolver;        /**< dns resolver if loaded								*/
 
@@ -461,6 +462,8 @@ struct rspamd_config {
 	guint lua_gc_step;                                /**< lua gc step 										*/
 	guint lua_gc_pause;                                /**< lua gc pause										*/
 	guint full_gc_iters;                            /**< iterations between full gc cycle					*/
+	guint max_lua_urls;                             /**< maximum number of urls to be passed to Lua			*/
+	guint max_blas_threads;                         /**< maximum threads for openblas when learning ANN		*/
 
 	GList *classify_headers;                        /**< list of headers using for statistics				*/
 	struct module_s **compiled_modules;                /**< list of compiled C modules							*/
