@@ -68,6 +68,17 @@ struct rspamd_abstract_callback_data {
 	char data[];
 };
 
+struct rspamd_symcache_item_stat {
+	struct rspamd_counter_data time_counter;
+	gdouble avg_time;
+	gdouble weight;
+	guint hits;
+	guint64 total_hits;
+	struct rspamd_counter_data frequency_counter;
+	gdouble avg_frequency;
+	gdouble stddev_frequency;
+};
+
 /**
  * Creates new cache structure
  * @return
@@ -242,7 +253,8 @@ void rspamd_symcache_add_delayed_dependency (struct rspamd_symcache *cache,
  * @param symbol
  */
 void rspamd_symcache_disable_symbol_perm (struct rspamd_symcache *cache,
-										  const gchar *symbol);
+										  const gchar *symbol,
+										  gboolean resolve_parent);
 
 /**
  * Enable specific symbol in the cache
@@ -356,8 +368,7 @@ gboolean rspamd_symcache_disable_symbol (struct rspamd_task *task,
  * @param ud
  */
 void rspamd_symcache_foreach (struct rspamd_symcache *cache,
-							  void (*func) (gint /* id */, const gchar * /* name */,
-											gint /* flags */, gpointer /* userdata */),
+							  void (*func) (struct rspamd_symcache_item *item, gpointer /* userdata */),
 							  gpointer ud);
 
 /**
@@ -515,8 +526,54 @@ gboolean rspamd_symcache_is_item_allowed (struct rspamd_task *task,
  * @param item
  * @return
  */
-enum rspamd_symbol_type rspamd_symcache_item_flags (struct rspamd_symcache_item *item);
+gint rspamd_symcache_item_flags (struct rspamd_symcache_item *item);
+/**
+ * Returns cache item name
+ * @param item
+ * @return
+ */
+const gchar* rspamd_symcache_item_name (struct rspamd_symcache_item *item);
+/**
+ * Returns the current item stat
+ * @param item
+ * @return
+ */
+const struct rspamd_symcache_item_stat *
+		rspamd_symcache_item_stat (struct rspamd_symcache_item *item);
+/**
+ * Returns if an item is enabled (for virutal it also means that parent should be enabled)
+ * @param item
+ * @return
+ */
+gboolean rspamd_symcache_item_is_enabled (struct rspamd_symcache_item *item);
+/**
+ * Returns parent for virtual symbols (or NULL)
+ * @param item
+ * @return
+ */
+struct rspamd_symcache_item * rspamd_symcache_item_get_parent (
+		struct rspamd_symcache_item *item);
+/**
+ * Returns direct deps for an element
+ * @param item
+ * @return array of struct rspamd_symcache_item *
+ */
+const GPtrArray* rspamd_symcache_item_get_deps (
+		struct rspamd_symcache_item *item);
+/**
+ * Returns direct reverse deps for an element
+ * @param item
+ * @return array of struct rspamd_symcache_item *
+ */
+const GPtrArray* rspamd_symcache_item_get_rdeps (
+		struct rspamd_symcache_item *item);
 
+
+/**
+ * Enable profiling for task (e.g. when a slow rule has been found)
+ * @param task
+ */
+void rspamd_symcache_enable_profile (struct rspamd_task *task);
 #ifdef  __cplusplus
 }
 #endif

@@ -17,7 +17,7 @@
 #include "rspamd.h"
 #include "message.h"
 #include "utlist.h"
-#include "http_private.h"
+#include "libserver/http/http_private.h"
 #include "worker_private.h"
 #include "libserver/cfg_file_private.h"
 #include "libmime/scan_result_private.h"
@@ -26,6 +26,7 @@
 #include "unix-std.h"
 #include "protocol_internal.h"
 #include "libserver/mempool_vars_internal.h"
+#include "contrib/fastutf8/fastutf8.h"
 #include "task.h"
 #include <math.h>
 
@@ -449,10 +450,10 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 {
 	rspamd_ftok_t *hn_tok, *hv_tok, srch;
 	gboolean has_ip = FALSE, seen_settings_header = FALSE;
-	struct rspamd_http_header *header, *h, *htmp;
+	struct rspamd_http_header *header, *h;
 	gchar *ntok;
 
-	HASH_ITER (hh, msg->headers, header, htmp) {
+	kh_foreach_value (msg->headers, header, {
 		DL_FOREACH (header, h) {
 			ntok = rspamd_mempool_ftokdup (task->task_pool, &h->name);
 			hn_tok = rspamd_mempool_alloc (task->task_pool, sizeof (*hn_tok));
@@ -701,7 +702,7 @@ rspamd_protocol_handle_headers (struct rspamd_task *task,
 
 			rspamd_task_add_request_header (task, hn_tok, hv_tok);
 		}
-	}
+	}); /* End of kh_foreach_value */
 
 	if (seen_settings_header && task->settings_elt) {
 		msg_warn_task ("ignore settings id %s as settings header is also presented",
@@ -873,15 +874,15 @@ rspamd_protocol_extended_url (struct rspamd_task *task,
 
 	obj = ucl_object_typed_new (UCL_OBJECT);
 
-	elt = ucl_object_fromlstring (encoded, enclen);
+	elt = ucl_object_fromstring_common (encoded, enclen, 0);
 	ucl_object_insert_key (obj, elt, "url", 0, false);
 
 	if (url->tldlen > 0) {
-		elt = ucl_object_fromlstring (url->tld, url->tldlen);
+		elt = ucl_object_fromstring_common (url->tld, url->tldlen, 0);
 		ucl_object_insert_key (obj, elt, "tld", 0, false);
 	}
 	if (url->hostlen > 0) {
-		elt = ucl_object_fromlstring (url->host, url->hostlen);
+		elt = ucl_object_fromstring_common (url->host, url->hostlen, 0);
 		ucl_object_insert_key (obj, elt, "host", 0, false);
 	}
 
@@ -922,16 +923,13 @@ urls_protocol_cb (gpointer key, gpointer value, gpointer ud)
 				return;
 			}
 
-			const gchar *end = NULL;
+			goffset err_offset;
 
-			if (g_utf8_validate (url->host, url->hostlen, &end)) {
-				obj = ucl_object_fromlstring (url->host, url->hostlen);
-			}
-			else if (end - url->host > 0) {
-				obj = ucl_object_fromlstring (url->host, end - url->host);
+			if ((err_offset = rspamd_fast_utf8_validate (url->host, url->hostlen)) == 0) {
+				obj = ucl_object_fromstring_common (url->host, url->hostlen, 0);
 			}
 			else {
-				return;
+				obj = ucl_object_fromstring_common (url->host, err_offset - 1, 0);
 			}
 		}
 		else {
@@ -1132,7 +1130,8 @@ rspamd_metric_symbol_ucl (struct rspamd_task *task, struct rspamd_symbol_result 
 		ar = ucl_object_typed_new (UCL_ARRAY);
 
 		DL_FOREACH (sym->opts_head, opt) {
-			ucl_array_append (ar, ucl_object_fromstring (opt->option));
+			ucl_array_append (ar, ucl_object_fromstring_common (opt->option,
+					opt->optlen, 0));
 		}
 
 		ucl_object_insert_key (obj, ar, "options", 0, false);
@@ -1463,7 +1462,6 @@ rspamd_protocol_write_ucl (struct rspamd_task *task,
 	if (flags & RSPAMD_PROTOCOL_DKIM) {
 		dkim_sigs = rspamd_mempool_get_variable (task->task_pool,
 				RSPAMD_MEMPOOL_DKIM_SIGNATURE);
-
 
 		if (dkim_sigs) {
 			if (dkim_sigs->next) {
@@ -2029,7 +2027,21 @@ rspamd_protocol_write_reply (struct rspamd_task *task, ev_tstamp timeout)
 		reply = rspamd_fstring_sized_new (256);
 		rspamd_ucl_emit_fstring (top, UCL_EMIT_JSON_COMPACT, &reply);
 		ucl_object_unref (top);
-		rspamd_http_message_set_body_from_fstring_steal (msg, reply);
+
+		/* We also need to validate utf8 */
+		if (rspamd_fast_utf8_validate (reply->str, reply->len) != 0) {
+			gsize valid_len;
+			gchar *validated;
+
+			/* We copy reply several times here but it should be a rare case */
+			validated = rspamd_str_make_utf_valid (reply->str, reply->len,
+					&valid_len, task->task_pool);
+			rspamd_http_message_set_body (msg, validated, valid_len);
+			rspamd_fstring_free (reply);
+		}
+		else {
+			rspamd_http_message_set_body_from_fstring_steal (msg, reply);
+		}
 	}
 	else {
 		msg->status = rspamd_fstring_new_init ("OK", 2);

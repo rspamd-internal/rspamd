@@ -26,7 +26,7 @@
 #include "libserver/cfg_file_private.h"
 #include "libmime/scan_result_private.h"
 #include "libstat/stat_api.h"
-#include "libutil/map_helpers.h"
+#include "libserver/maps/map_helpers.h"
 
 #include <math.h>
 
@@ -706,9 +706,7 @@ LUA_FUNCTION_DEF (task, disable_symbol);
  *
  * * `format` - a format of date returned:
  * 	- `message` - returns a mime date as integer (unix timestamp)
- * 	- `message_str` - returns a mime date as string (UTC format)
  * 	- `connect` - returns a unix timestamp of a connection to rspamd
- * 	- `connect_str` - returns connection time in UTC format
  * * `gmt` - returns date in `GMT` timezone (normal for unix timestamps)
  *
  * By default this function returns connection time in numeric format.
@@ -812,7 +810,7 @@ LUA_FUNCTION_DEF (task, set_settings);
  * Set users settings id for a task (must be registered previously)
  * @available 2.0+
  * @param {number} id numeric id
- * @return {boolean} true if settings id has been set
+ * @return {boolean} true if settings id has been replaced from the existing one
  */
 LUA_FUNCTION_DEF (task, set_settings_id);
 
@@ -1615,7 +1613,7 @@ lua_task_load_from_file (lua_State * L)
 				}
 			}
 
-			task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL);
+			task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL, FALSE);
 			task->msg.begin = data->str;
 			task->msg.len = data->len;
 			rspamd_mempool_add_destructor (task->task_pool,
@@ -1629,7 +1627,7 @@ lua_task_load_from_file (lua_State * L)
 			if (!map) {
 				err = strerror (errno);
 			} else {
-				task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL);
+				task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL, FALSE);
 				task->msg.begin = map;
 				task->msg.len = sz;
 				rspamd_mempool_add_destructor (task->task_pool,
@@ -1683,7 +1681,7 @@ lua_task_load_from_string (lua_State * L)
 			}
 		}
 
-		task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL);
+		task = rspamd_task_new (NULL, cfg, NULL, NULL, NULL, FALSE);
 		task->msg.begin = g_malloc (message_len);
 		memcpy ((gchar *)task->msg.begin, str_message, message_len);
 		task->msg.len  = message_len;
@@ -1729,7 +1727,7 @@ lua_task_create (lua_State * L)
 		}
 	}
 
-	task = rspamd_task_new (NULL, cfg, NULL, NULL, ev_base);
+	task = rspamd_task_new (NULL, cfg, NULL, NULL, ev_base, FALSE);
 	task->flags |= RSPAMD_TASK_FLAG_EMPTY;
 
 	ptask = lua_newuserdata (L, sizeof (*ptask));
@@ -1839,7 +1837,7 @@ lua_task_insert_result (lua_State * L)
 {
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
-	const gchar *symbol_name, *param;
+	const gchar *symbol_name;
 	double weight;
 	struct rspamd_symbol_result *s;
 	enum rspamd_symbol_insert_flags flags = RSPAMD_SYMBOL_INSERT_DEFAULT;
@@ -1861,26 +1859,77 @@ lua_task_insert_result (lua_State * L)
 				luaL_checkstring (L, args_start));
 		weight = luaL_checknumber (L, args_start + 1);
 		top = lua_gettop (L);
-		s = rspamd_task_insert_result_full (task, symbol_name, weight, NULL, flags);
+		s = rspamd_task_insert_result_full (task, symbol_name, weight,
+				NULL, flags);
 
 		/* Get additional options */
 		if (s) {
 			for (i = args_start + 2; i <= top; i++) {
-				if (lua_type (L, i) == LUA_TSTRING) {
-					param = luaL_checkstring (L, i);
-					rspamd_task_add_result_option (task, s, param);
-				}
-				else if (lua_type (L, i) == LUA_TTABLE) {
-					lua_pushvalue (L, i);
-					lua_pushnil (L);
+				gint ltype = lua_type (L, i);
 
-					while (lua_next (L, -2)) {
-						param = lua_tostring (L, -1);
-						rspamd_task_add_result_option (task, s, param);
+				if (ltype == LUA_TSTRING) {
+					gsize optlen;
+					const char *opt = lua_tolstring (L, i, &optlen);
+
+					rspamd_task_add_result_option (task, s, opt, optlen);
+				}
+				else if (ltype == LUA_TUSERDATA) {
+					struct rspamd_lua_text *t = lua_check_text (L, i);
+
+					if (t) {
+						rspamd_task_add_result_option (task, s, t->start,
+								t->len);
+					}
+				}
+				else if (ltype == LUA_TTABLE) {
+					gsize objlen = rspamd_lua_table_size (L, i);
+
+					for (guint j = 1; j <= objlen; j ++) {
+						lua_rawgeti (L, i, j);
+
+						if (lua_type (L, -1) == LUA_TSTRING) {
+							gsize optlen;
+							const char *opt = lua_tolstring (L, -1, &optlen);
+
+							rspamd_task_add_result_option (task, s, opt, optlen);
+						}
+						else if (lua_type (L, -1) == LUA_TUSERDATA) {
+							struct rspamd_lua_text *t = lua_check_text (L, -1);
+
+							if (t) {
+								rspamd_task_add_result_option (task, s, t->start,
+										t->len);
+							}
+							else {
+								return luaL_error (L, "not rspamd_text option in a table "
+													  "when adding symbol  %s: %s type",
+										s->name);
+							}
+						}
+						else {
+							const gchar *tname = lua_typename (L, lua_type (L, -1));
+							lua_pop (L, 2);
+
+							return luaL_error (L, "not a string option in a table "
+												  "when adding symbol  %s: %s type",
+									s->name, tname);
+						}
+
 						lua_pop (L, 1);
 					}
+				}
+				else if (ltype == LUA_TNIL) {
+					/* We have received a NULL option, it is not good but not a fatal error */
+					msg_info_task ("nil option when adding symbol %s at pos %d",
+							s->name, i);
+					continue;
+				}
+				else {
+					const gchar *tname = lua_typename (L, ltype);
 
-					lua_pop (L, 1);
+					return luaL_error (L, "not a string/table option "
+										  "when adding symbol %s: %s type",
+							s->name, tname);
 				}
 			}
 		}
@@ -1898,7 +1947,7 @@ lua_task_adjust_result (lua_State * L)
 {
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
-	const gchar *symbol_name, *param;
+	const gchar *symbol_name;
 	struct rspamd_scan_result *metric_res;
 	struct rspamd_symbol_result *s = NULL;
 	double weight;
@@ -1931,20 +1980,42 @@ lua_task_adjust_result (lua_State * L)
 		if (s) {
 			for (i = 4; i <= top; i++) {
 				if (lua_type (L, i) == LUA_TSTRING) {
-					param = luaL_checkstring (L, i);
-					rspamd_task_add_result_option (task, s, param);
+					gsize optlen;
+					const char *opt = lua_tolstring (L, i, &optlen);
+
+					rspamd_task_add_result_option (task, s, opt, optlen);
+				}
+				else if (lua_type (L, i) == LUA_TUSERDATA) {
+					struct rspamd_lua_text *t = lua_check_text (L, i);
+
+					if (t) {
+						rspamd_task_add_result_option (task, s, t->start,
+								t->len);
+					}
 				}
 				else if (lua_type (L, i) == LUA_TTABLE) {
-					lua_pushvalue (L, i);
-					lua_pushnil (L);
+					gsize objlen = rspamd_lua_table_size (L, i);
 
-					while (lua_next (L, -2)) {
-						param = lua_tostring (L, -1);
-						rspamd_task_add_result_option (task, s, param);
+					for (guint j = 1; j <= objlen; j ++) {
+						lua_rawgeti (L, i, j);
+
+						if (lua_type (L, -1) == LUA_TSTRING) {
+							gsize optlen;
+							const char *opt = lua_tolstring (L, -1, &optlen);
+
+							rspamd_task_add_result_option (task, s, opt, optlen);
+						}
+						else if (lua_type (L, -1) == LUA_TUSERDATA) {
+							struct rspamd_lua_text *t = lua_check_text (L, -1);
+
+							if (t) {
+								rspamd_task_add_result_option (task, s, t->start,
+										t->len);
+							}
+						}
+
 						lua_pop (L, 1);
 					}
-
-					lua_pop (L, 1);
 				}
 			}
 		}
@@ -2090,7 +2161,7 @@ lua_task_append_message (lua_State * L)
 {
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
-	const gchar *message = luaL_checkstring (L, 2), *category;
+	const gchar *category;
 
 	if (task != NULL) {
 		if (lua_type (L, 3) == LUA_TSTRING) {
@@ -2101,7 +2172,7 @@ lua_task_append_message (lua_State * L)
 		}
 
 		ucl_object_insert_key (task->messages,
-				ucl_object_fromstring_common (message, 0, UCL_STRING_RAW),
+				ucl_object_lua_import (L, 2),
 				category, 0,
 				true);
 	}
@@ -2118,7 +2189,7 @@ struct lua_tree_cb_data {
 	gint mask;
 	gint need_images;
 	gdouble skip_prob;
-	guint64 xoroshiro_state[2];
+	guint64 xoroshiro_state[4];
 };
 
 static void
@@ -2161,7 +2232,7 @@ lua_task_urls_adjust_skip_prob (struct rspamd_task *task,
 		memcpy (&cb->xoroshiro_state[0], &task->task_timestamp,
 				MIN (sizeof (cb->xoroshiro_state[0]), sizeof (task->task_timestamp)));
 		memcpy (&cb->xoroshiro_state[1], MESSAGE_FIELD (task, digest),
-				sizeof (cb->xoroshiro_state[1]));
+				sizeof (cb->xoroshiro_state[1]) * 3);
 		sz = max_urls;
 	}
 
@@ -2839,7 +2910,13 @@ lua_task_get_received_headers (lua_State * L)
 	const gchar *proto;
 	guint k = 1;
 
-	if (task && task->message) {
+	if (task) {
+		if (!task->message) {
+			/* No message - no received */
+			lua_newtable (L);
+			return 1;
+		}
+
 		if (!lua_task_get_cached (L, task, "received")) {
 			lua_createtable (L, 0, 0);
 
@@ -3917,28 +3994,47 @@ lua_task_set_from_ip (lua_State *L)
 {
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
-	gsize len;
-	const gchar *ip_str = luaL_checklstring (L, 2, &len);
 	rspamd_inet_addr_t *addr = NULL;
 
-	if (!task || !ip_str) {
-		lua_pushstring (L, "invalid parameters");
-		return lua_error (L);
+	if (!task) {
+		return luaL_error (L, "no task");
 	}
 	else {
-		if (!rspamd_parse_inet_address (&addr,
-				ip_str,
-				len,
-				RSPAMD_INET_ADDRESS_PARSE_DEFAULT)) {
-			msg_warn_task ("cannot get IP from received header: '%s'",
-					ip_str);
+		if (lua_type (L, 2) == LUA_TSTRING) {
+			gsize len;
+			const gchar *ip_str = lua_tolstring (L, 2, &len);
+
+			if (!rspamd_parse_inet_address (&addr,
+					ip_str,
+					len,
+					RSPAMD_INET_ADDRESS_PARSE_DEFAULT)) {
+				return luaL_error (L, "invalid IP string: %s", ip_str);
+			}
+			else {
+				if (task->from_addr) {
+					rspamd_inet_address_free (task->from_addr);
+				}
+
+				task->from_addr = addr;
+			}
+		}
+		else if (lua_type (L, 2) == LUA_TUSERDATA) {
+			struct rspamd_lua_ip *ip = lua_check_ip (L, 2);
+
+			if (ip && ip->addr) {
+				if (task->from_addr) {
+					rspamd_inet_address_free (task->from_addr);
+				}
+
+				task->from_addr = rspamd_inet_address_copy (ip->addr);
+			}
+			else {
+				return luaL_error (L, "invalid IP object");
+			}
 		}
 		else {
-			if (task->from_addr) {
-				rspamd_inet_address_free (task->from_addr);
-			}
-
-			task->from_addr = addr;
+			return luaL_error (L, "invalid IP argument type: %s", lua_typename (L,
+					lua_type (L, 2)));
 		}
 	}
 
@@ -4110,7 +4206,7 @@ lua_task_get_images (lua_State *L)
 				lua_createtable (L, MESSAGE_FIELD (task, parts)->len, 0);
 
 				PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, parts), i, part) {
-					if (part->flags & RSPAMD_MIME_PART_IMAGE) {
+					if (part->part_type == RSPAMD_MIME_PART_IMAGE) {
 						pimg = lua_newuserdata (L, sizeof (struct rspamd_image *));
 						rspamd_lua_setclass (L, "rspamd{image}", -1);
 						*pimg = part->specific.img;
@@ -4147,7 +4243,7 @@ lua_task_get_archives (lua_State *L)
 				lua_createtable (L, MESSAGE_FIELD (task, parts)->len, 0);
 
 				PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, parts), i, part) {
-					if (part->flags & RSPAMD_MIME_PART_ARCHIVE) {
+					if (part->part_type == RSPAMD_MIME_PART_ARCHIVE) {
 						parch = lua_newuserdata (L, sizeof (struct rspamd_archive *));
 						rspamd_lua_setclass (L, "rspamd{archive}", -1);
 						*parch = part->specific.arch;
@@ -4324,7 +4420,7 @@ lua_push_symbol_result (lua_State *L,
 			lua_createtable (L, kh_size (s->options), 0);
 
 			DL_FOREACH (s->opts_head, opt) {
-				lua_pushstring (L, (const char*)opt->option);
+				lua_pushlstring (L, opt->option, opt->optlen);
 				lua_rawseti (L, -2, j++);
 			}
 
@@ -4490,8 +4586,10 @@ lua_task_get_symbols_all (lua_State *L)
 			lua_createtable (L, kh_size (mres->symbols), 0);
 
 			kh_foreach_value_ptr (mres->symbols, s, {
-				lua_push_symbol_result (L, task, s->name, s, FALSE, TRUE);
-				lua_rawseti (L, -2, i++);
+				if (!(s->flags & RSPAMD_SYMBOL_RESULT_IGNORED)) {
+					lua_push_symbol_result (L, task, s->name, s, FALSE, TRUE);
+					lua_rawseti (L, -2, i++);
+				}
 			});
 		}
 	}
@@ -4597,21 +4695,31 @@ struct tokens_foreach_cbdata {
 };
 
 static void
-tokens_foreach_cb (gint id, const gchar *sym, gint flags, gpointer ud)
+tokens_foreach_cb (struct rspamd_symcache_item *item, gpointer ud)
 {
 	struct tokens_foreach_cbdata *cbd = ud;
 	struct rspamd_symbol_result *s;
+	gint flags;
+	const gchar *sym;
+
+	sym = rspamd_symcache_item_name (item);
+	flags = rspamd_symcache_item_flags (item);
 
 	if (flags & SYMBOL_TYPE_NOSTAT) {
 		return;
 	}
 
 	if ((s = rspamd_task_find_symbol_result (cbd->task, sym)) != NULL) {
-		if (cbd->normalize) {
-			lua_pushnumber (cbd->L, tanh (s->score));
+		if (s->flags & RSPAMD_SYMBOL_RESULT_IGNORED) {
+			lua_pushnumber (cbd->L, 0.0);
 		}
 		else {
-			lua_pushnumber (cbd->L, s->score);
+			if (cbd->normalize) {
+				lua_pushnumber (cbd->L, tanh (s->score));
+			}
+			else {
+				lua_pushnumber (cbd->L, s->score);
+			}
 		}
 	}
 	else {
@@ -4667,7 +4775,7 @@ lua_task_process_ann_tokens (lua_State *L)
 			sres = rspamd_task_find_symbol_result (task, sym);
 
 			if (sres && !(sres->flags & RSPAMD_SYMBOL_RESULT_IGNORED)) {
-				if (!isnan (sres->score) &&
+				if (!isnan (sres->score) && !isinf (sres->score) &&
 					!(rspamd_symcache_item_flags (sres->sym->cache_item) &
 					  SYMBOL_TYPE_NOSTAT)) {
 
@@ -4689,8 +4797,7 @@ lua_task_process_ann_tokens (lua_State *L)
 enum lua_date_type {
 	DATE_CONNECT = 0,
 	DATE_MESSAGE,
-	DATE_CONNECT_STRING,
-	DATE_MESSAGE_STRING
+	DATE_INVALID
 };
 
 static enum lua_date_type
@@ -4701,7 +4808,7 @@ lua_task_detect_date_type (struct rspamd_task *task,
 
 	if (lua_type (L, idx) == LUA_TNUMBER) {
 		gint num = lua_tonumber (L, idx);
-		if (num >= DATE_CONNECT && num <= DATE_MESSAGE_STRING) {
+		if (num >= DATE_CONNECT && num < DATE_INVALID) {
 			return num;
 		}
 	}
@@ -4717,10 +4824,6 @@ lua_task_detect_date_type (struct rspamd_task *task,
 		if (str) {
 			if (g_ascii_strcasecmp (str, "message") == 0) {
 				type = DATE_MESSAGE;
-			} else if (g_ascii_strcasecmp (str, "connect_str") == 0) {
-				type = DATE_CONNECT_STRING;
-			} else if (g_ascii_strcasecmp (str, "message_str") == 0) {
-				type = DATE_MESSAGE_STRING;
 			}
 		}
 		else {
@@ -4758,7 +4861,7 @@ lua_task_get_date (lua_State *L)
 			type = lua_task_detect_date_type (task, L, 2, &gmt);
 		}
 		/* Get GMT date and store it to time_t */
-		if (type == DATE_CONNECT || type == DATE_CONNECT_STRING) {
+		if (type == DATE_CONNECT) {
 			tim = task->task_timestamp;
 
 			if (!gmt) {
@@ -4771,7 +4874,8 @@ lua_task_get_date (lua_State *L)
 				t.tm_gmtoff = 0;
 #endif
 				t.tm_isdst = 0;
-				tim = mktime (&t);
+				/* Preserve fractional part as Lua is aware of it */
+				tim = mktime (&t) + (tim - tt);
 			}
 		}
 		else {
@@ -4800,18 +4904,7 @@ lua_task_get_date (lua_State *L)
 			}
 		}
 
-		if (type == DATE_CONNECT || type == DATE_MESSAGE) {
-			lua_pushnumber (L, tim);
-		}
-		else {
-			GTimeVal tv;
-			gchar *out;
-
-			double_to_tv (tim, &tv);
-			out = g_time_val_to_iso8601 (&tv);
-			lua_pushstring (L, out);
-			g_free (out);
-		}
+		lua_pushnumber (L, tim);
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -4849,14 +4942,19 @@ lua_task_get_timeval (lua_State *L)
 	struct timeval tv;
 
 	if (task != NULL) {
-		double_to_tv (task->task_timestamp, &tv);
-		lua_createtable (L, 0, 2);
-		lua_pushstring (L, "tv_sec");
-		lua_pushinteger (L, (lua_Integer)tv.tv_sec);
-		lua_settable (L, -3);
-		lua_pushstring (L, "tv_usec");
-		lua_pushinteger (L, (lua_Integer)tv.tv_usec);
-		lua_settable (L, -3);
+		if (lua_isboolean (L, 2) && !!lua_toboolean (L, 2)) {
+			lua_pushnumber (L, task->task_timestamp);
+		}
+		else {
+			double_to_tv (task->task_timestamp, &tv);
+			lua_createtable (L, 0, 2);
+			lua_pushstring (L, "tv_sec");
+			lua_pushinteger (L, (lua_Integer) tv.tv_sec);
+			lua_settable (L, -3);
+			lua_pushstring (L, "tv_usec");
+			lua_pushinteger (L, (lua_Integer) tv.tv_usec);
+			lua_settable (L, -3);
+		}
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -5337,6 +5435,53 @@ lua_task_set_milter_reply (lua_State *L)
 				RSPAMD_MEMPOOL_MILTER_REPLY);
 
 		if (prev) {
+			/*
+			 * We need to be very special about the add_headers part
+			 * If we want to insert some existing object, such as
+			 * add_headers = {
+			 *   hdr = {value = val1, order = 1},
+			 * }
+			 *
+			 * and new header has something similar:
+			 * add_headers = {
+			 *   hdr = {value = val2, order = 1},
+			 * }
+			 *
+			 * then we need to convert it to an array...
+			 *
+			 * add_headers = {
+			 *   hdr = [{value = val1, order = 1}, {value = val2, order = 1}],
+			 * }
+			 *
+			 * UCL itself cannot do it directly. So the trick is to extract the
+			 * original object, pack it into an array and then insert it back.
+			 *
+			 * I wish there was a simplier way to do it...
+			 */
+			const ucl_object_t *add_hdrs = ucl_object_lookup (prev, "add_headers");
+			const ucl_object_t *nadd_hdrs = ucl_object_lookup (reply, "add_headers");
+
+			if (add_hdrs && nadd_hdrs) {
+				ucl_object_iter_t it = NULL;
+				const ucl_object_t *cur;
+
+				while ((cur = ucl_object_iterate (nadd_hdrs, &it, true)) != NULL) {
+					gsize klen;
+					const gchar *key = ucl_object_keyl (cur, &klen);
+					const ucl_object_t *existing;
+
+					existing = ucl_object_lookup_len (add_hdrs, key, klen);
+
+					if (existing && ucl_object_type (existing) != UCL_ARRAY) {
+						ucl_object_t *ar = ucl_object_typed_new (UCL_ARRAY);
+
+						ucl_array_append (ar, ucl_object_ref (existing));
+						ucl_object_replace_key ((ucl_object_t *)add_hdrs,
+								ar, key, klen, false);
+					}
+				}
+			}
+
 			ucl_object_merge (prev, reply, false);
 			ucl_object_unref (reply);
 		}
@@ -5446,22 +5591,23 @@ lua_task_set_settings_id (lua_State *L)
 
 	if (task != NULL && id != 0) {
 
+		struct rspamd_config_settings_elt *selt =
+				rspamd_config_find_settings_id_ref (task->cfg, id);
+
+		if (selt == NULL) {
+			return luaL_error (L, "settings id %u is unknown", id);
+		}
 		if (task->settings_elt) {
-			if (task->settings_elt->id != id) {
-				return luaL_error (L, "settings id has been already set to %d (%s)",
-						task->settings_elt->id, task->settings_elt->name);
-			}
+			/* Overwrite existing settings from Lua */
+			REF_RELEASE (task->settings_elt);
+			lua_pushboolean (L, true);
 		}
 		else {
-			task->settings_elt = rspamd_config_find_settings_id_ref (task->cfg,
-					id);
-
-			if (!task->settings_elt) {
-				return luaL_error (L, "settings id %u is unknown", id);
-			}
+			lua_pushboolean (L, false);
 		}
 
-		lua_pushboolean (L, true);
+		task->settings_elt = selt;
+
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -6123,7 +6269,7 @@ lua_task_headers_foreach (lua_State *L)
 			if (MESSAGE_FIELD (task, headers_order)) {
 				hdr = MESSAGE_FIELD (task, headers_order);
 
-				LL_FOREACH (hdr, cur) {
+				LL_FOREACH2 (hdr, cur, ord_next) {
 					if (re && re->re) {
 						if (!rspamd_regexp_match (re->re, cur->name,
 								strlen (cur->name), FALSE)) {

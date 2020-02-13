@@ -99,8 +99,19 @@ local function p0f_check(task, ip, rule)
     task:get_mempool():set_variable('os_fingerprint', os_string, link_type,
       uptime_min, distance)
 
-    common.yield_result(task, rule, {
-      os_string, link_type, 'distance:' .. distance }, 0.0)
+    if link_type and #link_type > 0 then
+      common.yield_result(task, rule, {
+        os_string,
+        'link=' .. link_type,
+        'distance=' .. distance},
+          0.0)
+    else
+      common.yield_result(task, rule, {
+        os_string,
+        'link=unknown',
+        'distance=' .. distance},
+          0.0)
+    end
 
     return data
   end
@@ -115,17 +126,24 @@ local function p0f_check(task, ip, rule)
         end
       end
 
+      if err then
+        rspamd_logger.errx(task, 'p0f received an error: %s', err)
+        common.yield_result(task, rule, 'Error getting result: ' .. err,
+            0.0, 'fail')
+        return
+      end
+
       data = parse_p0f_response(data)
 
-      if rule.redis_params then
+      if rule.redis_params and data then
         local key = rule.prefix .. ip:to_string()
         local ret = lua_redis.redis_make_request(task,
-          rule.redis_params,
-          key,
-          true,
-          redis_set_cb,
-          'SETEX',
-          { key, tostring(rule.expire), data }
+            rule.redis_params,
+            key,
+            true,
+            redis_set_cb,
+            'SETEX',
+            { key, tostring(rule.expire), data }
         )
 
         if not ret then

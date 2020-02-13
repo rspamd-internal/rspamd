@@ -590,7 +590,12 @@ local function multimap_callback(task, rule)
 
 
     if opt then
-      task:insert_result(forced, symbol, score, opt)
+      if type(opt) == 'table' then
+        task:insert_result(forced, symbol, score, fun.totable(fun.map(tostring, opt)))
+      else
+        task:insert_result(forced, symbol, score, tostring(opt))
+      end
+
     else
       task:insert_result(forced, symbol, score)
     end
@@ -861,6 +866,12 @@ local function multimap_callback(task, rule)
         end
       end
     end,
+    user = function()
+      local user = task:get_user()
+      if user then
+        match_rule(rule, user)
+      end
+    end,
     filename = function()
       local parts = task:get_parts()
 
@@ -1032,6 +1043,7 @@ local function add_multimap_rule(key, newrule)
     symbol_options = true,
     filename = true,
     url = true,
+    user = true,
     content = true,
     hostname = true,
     asn = true,

@@ -99,12 +99,12 @@ struct rspamd_symcache_id_list {
 
 struct rspamd_symcache_item {
 	/* This block is likely shared */
-	struct item_stat *st;
+	struct rspamd_symcache_item_stat *st;
 
 	guint64 last_count;
 	struct rspamd_counter_data *cd;
 	gchar *symbol;
-	enum rspamd_symbol_type type;
+	gint type;
 
 	/* Callback data */
 	union {
@@ -115,6 +115,7 @@ struct rspamd_symcache_item {
 		} normal;
 		struct {
 			gint parent;
+			struct rspamd_symcache_item *parent_item;
 		} virtual;
 	} specific;
 
@@ -142,17 +143,6 @@ struct rspamd_symcache_item {
 
 	/* Container */
 	GPtrArray *container;
-};
-
-struct item_stat {
-	struct rspamd_counter_data time_counter;
-	gdouble avg_time;
-	gdouble weight;
-	guint hits;
-	guint64 total_hits;
-	struct rspamd_counter_data frequency_counter;
-	gdouble avg_frequency;
-	gdouble stddev_frequency;
 };
 
 struct rspamd_symcache {
@@ -214,6 +204,7 @@ struct cache_savepoint {
 	guint version;
 	guint items_inflight;
 	gboolean profile;
+	gboolean has_slow;
 	gdouble profile_start;
 
 	struct rspamd_scan_result *rs;
@@ -324,8 +315,7 @@ rspamd_symcache_find_filter (struct rspamd_symcache *cache,
 	if (item != NULL) {
 
 		if (resolve_parent && item->is_virtual && !(item->type & SYMBOL_TYPE_GHOST)) {
-			item = g_ptr_array_index (cache->items_by_id,
-					item->specific.virtual.parent);
+			item =item->specific.virtual.parent_item;
 		}
 
 		return item;
@@ -338,7 +328,7 @@ const gchar *
 rspamd_symcache_get_parent (struct rspamd_symcache *cache,
 										 const gchar *symbol)
 {
-	struct rspamd_symcache_item *item;
+	struct rspamd_symcache_item *item, *parent;
 
 	g_assert (cache != NULL);
 
@@ -351,8 +341,15 @@ rspamd_symcache_get_parent (struct rspamd_symcache *cache,
 	if (item != NULL) {
 
 		if (item->is_virtual && !(item->type & SYMBOL_TYPE_GHOST)) {
-			item = g_ptr_array_index (cache->items_by_id,
-					item->specific.virtual.parent);
+			parent = item->specific.virtual.parent_item;
+
+			if (!parent) {
+				item->specific.virtual.parent_item = g_ptr_array_index (cache->items_by_id,
+						item->specific.virtual.parent);
+				parent = item->specific.virtual.parent_item;
+			}
+
+			item = parent;
 		}
 
 		return item->symbol;
@@ -893,6 +890,7 @@ rspamd_symcache_load_items (struct rspamd_symcache *cache, const gchar *name)
 				g_assert (item->specific.virtual.parent < (gint)cache->items_by_id->len);
 				parent = g_ptr_array_index (cache->items_by_id,
 						item->specific.virtual.parent);
+				item->specific.virtual.parent_item = parent;
 
 				if (parent->st->weight < item->st->weight) {
 					parent->st->weight = item->st->weight;
@@ -1160,6 +1158,8 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 		else {
 			item->is_virtual = TRUE;
 			item->specific.virtual.parent = parent;
+			item->specific.virtual.parent_item =
+					g_ptr_array_index (cache->items_by_id, parent);
 			item->id = cache->virtual->len;
 			g_ptr_array_add (cache->virtual, item);
 			item->container = cache->virtual;
@@ -1320,7 +1320,7 @@ rspamd_symcache_new (struct rspamd_config *cfg)
 
 	cache = g_malloc0 (sizeof (struct rspamd_symcache));
 	cache->static_pool =
-			rspamd_mempool_new (rspamd_mempool_suggest_size (), "symcache");
+			rspamd_mempool_new (rspamd_mempool_suggest_size (), "symcache", 0);
 	cache->items_by_symbol = g_hash_table_new (rspamd_str_hash,
 			rspamd_str_equal);
 	cache->items_by_id = g_ptr_array_new ();
@@ -1428,6 +1428,7 @@ rspamd_symcache_validate_cb (gpointer k, gpointer v, gpointer ud)
 			g_assert (item->specific.virtual.parent < (gint) cache->items_by_id->len);
 			parent = g_ptr_array_index (cache->items_by_id,
 					item->specific.virtual.parent);
+			item->specific.virtual.parent_item = parent;
 
 			if (fabs (parent->st->weight) < fabs (item->st->weight)) {
 				parent->st->weight = item->st->weight;
@@ -1495,7 +1496,8 @@ rspamd_symcache_validate (struct rspamd_symcache *cache,
 		ignore_symbol = FALSE;
 		sym_def = v;
 
-		if (sym_def && (sym_def->flags & RSPAMD_SYMBOL_FLAG_IGNORE)) {
+		if (sym_def && (sym_def->flags &
+				(RSPAMD_SYMBOL_FLAG_IGNORE_METRIC|RSPAMD_SYMBOL_FLAG_DISABLED))) {
 			ignore_symbol = TRUE;
 		}
 
@@ -1510,6 +1512,13 @@ rspamd_symcache_validate (struct rspamd_symcache *cache,
 				if (strict) {
 					ret = FALSE;
 				}
+			}
+		}
+		else if (sym_def->flags & RSPAMD_SYMBOL_FLAG_DISABLED) {
+			item = g_hash_table_lookup (cache->items_by_symbol, k);
+
+			if (item) {
+				item->enabled = FALSE;
 			}
 		}
 	}
@@ -1590,14 +1599,18 @@ rspamd_symcache_is_item_allowed (struct rspamd_task *task,
 {
 	const gchar *what = "execution";
 
+	if (!exec_only) {
+		what = "symbol insertion";
+	}
+
 	/* Static checks */
 	if (!item->enabled ||
 		(RSPAMD_TASK_IS_EMPTY (task) && !(item->type & SYMBOL_TYPE_EMPTY)) ||
 		(item->type & SYMBOL_TYPE_MIME_ONLY && !RSPAMD_TASK_IS_MIME(task))) {
 
 		if (!item->enabled) {
-			msg_debug_cache_task ("skipping check of %s as it is permanently disabled",
-					item->symbol);
+			msg_debug_cache_task ("skipping %s of %s as it is permanently disabled",
+					what, item->symbol);
 
 			return FALSE;
 		}
@@ -1613,10 +1626,6 @@ rspamd_symcache_is_item_allowed (struct rspamd_task *task,
 				return FALSE;
 			}
 		}
-	}
-
-	if (!exec_only) {
-		what = "symbol insertion";
 	}
 
 	/* Settings checks */
@@ -1753,7 +1762,8 @@ rspamd_symcache_check_symbol (struct rspamd_task *task,
 		msg_debug_cache_task ("execute %s, %d", item->symbol, item->id);
 
 		if (checkpoint->profile) {
-			dyn_item->start_msec = (rspamd_get_virtual_ticks () -
+			ev_now_update_if_cheap (task->event_loop);
+			dyn_item->start_msec = (ev_now (task->event_loop) -
 					checkpoint->profile_start) * 1e3;
 		}
 
@@ -1906,14 +1916,15 @@ rspamd_symcache_make_checkpoint (struct rspamd_task *task,
 			rspamd_symcache_order_unref, checkpoint->order);
 
 	/* Calculate profile probability */
+	ev_now_update_if_cheap (task->event_loop);
 	ev_tstamp now = ev_now (task->event_loop);
+	checkpoint->profile_start = now;
 
 	if ((cache->last_profile == 0.0 || now > cache->last_profile + PROFILE_MAX_TIME) ||
 			(task->msg.len >= PROFILE_MESSAGE_SIZE_THRESHOLD) ||
 			(rspamd_random_double_fast () >= (1 - PROFILE_PROBABILITY))) {
 		msg_debug_cache_task ("enable profiling of symbols for task");
 		checkpoint->profile = TRUE;
-		checkpoint->profile_start = rspamd_get_virtual_ticks ();
 		cache->last_profile = now;
 	}
 
@@ -2021,7 +2032,8 @@ rspamd_symcache_process_settings (struct rspamd_task *task,
 
 gboolean
 rspamd_symcache_process_symbols (struct rspamd_task *task,
-								 struct rspamd_symcache *cache, gint stage)
+								 struct rspamd_symcache *cache,
+								 gint stage)
 {
 	struct rspamd_symcache_item *item = NULL;
 	struct rspamd_symcache_dynamic_item *dyn_item;
@@ -2060,6 +2072,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
 				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
+
+				if (checkpoint->has_slow) {
+					/* Delay */
+					checkpoint->has_slow = FALSE;
+
+					return FALSE;
+				}
 				/* Check priorities */
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
@@ -2099,6 +2118,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
 				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
 				/* Check priorities */
+				if (checkpoint->has_slow) {
+					/* Delay */
+					checkpoint->has_slow = FALSE;
+
+					return FALSE;
+				}
+
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
 				}
@@ -2151,6 +2177,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 
 				rspamd_symcache_check_symbol (task, cache, item,
 						checkpoint);
+
+				if (checkpoint->has_slow) {
+					/* Delay */
+					checkpoint->has_slow = FALSE;
+
+					return FALSE;
+				}
 			}
 
 			if (!(item->type & SYMBOL_TYPE_FINE)) {
@@ -2185,6 +2218,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 				/* Check priorities */
 				all_done = FALSE;
 
+				if (checkpoint->has_slow) {
+					/* Delay */
+					checkpoint->has_slow = FALSE;
+
+					return FALSE;
+				}
+
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
 				}
@@ -2218,6 +2258,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
 				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
 				/* Check priorities */
+				if (checkpoint->has_slow) {
+					/* Delay */
+					checkpoint->has_slow = FALSE;
+
+					return FALSE;
+				}
+
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
 				}
@@ -2752,14 +2799,15 @@ rspamd_symcache_is_checked (struct rspamd_task *task,
 
 void
 rspamd_symcache_disable_symbol_perm (struct rspamd_symcache *cache,
-									 const gchar *symbol)
+									 const gchar *symbol,
+									 gboolean resolve_parent)
 {
 	struct rspamd_symcache_item *item;
 
 	g_assert (cache != NULL);
 	g_assert (symbol != NULL);
 
-	item = rspamd_symcache_find_filter (cache, symbol, true);
+	item = rspamd_symcache_find_filter (cache, symbol, resolve_parent);
 
 	if (item) {
 		item->enabled = FALSE;
@@ -2930,7 +2978,7 @@ rspamd_symcache_disable_symbol (struct rspamd_task *task,
 
 void
 rspamd_symcache_foreach (struct rspamd_symcache *cache,
-						 void (*func) (gint, const gchar *, gint, gpointer),
+						 void (*func) (struct rspamd_symcache_item *, gpointer),
 						 gpointer ud)
 {
 	struct rspamd_symcache_item *item;
@@ -2941,7 +2989,7 @@ rspamd_symcache_foreach (struct rspamd_symcache *cache,
 
 	while (g_hash_table_iter_next (&it, &k, &v)) {
 		item = (struct rspamd_symcache_item *)v;
-		func (item->id, item->symbol, item->type, ud);
+		func (item, ud);
 	}
 }
 
@@ -2977,6 +3025,86 @@ rspamd_symcache_set_cur_item (struct rspamd_task *task,
 	return ex;
 }
 
+struct rspamd_symcache_delayed_cbdata {
+	struct rspamd_symcache_item *item;
+	struct rspamd_task *task;
+	struct rspamd_async_event *event;
+	struct ev_timer tm;
+};
+
+static void
+rspamd_symcache_delayed_item_fin (gpointer ud)
+{
+	struct rspamd_symcache_delayed_cbdata *cbd =
+			(struct rspamd_symcache_delayed_cbdata *)ud;
+	struct rspamd_task *task;
+	struct cache_savepoint *checkpoint;
+
+	task = cbd->task;
+	checkpoint = task->checkpoint;
+	checkpoint->has_slow = FALSE;
+	ev_timer_stop (task->event_loop, &cbd->tm);
+}
+
+static void
+rspamd_symcache_delayed_item_cb (EV_P_ ev_timer *w, int what)
+{
+	struct rspamd_symcache_delayed_cbdata *cbd =
+			(struct rspamd_symcache_delayed_cbdata *)w->data;
+	struct rspamd_symcache_item *item;
+	struct rspamd_task *task;
+	struct cache_dependency *rdep;
+	struct cache_savepoint *checkpoint;
+	struct rspamd_symcache_dynamic_item *dyn_item;
+	guint i;
+
+	item = cbd->item;
+	task = cbd->task;
+	checkpoint = task->checkpoint;
+	cbd->event = NULL;
+
+	/* Timer will be stopped here */
+	rspamd_session_remove_event (task->s,
+			rspamd_symcache_delayed_item_fin, cbd);
+
+	/* Process all reverse dependencies */
+	PTR_ARRAY_FOREACH (item->rdeps, i, rdep) {
+		if (rdep->item) {
+			dyn_item = rspamd_symcache_get_dynamic (checkpoint, rdep->item);
+			if (!CHECK_START_BIT (checkpoint, dyn_item)) {
+				msg_debug_cache_task ("check item %d(%s) rdep of %s ",
+						rdep->item->id, rdep->item->symbol, item->symbol);
+
+				if (!rspamd_symcache_check_deps (task, task->cfg->cache,
+						rdep->item,
+						checkpoint, 0, FALSE)) {
+					msg_debug_cache_task ("blocked execution of %d(%s) rdep of %s "
+										  "unless deps are resolved",
+							rdep->item->id, rdep->item->symbol, item->symbol);
+				}
+				else {
+					rspamd_symcache_check_symbol (task, task->cfg->cache,
+							rdep->item,
+							checkpoint);
+				}
+			}
+		}
+	}
+}
+
+static void
+rspamd_delayed_timer_dtor (gpointer d)
+{
+	struct rspamd_symcache_delayed_cbdata *cbd =
+			(struct rspamd_symcache_delayed_cbdata *)d;
+
+	if (cbd->event) {
+		/* Event has not been executed */
+		rspamd_session_remove_event (cbd->task->s,
+				rspamd_symcache_delayed_item_fin, cbd);
+		cbd->event = NULL;
+	}
+}
 
 /**
  * Finalize the current async element potentially calling its deps
@@ -2990,6 +3118,7 @@ rspamd_symcache_finalize_item (struct rspamd_task *task,
 	struct rspamd_symcache_dynamic_item *dyn_item;
 	gdouble diff;
 	guint i;
+	gboolean enable_slow_timer = FALSE;
 	const gdouble slow_diff_limit = 300;
 
 	/* Sanity checks */
@@ -3018,11 +3147,24 @@ rspamd_symcache_finalize_item (struct rspamd_task *task,
 	checkpoint->cur_item = NULL;
 
 	if (checkpoint->profile) {
-		diff = ((rspamd_get_virtual_ticks () - checkpoint->profile_start) * 1e3 -
+		ev_now_update_if_cheap (task->event_loop);
+		diff = ((ev_now (task->event_loop) - checkpoint->profile_start) * 1e3 -
 				dyn_item->start_msec);
+
 		if (diff > slow_diff_limit) {
-			msg_info_task ("slow rule: %s(%d): %.2f ms", item->symbol, item->id,
-					diff);
+
+			if (!checkpoint->has_slow) {
+				checkpoint->has_slow = TRUE;
+				enable_slow_timer = TRUE;
+				msg_info_task ("slow rule: %s(%d): %.2f ms; enable slow timer delay",
+						item->symbol, item->id,
+						diff);
+			}
+			else {
+				msg_info_task ("slow rule: %s(%d): %.2f ms",
+						item->symbol, item->id,
+						diff);
+			}
 		}
 
 		if (G_UNLIKELY (RSPAMD_TASK_IS_PROFILING (task))) {
@@ -3032,6 +3174,39 @@ rspamd_symcache_finalize_item (struct rspamd_task *task,
 		if (rspamd_worker_is_scanner (task->worker)) {
 			rspamd_set_counter (item->cd, diff);
 		}
+	}
+
+	if (enable_slow_timer) {
+		struct rspamd_symcache_delayed_cbdata *cbd =
+				rspamd_mempool_alloc (task->task_pool,sizeof (*cbd));
+		/* Add timer to allow something else to be executed */
+		ev_timer *tm = &cbd->tm;
+
+		cbd->event = rspamd_session_add_event (task->s,
+				rspamd_symcache_delayed_item_fin, cbd,
+				"symcache");
+
+		/*
+		 * If no event could be added, then we are already in the destruction
+		 * phase. So the main issue is to deal with has slow here
+		 */
+		if (cbd->event) {
+			ev_timer_init (tm, rspamd_symcache_delayed_item_cb, 0.1, 0.0);
+			ev_set_priority (tm, EV_MINPRI);
+			rspamd_mempool_add_destructor (task->task_pool,
+					rspamd_delayed_timer_dtor, cbd);
+
+			cbd->task = task;
+			cbd->item = item;
+			tm->data = cbd;
+			ev_timer_start (task->event_loop, tm);
+		}
+		else {
+			/* Just reset as no timer is added */
+			checkpoint->has_slow = FALSE;
+		}
+
+		return;
 	}
 
 	/* Process all reverse dependencies */
@@ -3505,7 +3680,7 @@ rspamd_symcache_process_settings_elt (struct rspamd_symcache *cache,
 	}
 }
 
-enum rspamd_symbol_type
+gint
 rspamd_symcache_item_flags (struct rspamd_symcache_item *item)
 {
 	if (item) {
@@ -3513,4 +3688,95 @@ rspamd_symcache_item_flags (struct rspamd_symcache_item *item)
 	}
 
 	return 0;
+}
+
+const gchar*
+rspamd_symcache_item_name (struct rspamd_symcache_item *item)
+{
+	return item ? item->symbol : NULL;
+}
+
+const struct rspamd_symcache_item_stat *
+rspamd_symcache_item_stat (struct rspamd_symcache_item *item)
+{
+	return item ? item->st : NULL;
+}
+
+gboolean
+rspamd_symcache_item_is_enabled (struct rspamd_symcache_item *item)
+{
+	if (item) {
+		if (!item->enabled) {
+			return FALSE;
+		}
+
+		if (item->is_virtual && item->specific.virtual.parent_item != NULL) {
+			return rspamd_symcache_item_is_enabled (item->specific.virtual.parent_item);
+		}
+
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+struct rspamd_symcache_item * rspamd_symcache_item_get_parent (
+		struct rspamd_symcache_item *item)
+{
+	if (item && item->is_virtual && item->specific.virtual.parent_item != NULL) {
+		return item->specific.virtual.parent_item;
+	}
+
+	return NULL;
+}
+
+const GPtrArray*
+rspamd_symcache_item_get_deps (struct rspamd_symcache_item *item)
+{
+	struct rspamd_symcache_item *parent;
+
+	if (item) {
+		parent = rspamd_symcache_item_get_parent (item);
+
+		if (parent) {
+			item = parent;
+		}
+
+		return item->deps;
+	}
+
+	return NULL;
+}
+
+const GPtrArray*
+rspamd_symcache_item_get_rdeps (struct rspamd_symcache_item *item)
+{
+	struct rspamd_symcache_item *parent;
+
+	if (item) {
+		parent = rspamd_symcache_item_get_parent (item);
+
+		if (parent) {
+			item = parent;
+		}
+
+		return item->rdeps;
+	}
+
+	return NULL;
+}
+
+void
+rspamd_symcache_enable_profile (struct rspamd_task *task)
+{
+	struct cache_savepoint *checkpoint = task->checkpoint;
+
+	if (checkpoint && !checkpoint->profile) {
+		ev_now_update_if_cheap (task->event_loop);
+		ev_tstamp now = ev_now (task->event_loop);
+		checkpoint->profile_start = now;
+
+		msg_debug_cache_task ("enable profiling of symbols for task");
+		checkpoint->profile = TRUE;
+	}
 }

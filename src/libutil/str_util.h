@@ -279,6 +279,17 @@ gssize rspamd_decode_qp_buf (const gchar *in, gsize inlen,
 							 gchar *out, gsize outlen);
 
 /**
+ * Decode uuencode encoded buffer, input and output must not overlap
+ * @param in input
+ * @param inlen length of input
+ * @param out output
+ * @param outlen length of output
+ * @return real size of decoded output or (-1) if outlen is not enough
+ */
+gssize rspamd_decode_uue_buf (const gchar *in, gsize inlen,
+							 gchar *out, gsize outlen);
+
+/**
  * Decode quoted-printable encoded buffer using rfc2047 format, input and output must not overlap
  * @param in input
  * @param inlen length of input
@@ -429,39 +440,7 @@ gsize rspamd_memspn (const gchar *s, const gchar *e, gsize len);
  */
 #define rspamd_is_aligned(p, n) (((uintptr_t)(p) & ((uintptr_t)(n) - 1)) == 0)
 #define rspamd_is_aligned_as(p, v) rspamd_is_aligned(p, _Alignof(__typeof((v))))
-
-static inline gboolean
-rspamd_str_has_8bit (const guchar *beg, gsize len)
-{
-	unsigned long *w;
-	gsize i, leftover;
-
-	if (rspamd_is_aligned_as (beg, *w)) {
-		leftover = len % sizeof (*w);
-		w = (unsigned long *) beg;
-
-		for (i = 0; i < len / sizeof (*w); i++) {
-			if (rspamd_str_hasmore (*w, 127)) {
-				return TRUE;
-			}
-
-			w++;
-		}
-
-		beg = (const guchar *) w;
-	}
-	else {
-		leftover = len;
-	}
-
-	for (i = 0; i < leftover; i++) {
-		if (beg[i] > 127) {
-			return TRUE;
-		}
-	}
-
-	return FALSE;
-}
+gboolean rspamd_str_has_8bit (const guchar *beg, gsize len);
 
 struct UConverter;
 
@@ -516,7 +495,7 @@ rspamd_str_regexp_escape (const gchar *pattern, gsize slen,
  * @param dstelen
  * @return
  */
-gchar *rspamd_str_make_utf_valid (const guchar *src, gsize slen, gsize *dstlen);
+gchar *rspamd_str_make_utf_valid (const guchar *src, gsize slen, gsize *dstlen, rspamd_mempool_t *pool);
 
 /**
  * Strips characters in `strip_chars` from start and end of the GString
@@ -550,7 +529,8 @@ gchar ** rspamd_string_len_split (const gchar *in, gsize len,
 #define IS_ZERO_WIDTH_SPACE(uc) ((uc) == 0x200B || \
                                 (uc) == 0x200C || \
                                 (uc) == 0x200D || \
-                                (uc) == 0xFEFF)
+                                (uc) == 0xFEFF || \
+								(uc) == 0x00AD)
 #define IS_OBSCURED_CHAR(uc) (((uc) >= 0x200B && (uc) <= 0x200F) || \
                                 ((uc) >= 0x2028 && (uc) <= 0x202F) || \
                                 ((uc) >= 0x205F && (uc) <= 0x206F) || \

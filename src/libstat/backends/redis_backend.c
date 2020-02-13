@@ -751,12 +751,15 @@ rspamd_redis_async_cbdata_cleanup (struct rspamd_redis_stat_cbdata *cbdata)
 static void
 rspamd_redis_stat_learns (redisAsyncContext *c, gpointer r, gpointer priv)
 {
-	struct rspamd_redis_stat_cbdata *cbdata = priv;
+	struct rspamd_redis_stat_elt *redis_elt = (struct rspamd_redis_stat_elt *)priv;
+	struct rspamd_redis_stat_cbdata *cbdata;
 	redisReply *reply = r;
 	ucl_object_t *obj;
 	gulong num = 0;
 
-	if (cbdata->wanna_die) {
+	cbdata = redis_elt->cbdata;
+
+	if (cbdata == NULL || cbdata->wanna_die) {
 		return;
 	}
 
@@ -778,6 +781,7 @@ rspamd_redis_stat_learns (redisAsyncContext *c, gpointer r, gpointer priv)
 
 	if (cbdata->inflight == 0) {
 		rspamd_redis_async_cbdata_cleanup (cbdata);
+		redis_elt->cbdata = NULL;
 	}
 }
 
@@ -785,12 +789,15 @@ rspamd_redis_stat_learns (redisAsyncContext *c, gpointer r, gpointer priv)
 static void
 rspamd_redis_stat_key (redisAsyncContext *c, gpointer r, gpointer priv)
 {
-	struct rspamd_redis_stat_cbdata *cbdata = priv;
+	struct rspamd_redis_stat_elt *redis_elt = (struct rspamd_redis_stat_elt *)priv;
+	struct rspamd_redis_stat_cbdata *cbdata;
 	redisReply *reply = r;
 	ucl_object_t *obj;
 	glong num = 0;
 
-	if (cbdata->wanna_die) {
+	cbdata = redis_elt->cbdata;
+
+	if (cbdata == NULL || cbdata->wanna_die) {
 		return;
 	}
 
@@ -829,6 +836,7 @@ rspamd_redis_stat_key (redisAsyncContext *c, gpointer r, gpointer priv)
 
 	if (cbdata->inflight == 0) {
 		rspamd_redis_async_cbdata_cleanup (cbdata);
+		redis_elt->cbdata = NULL;
 	}
 }
 
@@ -836,13 +844,16 @@ rspamd_redis_stat_key (redisAsyncContext *c, gpointer r, gpointer priv)
 static void
 rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 {
-	struct rspamd_redis_stat_cbdata *cbdata = priv;
-	redisReply *reply = r, *elt;
+	struct rspamd_redis_stat_elt *redis_elt = (struct rspamd_redis_stat_elt *)priv;
+	struct rspamd_redis_stat_cbdata *cbdata;
+	redisReply *reply = r, *more_elt, *elts, *elt;
 	gchar **pk, *k;
 	guint i, processed = 0;
+	gboolean more = false;
 
+	cbdata = redis_elt->cbdata;
 
-	if (cbdata->wanna_die) {
+	if (cbdata == NULL || cbdata->wanna_die) {
 		return;
 	}
 
@@ -850,10 +861,17 @@ rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 
 	if (c->err == 0 && r != NULL) {
 		if (reply->type == REDIS_REPLY_ARRAY) {
-			g_ptr_array_set_size (cbdata->cur_keys, reply->elements);
+			more_elt = reply->element[0];
+			elts = reply->element[1];
 
-			for (i = 0; i < reply->elements; i ++) {
-				elt = reply->element[i];
+			if (more_elt != NULL && more_elt->str != NULL && strcmp (more_elt->str, "0") != 0) {
+				more = true;
+			}
+
+			g_ptr_array_set_size (cbdata->cur_keys, elts->elements);
+
+			for (i = 0; i < elts->elements; i ++) {
+				elt = elts->element[i];
 
 				if (elt->type == REDIS_REPLY_STRING) {
 					pk = (gchar **)&g_ptr_array_index (cbdata->cur_keys, i);
@@ -879,7 +897,7 @@ rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 							}
 							redisAsyncCommand (cbdata->redis,
 									rspamd_redis_stat_learns,
-									cbdata,
+									redis_elt,
 									"HGET %s %s",
 									k, learned_key);
 							cbdata->inflight += 1;
@@ -887,12 +905,12 @@ rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 						else {
 							redisAsyncCommand (cbdata->redis,
 									rspamd_redis_stat_key,
-									cbdata,
+									redis_elt,
 									"HLEN %s",
 									k);
 							redisAsyncCommand (cbdata->redis,
 									rspamd_redis_stat_learns,
-									cbdata,
+									redis_elt,
 									"HGET %s %s",
 									k, learned_key);
 							cbdata->inflight += 2;
@@ -902,29 +920,40 @@ rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 			}
 		}
 
-		/* Set up the required keys */
-		ucl_object_insert_key (cbdata->cur,
-				ucl_object_typed_new (UCL_INT), "revision", 0, false);
-		ucl_object_insert_key (cbdata->cur,
-				ucl_object_typed_new (UCL_INT), "used", 0, false);
-		ucl_object_insert_key (cbdata->cur,
-				ucl_object_typed_new (UCL_INT), "total", 0, false);
-		ucl_object_insert_key (cbdata->cur,
-				ucl_object_typed_new (UCL_INT), "size", 0, false);
-		ucl_object_insert_key (cbdata->cur,
-				ucl_object_fromstring (cbdata->elt->ctx->stcf->symbol),
-				"symbol", 0, false);
-		ucl_object_insert_key (cbdata->cur, ucl_object_fromstring ("redis"),
-				"type", 0, false);
-		ucl_object_insert_key (cbdata->cur, ucl_object_fromint (0),
-				"languages", 0, false);
-		ucl_object_insert_key (cbdata->cur, ucl_object_fromint (processed),
-				"users", 0, false);
+		if (more) {
+			/* Get more stat keys */
+			redisAsyncCommand (cbdata->redis, rspamd_redis_stat_keys, redis_elt,
+					"SSCAN %s_keys %s COUNT 1000",
+					cbdata->elt->ctx->stcf->symbol, more_elt->str);
 
-		rspamd_upstream_ok (cbdata->selected);
+			cbdata->inflight += 1;
+		}
+		else {
+			/* Set up the required keys */
+			ucl_object_insert_key (cbdata->cur,
+					ucl_object_typed_new (UCL_INT), "revision", 0, false);
+			ucl_object_insert_key (cbdata->cur,
+					ucl_object_typed_new (UCL_INT), "used", 0, false);
+			ucl_object_insert_key (cbdata->cur,
+					ucl_object_typed_new (UCL_INT), "total", 0, false);
+			ucl_object_insert_key (cbdata->cur,
+					ucl_object_typed_new (UCL_INT), "size", 0, false);
+			ucl_object_insert_key (cbdata->cur,
+					ucl_object_fromstring (cbdata->elt->ctx->stcf->symbol),
+					"symbol", 0, false);
+			ucl_object_insert_key (cbdata->cur, ucl_object_fromstring ("redis"),
+					"type", 0, false);
+			ucl_object_insert_key (cbdata->cur, ucl_object_fromint (0),
+					"languages", 0, false);
+			ucl_object_insert_key (cbdata->cur, ucl_object_fromint (processed),
+					"users", 0, false);
 
-		if (cbdata->inflight == 0) {
-			rspamd_redis_async_cbdata_cleanup (cbdata);
+			rspamd_upstream_ok (cbdata->selected);
+
+			if (cbdata->inflight == 0) {
+				rspamd_redis_async_cbdata_cleanup (cbdata);
+				redis_elt->cbdata = NULL;
+			}
 		}
 	}
 	else {
@@ -935,8 +964,9 @@ rspamd_redis_stat_keys (redisAsyncContext *c, gpointer r, gpointer priv)
 			msg_err ("cannot get keys to gather stat: unknown error");
 		}
 
-		rspamd_upstream_fail (cbdata->selected, FALSE);
+		rspamd_upstream_fail (cbdata->selected, FALSE, c->errstr);
 		rspamd_redis_async_cbdata_cleanup (cbdata);
+		redis_elt->cbdata = NULL;
 	}
 }
 
@@ -948,6 +978,8 @@ rspamd_redis_async_stat_cb (struct rspamd_stat_async_elt *elt, gpointer d)
 	struct rspamd_redis_stat_cbdata *cbdata;
 	rspamd_inet_addr_t *addr;
 	struct upstream_list *ups;
+	redisAsyncContext *redis_ctx;
+	struct upstream *selected;
 
 	g_assert (redis_elt != NULL);
 
@@ -956,6 +988,7 @@ rspamd_redis_async_stat_cb (struct rspamd_stat_async_elt *elt, gpointer d)
 	if (redis_elt->cbdata) {
 		/* We have some other process pending */
 		rspamd_redis_async_cbdata_cleanup (redis_elt->cbdata);
+		redis_elt->cbdata = NULL;
 	}
 
 	/* Disable further events unless needed */
@@ -967,29 +1000,43 @@ rspamd_redis_async_stat_cb (struct rspamd_stat_async_elt *elt, gpointer d)
 		return;
 	}
 
-	cbdata = g_malloc0 (sizeof (*cbdata));
-
-	cbdata->selected = rspamd_upstream_get (ups,
+	selected = rspamd_upstream_get (ups,
 					RSPAMD_UPSTREAM_ROUND_ROBIN,
 					NULL,
 					0);
 
-	g_assert (cbdata->selected != NULL);
-	addr = rspamd_upstream_addr_next (cbdata->selected);
+	g_assert (selected != NULL);
+	addr = rspamd_upstream_addr_next (selected);
 	g_assert (addr != NULL);
 
 	if (rspamd_inet_address_get_af (addr) == AF_UNIX) {
-		cbdata->redis = redisAsyncConnectUnix (rspamd_inet_address_to_string (addr));
+		redis_ctx = redisAsyncConnectUnix (rspamd_inet_address_to_string (addr));
 	}
 	else {
-		cbdata->redis = redisAsyncConnect (rspamd_inet_address_to_string (addr),
+		redis_ctx = redisAsyncConnect (rspamd_inet_address_to_string (addr),
 				rspamd_inet_address_get_port (addr));
 	}
 
-	g_assert (cbdata->redis != NULL);
+	if (redis_ctx == NULL) {
+		msg_warn ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				strerror (errno));
 
-	redisLibevAttach (redis_elt->event_loop, cbdata->redis);
+		return;
+	}
+	else if (redis_ctx->err != REDIS_OK) {
+		msg_warn ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				redis_ctx->errstr);
+		redisAsyncFree (redis_ctx);
 
+		return;
+	}
+
+	redisLibevAttach (redis_elt->event_loop, redis_ctx);
+	cbdata = g_malloc0 (sizeof (*cbdata));
+	cbdata->redis = redis_ctx;
+	cbdata->selected = selected;
 	cbdata->inflight = 1;
 	cbdata->cur = ucl_object_typed_new (UCL_OBJECT);
 	cbdata->elt = redis_elt;
@@ -999,8 +1046,8 @@ rspamd_redis_async_stat_cb (struct rspamd_stat_async_elt *elt, gpointer d)
 	/* XXX: deal with timeouts maybe */
 	/* Get keys in redis that match our symbol */
 	rspamd_redis_maybe_auth (ctx, cbdata->redis);
-	redisAsyncCommand (cbdata->redis, rspamd_redis_stat_keys, cbdata,
-			"SMEMBERS %s_keys",
+	redisAsyncCommand (cbdata->redis, rspamd_redis_stat_keys, redis_elt,
+			"SSCAN %s_keys 0 COUNT 1000",
 			ctx->stcf->symbol);
 }
 
@@ -1009,7 +1056,10 @@ rspamd_redis_async_stat_fin (struct rspamd_stat_async_elt *elt, gpointer d)
 {
 	struct rspamd_redis_stat_elt *redis_elt = elt->ud;
 
-	rspamd_redis_async_cbdata_cleanup (redis_elt->cbdata);
+	if (redis_elt->cbdata != NULL) {
+		rspamd_redis_async_cbdata_cleanup (redis_elt->cbdata);
+		redis_elt->cbdata = NULL;
+	}
 }
 
 /* Called on connection termination */
@@ -1074,7 +1124,7 @@ rspamd_redis_timeout (EV_P_ ev_timer *w, int revents)
 	msg_err_task_check ("connection to redis server %s timed out",
 			rspamd_upstream_name (rt->selected));
 
-	rspamd_upstream_fail (rt->selected, FALSE);
+	rspamd_upstream_fail (rt->selected, FALSE, "timeout");
 
 	if (rt->redis) {
 		redis = rt->redis;
@@ -1175,7 +1225,7 @@ rspamd_redis_processed (redisAsyncContext *c, gpointer r, gpointer priv)
 				rspamd_upstream_name (rt->selected), c->errstr);
 
 		if (rt->redis) {
-			rspamd_upstream_fail (rt->selected, FALSE);
+			rspamd_upstream_fail (rt->selected, FALSE, c->errstr);
 		}
 
 		if (!rt->err) {
@@ -1293,20 +1343,17 @@ rspamd_redis_connected (redisAsyncContext *c, gpointer r, gpointer priv)
 				}
 			}
 			else {
-				if (!rt->err) {
-					g_set_error (&rt->err, rspamd_redis_stat_quark (), c->err,
-							"skip obtaining bayes tokens for %s: "
-							"not enough learns %d; %d required",
-							rt->stcf->symbol, (int)rt->learned,
-							rt->stcf->clcf->min_learns);
-				}
+				msg_warn_task ("skip obtaining bayes tokens for %s of classifier "
+							   "%s: not enough learns %d; %d required",
+						rt->stcf->symbol, rt->stcf->clcf->name,
+						(int)rt->learned, rt->stcf->clcf->min_learns);
 			}
 		}
 	}
 	else if (rt->has_event) {
 		msg_err_task ("error getting reply from redis server %s: %s",
 				rspamd_upstream_name (rt->selected), c->errstr);
-		rspamd_upstream_fail (rt->selected, FALSE);
+		rspamd_upstream_fail (rt->selected, FALSE,  c->errstr);
 
 		if (!rt->err) {
 			g_set_error (&rt->err, rspamd_redis_stat_quark (), c->err,
@@ -1337,7 +1384,7 @@ rspamd_redis_learned (redisAsyncContext *c, gpointer r, gpointer priv)
 				rspamd_upstream_name (rt->selected), c->errstr);
 
 		if (rt->redis) {
-			rspamd_upstream_fail (rt->selected, FALSE);
+			rspamd_upstream_fail (rt->selected, FALSE, c->errstr);
 		}
 
 		if (!rt->err) {
@@ -1627,7 +1674,18 @@ rspamd_redis_runtime (struct rspamd_task *task,
 	}
 
 	if (rt->redis == NULL) {
-		msg_err_task ("cannot connect redis");
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				strerror (errno));
+		return NULL;
+	}
+	else if (rt->redis->err != REDIS_OK) {
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				rt->redis->errstr);
+		redisAsyncFree (rt->redis);
+		rt->redis = NULL;
+
 		return NULL;
 	}
 
@@ -1722,7 +1780,7 @@ rspamd_redis_finalize_process (struct rspamd_task *task, gpointer runtime,
 	}
 
 	if (rt->err) {
-		msg_info_task ("cannot retreive stat tokens from Redis: %e", rt->err);
+		msg_info_task ("cannot retrieve stat tokens from Redis: %e", rt->err);
 		g_error_free (rt->err);
 		rt->err = NULL;
 
@@ -1789,7 +1847,22 @@ rspamd_redis_learn_tokens (struct rspamd_task *task, GPtrArray *tokens,
 				rspamd_inet_address_get_port (addr));
 	}
 
-	g_assert (rt->redis != NULL);
+	if (rt->redis == NULL) {
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				strerror (errno));
+
+		return FALSE;
+	}
+	else if (rt->redis->err != REDIS_OK) {
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				rt->redis->errstr);
+		redisAsyncFree (rt->redis);
+		rt->redis = NULL;
+
+		return FALSE;
+	}
 
 	redisLibevAttach (task->event_loop, rt->redis);
 	rspamd_redis_maybe_auth (rt->ctx, rt->redis);

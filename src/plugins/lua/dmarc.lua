@@ -23,8 +23,7 @@ local rspamd_url = require "rspamd_url"
 local rspamd_util = require "rspamd_util"
 local rspamd_redis = require "lua_redis"
 local lua_util = require "lua_util"
-local check_local = false
-local check_authed = false
+local auth_and_local_conf
 
 if confighelp then
   return
@@ -45,15 +44,16 @@ local report_settings = {
   smtp_port = 25,
   retries = 2,
   from_name = 'Rspamd',
+  msgid_from = 'rspamd',
 }
-local report_template = [[From: "{% from_name %}" <{% from_addr %}>
-To: {% rcpt %}
-Subject: Report Domain: {% reporting_domain %}
-	Submitter: {% submitter %}
-	Report-ID: {% report_id %}
-Date: {% report_date %}
+local report_template = [[From: "{= from_name =}" <{= from_addr =}>
+To: {= rcpt =}
+Subject: Report Domain: {= reporting_domain =}
+	Submitter: {= submitter =}
+	Report-ID: {= report_id =}
+Date: {= report_date =}
 MIME-Version: 1.0
-Message-ID: <{% message_id %}>
+Message-ID: <{= message_id =}>
 Content-Type: multipart/mixed;
 	boundary="----=_NextPart_000_024E_01CC9B0A.AFE54C00"
 
@@ -63,17 +63,17 @@ This is a multipart message in MIME format.
 Content-Type: text/plain; charset="us-ascii"
 Content-Transfer-Encoding: 7bit
 
-This is an aggregate report from {% submitter %}.
+This is an aggregate report from {= submitter =}.
 
-Report domain: {% reporting_domain %}
-Submitter: {% submitter %}
-Report ID: {% report_id %}
+Report domain: {= reporting_domain =}
+Submitter: {= submitter =}
+Report ID: {= report_id =}
 
 ------=_NextPart_000_024E_01CC9B0A.AFE54C00
 Content-Type: application/gzip
 Content-Transfer-Encoding: base64
 Content-Disposition: attachment;
-	filename="{% submitter %}!{% reporting_domain %}!{% report_start %}!{% report_end %}.xml.gz"
+	filename="{= submitter =}!{= reporting_domain =}!{= report_start =}!{= report_end =}.xml.gz"
 
 ]]
 local report_footer = [[
@@ -178,6 +178,23 @@ end
 
 local dmarc_grammar = gen_dmarc_grammar()
 
+local function dmarc_key_value_case(elts)
+  if type(elts) ~= "table" then
+    return elts
+  end
+  local result = {}
+  for k, v in pairs(elts) do
+    k = k:lower()
+    if k ~= "v" then
+      v = v:lower()
+    end
+
+    result[k] = v
+  end
+
+  return result
+end
+
 local function dmarc_report(task, spf_ok, dkim_ok, disposition,
     sampled_out, hfromdom, spfdom, dres, spf_result)
   local ip = task:get_from_ip()
@@ -228,6 +245,8 @@ local function dmarc_check_record(task, record, is_tld)
       record, is_tld, elts)
 
   if elts then
+    elts = dmarc_key_value_case(elts)
+
     local dkim_pol = elts['adkim']
     if dkim_pol then
       if dkim_pol == 's' then
@@ -559,7 +578,7 @@ local function dmarc_callback(task)
   local hfromdom = ((from or E)[1] or E).domain
   local dmarc_domain
   local ip_addr = task:get_ip()
-  local dmarc_checks = task:get_mempool():get_variable('dmarc_checks', 'int') or 0
+  local dmarc_checks = task:get_mempool():get_variable('dmarc_checks', 'double') or 0
   local seen_invalid = false
 
   if dmarc_checks ~= 2 then
@@ -567,8 +586,7 @@ local function dmarc_callback(task)
     return
   end
 
-  if ((not check_authed and task:get_user()) or
-      (not check_local and ip_addr and ip_addr:is_local())) then
+  if lua_util.is_skip_local_or_authed(task, auth_and_local_conf, ip_addr) then
     rspamd_logger.infox(task, "skip DMARC checks for local networks and authorized users")
     return
   end
@@ -709,29 +727,14 @@ local function dmarc_callback(task)
 end
 
 
-local function try_opts(where)
-  local ret = false
-  local opts = rspamd_config:get_all_opt(where)
-  if type(opts) == 'table' then
-    if type(opts['check_local']) == 'boolean' then
-      check_local = opts['check_local']
-      ret = true
-    end
-    if type(opts['check_authed']) == 'boolean' then
-      check_authed = opts['check_authed']
-      ret = true
-    end
-  end
-
-  return ret
-end
-
-if not try_opts(N) then try_opts('options') end
-
 local opts = rspamd_config:get_all_opt('dmarc')
 if not opts or type(opts) ~= 'table' then
   return
 end
+
+auth_and_local_conf = lua_util.config_check_local_or_authed(rspamd_config, N,
+    false, false)
+
 no_sampling_domains = rspamd_map_add(N, 'no_sampling_domains', 'map', 'Domains not to apply DMARC sampling to')
 no_reporting_domains = rspamd_map_add(N, 'no_reporting_domains', 'map', 'Domains not to apply DMARC reporting to')
 
@@ -912,6 +915,8 @@ if opts['reporting'] == true then
             else
               send_report_via_email(xmlf, retry + 1)
             end
+          else
+            get_reporting_domain()
           end
         end
 
@@ -941,14 +946,14 @@ if opts['reporting'] == true then
               submitter = report_settings.domain,
               report_id = report_id,
               report_date = rspamd_util.time_to_string(rspamd_util.get_time()),
-              message_id = rspamd_util.random_hex(12) .. '@rspamd',
+              message_id = rspamd_util.random_hex(16) .. '@' .. report_settings.msgid_from,
               report_start = report_start,
               report_end = report_end
             }, true)
         local message = {
-          rhead:gsub("\n", "\r\n"),
+          (rhead:gsub("\n", "\r\n")),
           encoded,
-          report_footer:gsub("\n", "\r\n")
+          (report_footer:gsub("\n", "\r\n"))
         }
 
         local lua_smtp = require "lua_smtp"
@@ -973,7 +978,7 @@ if opts['reporting'] == true then
           reporting_addr[report_settings.additional_address] = true
         end
         rspamd_logger.infox(ev_base, 'sending report for %s <%s>',
-            reporting_domain, table.concat(reporting_addr, ','))
+            reporting_domain, reporting_addr)
         local dmarc_xml = dmarc_report_xml()
         local dmarc_push_cb
         dmarc_push_cb = function(err, data)
@@ -1143,7 +1148,7 @@ if opts['reporting'] == true then
                 failed_policy = true
               elseif elts then
                 found_policy = true
-                policy = elts
+                policy = dmarc_key_value_case(elts)
               end
             end
             if not found_policy then
@@ -1390,6 +1395,13 @@ rspamd_config:register_symbol({
 })
 rspamd_config:register_symbol({
   name = dmarc_symbols['dnsfail'],
+  parent = id,
+  group = 'policies',
+  groups = {'dmarc'},
+  type = 'virtual'
+})
+rspamd_config:register_symbol({
+  name = dmarc_symbols['badpolicy'],
   parent = id,
   group = 'policies',
   groups = {'dmarc'},

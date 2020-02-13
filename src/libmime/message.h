@@ -30,13 +30,24 @@ struct rspamd_image;
 struct rspamd_archive;
 
 enum rspamd_mime_part_flags {
-	RSPAMD_MIME_PART_TEXT = (1 << 0),
 	RSPAMD_MIME_PART_ATTACHEMENT = (1 << 1),
-	RSPAMD_MIME_PART_IMAGE = (1 << 2),
-	RSPAMD_MIME_PART_ARCHIVE = (1 << 3),
 	RSPAMD_MIME_PART_BAD_CTE = (1 << 4),
-	RSPAMD_MIME_PART_MISSING_CTE = (1 << 5)
+	RSPAMD_MIME_PART_MISSING_CTE = (1 << 5),
 };
+
+enum rspamd_mime_part_type {
+	RSPAMD_MIME_PART_UNDEFINED = 0,
+	RSPAMD_MIME_PART_MULTIPART,
+	RSPAMD_MIME_PART_MESSAGE,
+	RSPAMD_MIME_PART_TEXT,
+	RSPAMD_MIME_PART_ARCHIVE,
+	RSPAMD_MIME_PART_IMAGE,
+	RSPAMD_MIME_PART_CUSTOM_LUA
+};
+
+#define IS_PART_MULTIPART(part) ((part) && ((part)->part_type == RSPAMD_MIME_PART_MULTIPART))
+#define IS_PART_TEXT(part) ((part) && ((part)->part_type == RSPAMD_MIME_PART_TEXT))
+#define IS_PART_MESSAGE(part) ((part) &&((part)->part_type == RSPAMD_MIME_PART_MESSAGE))
 
 enum rspamd_cte {
 	RSPAMD_CTE_UNKNOWN = 0,
@@ -44,6 +55,7 @@ enum rspamd_cte {
 	RSPAMD_CTE_8BIT = 2,
 	RSPAMD_CTE_QP = 3,
 	RSPAMD_CTE_B64 = 4,
+	RSPAMD_CTE_UUE = 5,
 };
 
 struct rspamd_mime_text_part;
@@ -51,6 +63,19 @@ struct rspamd_mime_text_part;
 struct rspamd_mime_multipart {
 	GPtrArray *children;
 	rspamd_ftok_t boundary;
+};
+
+enum rspamd_lua_specific_type {
+	RSPAMD_LUA_PART_TEXT,
+	RSPAMD_LUA_PART_STRING,
+	RSPAMD_LUA_PART_TABLE,
+	RSPAMD_LUA_PART_FUNCTION,
+	RSPAMD_LUA_PART_UNKNOWN,
+};
+
+struct rspamd_lua_specific_part {
+	gint cbref;
+	enum rspamd_lua_specific_type type;
 };
 
 struct rspamd_mime_part {
@@ -71,6 +96,7 @@ struct rspamd_mime_part {
 
 	enum rspamd_cte cte;
 	guint flags;
+	enum rspamd_mime_part_type part_type;
 	guint id;
 
 	union {
@@ -78,6 +104,7 @@ struct rspamd_mime_part {
 		struct rspamd_mime_text_part *txt;
 		struct rspamd_image *img;
 		struct rspamd_archive *arch;
+		struct rspamd_lua_specific_part lua_specific;
 	} specific;
 
 	guchar digest[rspamd_cryptobox_HASHBYTES];
@@ -87,7 +114,7 @@ struct rspamd_mime_part {
 #define RSPAMD_MIME_TEXT_PART_FLAG_BALANCED (1 << 1)
 #define RSPAMD_MIME_TEXT_PART_FLAG_EMPTY (1 << 2)
 #define RSPAMD_MIME_TEXT_PART_FLAG_HTML (1 << 3)
-#define RSPAMD_MIME_TEXT_PART_FLAG_8BIT (1 << 4)
+#define RSPAMD_MIME_TEXT_PART_FLAG_8BIT_RAW (1 << 4)
 #define RSPAMD_MIME_TEXT_PART_FLAG_8BIT_ENCODED (1 << 5)
 #define RSPAMD_MIME_TEXT_PART_HAS_SUBNORMAL (1 << 6)
 #define RSPAMD_MIME_TEXT_PART_NORMALISED (1 << 7)
@@ -152,6 +179,7 @@ struct rspamd_message {
 	GHashTable *emails;							/**< list of parsed emails							*/
 	struct rspamd_mime_headers_table *raw_headers;	/**< list of raw headers						*/
 	struct rspamd_mime_header *headers_order;	/**< order of raw headers							*/
+	struct rspamd_task *task;
 	GPtrArray *rcpt_mime;
 	GPtrArray *from_mime;
 	guchar digest[16];

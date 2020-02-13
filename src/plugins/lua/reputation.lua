@@ -109,9 +109,10 @@ end
 
 -- Extracts task score and subtracts score of the rule itself
 local function extract_task_score(task, rule)
-  local _,score = lua_util.get_task_verdict(task)
+  local lua_verdict = require "lua_verdict"
+  local verdict,score = lua_verdict.get_specific_verdict(N, task)
 
-  if not score then return nil end
+  if not score or verdict == 'passthrough' then return nil end
 
   return sub_symbol_score(task, rule, score)
 end
@@ -284,15 +285,15 @@ local function gen_url_queries(task, rule)
 end
 
 local function url_reputation_filter(task, rule)
-  local requests = lua_util.extract_specific_urls(task, rule.selector.config.max_urls)
+  local requests = gen_url_queries(task, rule)
   local results = {}
   local nchecked = 0
 
-  local function tokens_cb(err, token, values)
+  local function indexed_tokens_cb(err, index, values)
     nchecked = nchecked + 1
 
     if values then
-      results[token] = values
+      results[index] = values
     end
 
     if nchecked == #requests then
@@ -319,8 +320,12 @@ local function url_reputation_filter(task, rule)
     end
   end
 
-  for _,u in ipairs(requests) do
-    rule.backend.get_token(task, rule, u:get_tld(), tokens_cb)
+  for i,req in ipairs(requests) do
+    local function tokens_cb(err, token, values)
+      indexed_tokens_cb(err, i, values)
+    end
+
+    rule.backend.get_token(task, rule, req[1], tokens_cb)
   end
 end
 
@@ -865,8 +870,8 @@ local function reputation_redis_init(rule, cfg, ev_base, worker)
     local last_value = tonumber(redis.call('HGET', KEYS[1], 'v' .. '{= w.name =}'))
     local window = {= w.time =}
     -- Adjust alpha
-    local time_diff = now - last_value
-    if time_diff > 0 then
+    local time_diff = now - last
+    if time_diff < 0 then
       time_diff = 0
     end
     local alpha = 1.0 - math.exp((-time_diff) / (1000 * window))

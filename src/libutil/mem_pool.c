@@ -22,6 +22,7 @@
 #include "khash.h"
 #include "cryptobox.h"
 #include "contrib/uthash/utlist.h"
+#include "mem_pool_internal.h"
 
 #ifdef WITH_JEMALLOC
 #include <jemalloc/jemalloc.h>
@@ -55,22 +56,6 @@
  * greedy method)
  */
 #undef MEMORY_GREEDY
-
-
-#define ENTRY_LEN 128
-#define ENTRY_NELTS 64
-
-struct entry_elt {
-	guint32 fragmentation;
-	guint32 leftover;
-};
-
-struct rspamd_mempool_entry_point {
-	gchar src[ENTRY_LEN];
-	guint32 cur_suggestion;
-	guint32 cur_elts;
-	struct entry_elt elts[ENTRY_NELTS];
-};
 
 
 static inline uint32_t
@@ -233,11 +218,11 @@ rspamd_mempool_chain_new (gsize size, enum rspamd_mempool_chain_type pool_type)
 		optimal_size = sys_alloc_size (total_size);
 #endif
 		total_size = MAX (total_size, optimal_size);
-		map = malloc (total_size);
+		gint ret = posix_memalign (&map, MIN_MEM_ALIGNMENT, total_size);
 
-		if (map == NULL) {
-			g_error ("%s: failed to allocate %"G_GSIZE_FORMAT" bytes",
-					G_STRLOC, total_size);
+		if (ret != 0 || map == NULL) {
+			g_error ("%s: failed to allocate %"G_GSIZE_FORMAT" bytes: %d - %s",
+					G_STRLOC, total_size, ret, strerror (errno));
 			abort ();
 		}
 
@@ -249,7 +234,6 @@ rspamd_mempool_chain_new (gsize size, enum rspamd_mempool_chain_type pool_type)
 
 	chain->pos = align_ptr (chain->begin, MIN_MEM_ALIGNMENT);
 	chain->slice_size = total_size - sizeof (struct _pool_chain);
-	chain->lock = NULL;
 
 	return chain;
 }
@@ -268,7 +252,7 @@ rspamd_mempool_get_chain (rspamd_mempool_t * pool,
 {
 	g_assert (pool_type >= 0 && pool_type < RSPAMD_MEMPOOL_MAX);
 
-	return pool->pools[pool_type];
+	return pool->priv->pools[pool_type];
 }
 
 static void
@@ -279,7 +263,7 @@ rspamd_mempool_append_chain (rspamd_mempool_t * pool,
 	g_assert (pool_type >= 0 && pool_type < RSPAMD_MEMPOOL_MAX);
 	g_assert (chain != NULL);
 
-	LL_PREPEND (pool->pools[pool_type], chain);
+	LL_PREPEND (pool->priv->pools[pool_type], chain);
 }
 
 /**
@@ -288,7 +272,7 @@ rspamd_mempool_append_chain (rspamd_mempool_t * pool,
  * @return new memory pool object
  */
 rspamd_mempool_t *
-rspamd_mempool_new_ (gsize size, const gchar *tag, const gchar *loc)
+rspamd_mempool_new_ (gsize size, const gchar *tag, gint flags, const gchar *loc)
 {
 	rspamd_mempool_t *new_pool;
 	gpointer map;
@@ -345,18 +329,66 @@ rspamd_mempool_new_ (gsize size, const gchar *tag, const gchar *loc)
 		env_checked = TRUE;
 	}
 
-	new_pool = g_malloc0 (sizeof (rspamd_mempool_t));
-	new_pool->entry = rspamd_mempool_get_entry (loc);
-	new_pool->destructors = g_array_sized_new (FALSE, FALSE,
-			sizeof (struct _pool_destructors), 32);
-	/* Set it upon first call of set variable */
+	struct rspamd_mempool_entry_point *entry = rspamd_mempool_get_entry (loc);
+	gsize total_size;
 
-	if (size == 0) {
-		new_pool->elt_len = new_pool->entry->cur_suggestion;
+	if (size == 0 && entry) {
+		size = entry->cur_suggestion;
+	}
+
+	total_size = sizeof (rspamd_mempool_t) +
+				 sizeof (struct rspamd_mempool_specific) +
+				 MIN_MEM_ALIGNMENT +
+				 sizeof (struct _pool_chain) +
+				 size;
+
+	if (G_UNLIKELY (flags & RSPAMD_MEMPOOL_DEBUG)) {
+		total_size += sizeof (GHashTable *);
+	}
+	/*
+	 * Memory layout:
+	 * struct rspamd_mempool_t
+	 * <optional debug hash table>
+	 * struct rspamd_mempool_specific
+	 * struct _pool_chain
+	 * alignment (if needed)
+	 * memory chunk
+	 */
+	guchar *mem_chunk;
+	gint ret = posix_memalign ((void **)&mem_chunk, MIN_MEM_ALIGNMENT,
+			total_size);
+	gsize priv_offset;
+
+	if (ret != 0 || mem_chunk == NULL) {
+		g_error ("%s: failed to allocate %"G_GSIZE_FORMAT" bytes: %d - %s",
+				G_STRLOC, total_size, ret, strerror (errno));
+		abort ();
+	}
+
+	/* Set memory layout */
+	new_pool = (rspamd_mempool_t *)mem_chunk;
+	if (G_UNLIKELY (flags & RSPAMD_MEMPOOL_DEBUG)) {
+		/* Allocate debug table */
+		GHashTable *debug_tbl;
+
+		debug_tbl = g_hash_table_new (rspamd_str_hash, rspamd_str_equal);
+		memcpy (mem_chunk + sizeof (rspamd_mempool_t), &debug_tbl,
+				sizeof (GHashTable *));
+		priv_offset = sizeof (rspamd_mempool_t) + sizeof (GHashTable *);
 	}
 	else {
-		new_pool->elt_len = size;
+		priv_offset = sizeof (rspamd_mempool_t);
 	}
+
+	new_pool->priv = (struct rspamd_mempool_specific *)(mem_chunk +
+			priv_offset);
+	/* Zero memory for specific and for the first chain */
+	memset (new_pool->priv, 0, sizeof (struct rspamd_mempool_specific) +
+			sizeof (struct _pool_chain));
+
+	new_pool->priv->entry = entry;
+	new_pool->priv->elt_len = size;
+	new_pool->priv->flags = flags;
 
 	if (tag) {
 		rspamd_strlcpy (new_pool->tag.tagname, tag, sizeof (new_pool->tag.tagname));
@@ -375,17 +407,64 @@ rspamd_mempool_new_ (gsize size, const gchar *tag, const gchar *loc)
 
 	mem_pool_stat->pools_allocated++;
 
+	/* Now we can attach one chunk to speed up simple allocations */
+	struct _pool_chain *nchain;
+
+	nchain = (struct _pool_chain *)
+			(mem_chunk +
+			 priv_offset +
+			 sizeof (struct rspamd_mempool_specific));
+
+	guchar *unaligned = mem_chunk +
+						priv_offset +
+						sizeof (struct rspamd_mempool_specific) +
+						sizeof (struct _pool_chain);
+
+	nchain->slice_size = size;
+	nchain->begin = unaligned;
+	nchain->slice_size = size;
+	nchain->pos = align_ptr (unaligned, MIN_MEM_ALIGNMENT);
+	new_pool->priv->pools[RSPAMD_MEMPOOL_NORMAL] = nchain;
+	new_pool->priv->used_memory = size;
+
+	/* Adjust stats */
+	g_atomic_int_add (&mem_pool_stat->bytes_allocated,
+			(gint)size);
+	g_atomic_int_add (&mem_pool_stat->chunks_allocated, 1);
+
 	return new_pool;
 }
 
 static void *
 memory_pool_alloc_common (rspamd_mempool_t * pool, gsize size,
-						  enum rspamd_mempool_chain_type pool_type)
+						  enum rspamd_mempool_chain_type pool_type,
+						  const gchar *loc)
 RSPAMD_ATTR_ALLOC_SIZE(2) RSPAMD_ATTR_ALLOC_ALIGN(MIN_MEM_ALIGNMENT) RSPAMD_ATTR_RETURNS_NONNUL;
+
+
+void
+rspamd_mempool_notify_alloc_ (rspamd_mempool_t *pool, gsize size, const gchar *loc)
+{
+	if (pool && G_UNLIKELY (pool->priv->flags & RSPAMD_MEMPOOL_DEBUG)) {
+		GHashTable *debug_tbl = *(GHashTable **)(((guchar *)pool + sizeof (*pool)));
+		gpointer ptr;
+
+		ptr = g_hash_table_lookup (debug_tbl, loc);
+
+		if (ptr) {
+			ptr = GSIZE_TO_POINTER (GPOINTER_TO_SIZE (ptr) + size);
+		}
+		else {
+			ptr = GSIZE_TO_POINTER (size);
+		}
+
+		g_hash_table_insert (debug_tbl, (gpointer) loc, ptr);
+	}
+}
 
 static void *
 memory_pool_alloc_common (rspamd_mempool_t * pool, gsize size,
-		enum rspamd_mempool_chain_type pool_type)
+		enum rspamd_mempool_chain_type pool_type, const gchar *loc)
 {
 	guint8 *tmp;
 	struct _pool_chain *new, *cur;
@@ -393,17 +472,23 @@ memory_pool_alloc_common (rspamd_mempool_t * pool, gsize size,
 
 	if (pool) {
 		POOL_MTX_LOCK ();
+		pool->priv->used_memory += size;
+
+		if (G_UNLIKELY (pool->priv->flags & RSPAMD_MEMPOOL_DEBUG)) {
+			rspamd_mempool_notify_alloc_ (pool, size, loc);
+		}
+
 		if (always_malloc && pool_type != RSPAMD_MEMPOOL_SHARED) {
 			void *ptr;
 
 			ptr = g_malloc (size);
 			POOL_MTX_UNLOCK ();
 
-			if (pool->trash_stack == NULL) {
-				pool->trash_stack = g_ptr_array_sized_new (128);
+			if (pool->priv->trash_stack == NULL) {
+				pool->priv->trash_stack = g_ptr_array_sized_new (128);
 			}
 
-			g_ptr_array_add (pool->trash_stack, ptr);
+			g_ptr_array_add (pool->priv->trash_stack, ptr);
 
 			return ptr;
 		}
@@ -416,18 +501,22 @@ memory_pool_alloc_common (rspamd_mempool_t * pool, gsize size,
 		}
 
 		if (cur == NULL || free < size) {
+			if (free < size) {
+				pool->priv->wasted_memory += free;
+			}
+
 			/* Allocate new chain element */
-			if (pool->elt_len >= size + MIN_MEM_ALIGNMENT) {
-				pool->entry->elts[pool->entry->cur_elts].fragmentation += size;
-				new = rspamd_mempool_chain_new (pool->elt_len,
+			if (pool->priv->elt_len >= size + MIN_MEM_ALIGNMENT) {
+				pool->priv->entry->elts[pool->priv->entry->cur_elts].fragmentation += size;
+				new = rspamd_mempool_chain_new (pool->priv->elt_len,
 						pool_type);
 			}
 			else {
 				mem_pool_stat->oversized_chunks++;
 				g_atomic_int_add (&mem_pool_stat->fragmented_size,
 						free);
-				pool->entry->elts[pool->entry->cur_elts].fragmentation += free;
-				new = rspamd_mempool_chain_new (size + pool->elt_len, pool_type);
+				pool->priv->entry->elts[pool->priv->entry->cur_elts].fragmentation += free;
+				new = rspamd_mempool_chain_new (size + pool->priv->elt_len, pool_type);
 			}
 
 			/* Connect to pool subsystem */
@@ -453,39 +542,21 @@ memory_pool_alloc_common (rspamd_mempool_t * pool, gsize size,
 
 
 void *
-rspamd_mempool_alloc (rspamd_mempool_t * pool, gsize size)
+rspamd_mempool_alloc_ (rspamd_mempool_t * pool, gsize size, const gchar *loc)
 {
-	return memory_pool_alloc_common (pool, size, RSPAMD_MEMPOOL_NORMAL);
+	return memory_pool_alloc_common (pool, size, RSPAMD_MEMPOOL_NORMAL, loc);
 }
 
 void *
-rspamd_mempool_alloc_tmp (rspamd_mempool_t * pool, gsize size)
+rspamd_mempool_alloc0_ (rspamd_mempool_t * pool, gsize size, const gchar *loc)
 {
-	return memory_pool_alloc_common (pool, size, RSPAMD_MEMPOOL_TMP);
-}
-
-void *
-rspamd_mempool_alloc0 (rspamd_mempool_t * pool, gsize size)
-{
-	void *pointer = rspamd_mempool_alloc (pool, size);
-
+	void *pointer = rspamd_mempool_alloc_ (pool, size, loc);
 	memset (pointer, 0, size);
 
 	return pointer;
 }
-
 void *
-rspamd_mempool_alloc0_tmp (rspamd_mempool_t * pool, gsize size)
-{
-	void *pointer = rspamd_mempool_alloc_tmp (pool, size);
-
-	memset (pointer, 0, size);
-
-	return pointer;
-}
-
-void *
-rspamd_mempool_alloc0_shared (rspamd_mempool_t * pool, gsize size)
+rspamd_mempool_alloc0_shared_ (rspamd_mempool_t * pool, gsize size, const gchar *loc)
 {
 	void *pointer = rspamd_mempool_alloc_shared (pool, size);
 
@@ -494,14 +565,14 @@ rspamd_mempool_alloc0_shared (rspamd_mempool_t * pool, gsize size)
 }
 
 void *
-rspamd_mempool_alloc_shared (rspamd_mempool_t * pool, gsize size)
+rspamd_mempool_alloc_shared_ (rspamd_mempool_t * pool, gsize size, const gchar *loc)
 {
-	return memory_pool_alloc_common (pool, size, RSPAMD_MEMPOOL_SHARED);
+	return memory_pool_alloc_common (pool, size, RSPAMD_MEMPOOL_SHARED, loc);
 }
 
 
 gchar *
-rspamd_mempool_strdup (rspamd_mempool_t * pool, const gchar *src)
+rspamd_mempool_strdup_ (rspamd_mempool_t * pool, const gchar *src, const gchar *loc)
 {
 	gsize len;
 	gchar *newstr;
@@ -511,7 +582,7 @@ rspamd_mempool_strdup (rspamd_mempool_t * pool, const gchar *src)
 	}
 
 	len = strlen (src);
-	newstr = rspamd_mempool_alloc (pool, len + 1);
+	newstr = rspamd_mempool_alloc_ (pool, len + 1, loc);
 	memcpy (newstr, src, len);
 	newstr[len] = '\0';
 
@@ -519,7 +590,8 @@ rspamd_mempool_strdup (rspamd_mempool_t * pool, const gchar *src)
 }
 
 gchar *
-rspamd_mempool_fstrdup (rspamd_mempool_t * pool, const struct f_str_s *src)
+rspamd_mempool_fstrdup_ (rspamd_mempool_t * pool, const struct f_str_s *src,
+		const gchar *loc)
 {
 	gchar *newstr;
 
@@ -527,7 +599,7 @@ rspamd_mempool_fstrdup (rspamd_mempool_t * pool, const struct f_str_s *src)
 		return NULL;
 	}
 
-	newstr = rspamd_mempool_alloc (pool, src->len + 1);
+	newstr = rspamd_mempool_alloc_ (pool, src->len + 1, loc);
 	memcpy (newstr, src->str, src->len);
 	newstr[src->len] = '\0';
 
@@ -535,7 +607,8 @@ rspamd_mempool_fstrdup (rspamd_mempool_t * pool, const struct f_str_s *src)
 }
 
 gchar *
-rspamd_mempool_ftokdup (rspamd_mempool_t *pool, const rspamd_ftok_t *src)
+rspamd_mempool_ftokdup_ (rspamd_mempool_t *pool, const rspamd_ftok_t *src,
+		const gchar *loc)
 {
 	gchar *newstr;
 
@@ -543,7 +616,7 @@ rspamd_mempool_ftokdup (rspamd_mempool_t *pool, const rspamd_ftok_t *src)
 		return NULL;
 	}
 
-	newstr = rspamd_mempool_alloc (pool, src->len + 1);
+	newstr = rspamd_mempool_alloc_ (pool, src->len + 1, loc);
 	memcpy (newstr, src->begin, src->len);
 	newstr[src->len] = '\0';
 
@@ -557,15 +630,25 @@ rspamd_mempool_add_destructor_full (rspamd_mempool_t * pool,
 	const gchar *function,
 	const gchar *line)
 {
-	struct _pool_destructors cur;
+	struct _pool_destructors *cur;
 
 	POOL_MTX_LOCK ();
-	cur.func = func;
-	cur.data = data;
-	cur.function = function;
-	cur.loc = line;
+	cur = rspamd_mempool_alloc_ (pool, sizeof (*cur), line);
+	cur->func = func;
+	cur->data = data;
+	cur->function = function;
+	cur->loc = line;
+	cur->next = NULL;
 
-	g_array_append_val (pool->destructors, cur);
+	if (pool->priv->dtors_tail) {
+		pool->priv->dtors_tail->next = cur;
+		pool->priv->dtors_tail = cur;
+	}
+	else {
+		pool->priv->dtors_head = cur;
+		pool->priv->dtors_tail = cur;
+	}
+
 	POOL_MTX_UNLOCK ();
 }
 
@@ -576,11 +659,8 @@ rspamd_mempool_replace_destructor (rspamd_mempool_t * pool,
 	void *new_data)
 {
 	struct _pool_destructors *tmp;
-	guint i;
 
-	for (i = 0; i < pool->destructors->len; i ++) {
-		tmp = &g_array_index (pool->destructors, struct _pool_destructors, i);
-
+	LL_FOREACH (pool->priv->dtors_head, tmp) {
 		if (tmp->func == func && tmp->data == old_data) {
 			tmp->func = func;
 			tmp->data = new_data;
@@ -615,11 +695,7 @@ rspamd_mempool_adjust_entry (struct rspamd_mempool_entry_point *e)
 	sel_pos = sz[50 + jitter];
 	sel_neg = sz[4 + jitter];
 
-	if (sel_neg > 0) {
-		/* We need to increase our suggestion */
-		e->cur_suggestion *= (1 + (((double)sel_pos) / e->cur_suggestion)) * 1.5;
-	}
-	else if (-sel_neg > sel_pos) {
+	if (-sel_neg > sel_pos) {
 		/* We need to reduce current suggestion */
 		e->cur_suggestion /= (1 + (((double)-sel_neg) / e->cur_suggestion)) * 1.5;
 	}
@@ -639,25 +715,86 @@ rspamd_mempool_adjust_entry (struct rspamd_mempool_entry_point *e)
 	memset (e->elts, 0, sizeof (e->elts));
 }
 
+static void
+rspamd_mempool_variables_cleanup (rspamd_mempool_t * pool)
+{
+	if (pool->priv->variables) {
+		struct rspamd_mempool_variable *var;
+		kh_foreach_value_ptr (pool->priv->variables, var, {
+			if (var->dtor) {
+				var->dtor (var->data);
+			}
+		});
+
+		if (pool->priv->entry && pool->priv->entry->cur_vars <
+								 kh_size (pool->priv->variables)) {
+			/*
+			 * Increase preallocated size in two cases:
+			 * 1) Our previous guess was zero
+			 * 2) Our new variables count is not more than twice larger than
+			 * previous count
+			 * 3) Our variables count is less than some hard limit
+			 */
+			static const guint max_preallocated_vars = 512;
+
+			guint cur_size = kh_size (pool->priv->variables);
+			guint old_guess = pool->priv->entry->cur_vars;
+			guint new_guess;
+
+			if (old_guess == 0) {
+				new_guess = MIN (cur_size, max_preallocated_vars);
+			}
+			else {
+				if (old_guess * 2 < cur_size) {
+					new_guess = MIN (cur_size, max_preallocated_vars);
+				}
+				else {
+					/* Too large step */
+					new_guess = MIN (old_guess * 2, max_preallocated_vars);
+				}
+			}
+
+			pool->priv->entry->cur_vars = new_guess;
+		}
+
+		kh_destroy (rspamd_mempool_vars_hash, pool->priv->variables);
+		pool->priv->variables = NULL;
+	}
+}
+
 void
 rspamd_mempool_destructors_enforce (rspamd_mempool_t *pool)
 {
 	struct _pool_destructors *destructor;
-	guint i;
 
 	POOL_MTX_LOCK ();
 
-	for (i = 0; i < pool->destructors->len; i ++) {
-		destructor = &g_array_index (pool->destructors, struct _pool_destructors, i);
+	LL_FOREACH (pool->priv->dtors_head, destructor) {
 		/* Avoid calling destructors for NULL pointers */
 		if (destructor->data != NULL) {
 			destructor->func (destructor->data);
 		}
 	}
 
-	pool->destructors->len = 0;
+	pool->priv->dtors_head = pool->priv->dtors_tail = NULL;
+
+	rspamd_mempool_variables_cleanup (pool);
 
 	POOL_MTX_UNLOCK ();
+}
+
+struct mempool_debug_elt {
+	gsize sz;
+	const gchar *loc;
+};
+
+static gint
+rspamd_mempool_debug_elt_cmp (const void *a, const void *b)
+{
+	const struct mempool_debug_elt *e1 = a, *e2 = b;
+
+	/* Inverse order */
+	return (gint)((gssize)e2->sz) - ((gssize)e1->sz);
 }
 
 void
@@ -671,38 +808,85 @@ rspamd_mempool_delete (rspamd_mempool_t * pool)
 
 	POOL_MTX_LOCK ();
 
-	cur = NULL;
+	cur = pool->priv->pools[RSPAMD_MEMPOOL_NORMAL];
 
-	if (pool->pools[RSPAMD_MEMPOOL_NORMAL] != NULL) {
-		cur = pool->pools[RSPAMD_MEMPOOL_NORMAL];
+	if (G_UNLIKELY (pool->priv->flags & RSPAMD_MEMPOOL_DEBUG)) {
+		GHashTable *debug_tbl = *(GHashTable **)(((guchar *)pool) + sizeof (*pool));
+		/* Show debug info */
+		gsize ndtor = 0;
+		LL_COUNT (pool->priv->dtors_head, destructor, ndtor);
+		msg_info_pool ("destructing of the memory pool %p; elt size = %z; "
+					   "used memory = %Hz; wasted memory = %Hd; "
+					   "vars = %z; destructors = %z",
+				pool,
+				pool->priv->elt_len,
+				pool->priv->used_memory,
+				pool->priv->wasted_memory,
+				pool->priv->variables ? (gsize)kh_size (pool->priv->variables) : (gsize)0,
+				ndtor);
+
+		GHashTableIter it;
+		gpointer k, v;
+		GArray *sorted_debug_size = g_array_sized_new (FALSE, FALSE,
+				sizeof (struct mempool_debug_elt),
+				g_hash_table_size (debug_tbl));
+
+		g_hash_table_iter_init (&it, debug_tbl);
+
+		while (g_hash_table_iter_next (&it, &k, &v)) {
+			struct mempool_debug_elt e;
+			e.loc = (const gchar *)k;
+			e.sz = GPOINTER_TO_SIZE (v);
+			g_array_append_val (sorted_debug_size, e);
+		}
+
+		g_array_sort (sorted_debug_size, rspamd_mempool_debug_elt_cmp);
+
+		for (guint _i = 0; _i < sorted_debug_size->len; _i ++) {
+			struct mempool_debug_elt *e;
+
+			e = &g_array_index (sorted_debug_size, struct mempool_debug_elt, _i);
+			msg_info_pool ("allocated %Hz from %s", e->sz, e->loc);
+		}
+
+		g_array_free (sorted_debug_size, TRUE);
+		g_hash_table_unref (debug_tbl);
 	}
 
 	if (cur && mempool_entries) {
-		pool->entry->elts[pool->entry->cur_elts].leftover =
+		pool->priv->entry->elts[pool->priv->entry->cur_elts].leftover =
 				pool_chain_free (cur);
 
-		pool->entry->cur_elts = (pool->entry->cur_elts + 1) %
-				G_N_ELEMENTS (pool->entry->elts);
+		pool->priv->entry->cur_elts = (pool->priv->entry->cur_elts + 1) %
+				G_N_ELEMENTS (pool->priv->entry->elts);
 
-		if (pool->entry->cur_elts == 0) {
-			rspamd_mempool_adjust_entry (pool->entry);
+		if (pool->priv->entry->cur_elts == 0) {
+			rspamd_mempool_adjust_entry (pool->priv->entry);
 		}
 	}
 
 	/* Call all pool destructors */
-	for (i = 0; i < pool->destructors->len; i ++) {
-		destructor = &g_array_index (pool->destructors, struct _pool_destructors, i);
+	LL_FOREACH (pool->priv->dtors_head, destructor) {
 		/* Avoid calling destructors for NULL pointers */
 		if (destructor->data != NULL) {
 			destructor->func (destructor->data);
 		}
 	}
 
-	g_array_free (pool->destructors, TRUE);
+	rspamd_mempool_variables_cleanup (pool);
 
-	for (i = 0; i < G_N_ELEMENTS (pool->pools); i ++) {
-		if (pool->pools[i]) {
-			LL_FOREACH_SAFE (pool->pools[i], cur, tmp) {
+	if (pool->priv->trash_stack) {
+		for (i = 0; i < pool->priv->trash_stack->len; i++) {
+			ptr = g_ptr_array_index (pool->priv->trash_stack, i);
+			g_free (ptr);
+		}
+
+		g_ptr_array_free (pool->priv->trash_stack, TRUE);
+	}
+
+	for (i = 0; i < G_N_ELEMENTS (pool->priv->pools); i ++) {
+		if (pool->priv->pools[i]) {
+			LL_FOREACH_SAFE (pool->priv->pools[i], cur, tmp) {
 				g_atomic_int_add (&mem_pool_stat->bytes_allocated,
 						-((gint)cur->slice_size));
 				g_atomic_int_add (&mem_pool_stat->chunks_allocated, -1);
@@ -713,51 +897,18 @@ rspamd_mempool_delete (rspamd_mempool_t * pool)
 					munmap ((void *)cur, len);
 				}
 				else {
-					free (cur); /* Not g_free as we use system allocator */
+					/* The last pool is special, it is a part of the initial chunk */
+					if (cur->next != NULL) {
+						free (cur); /* Not g_free as we use system allocator */
+					}
 				}
 			}
 		}
 	}
 
-	if (pool->variables) {
-		g_hash_table_destroy (pool->variables);
-	}
-
-	if (pool->trash_stack) {
-		for (i = 0; i < pool->trash_stack->len; i++) {
-			ptr = g_ptr_array_index (pool->trash_stack, i);
-			g_free (ptr);
-		}
-
-		g_ptr_array_free (pool->trash_stack, TRUE);
-	}
-
 	g_atomic_int_inc (&mem_pool_stat->pools_freed);
 	POOL_MTX_UNLOCK ();
-	g_free (pool);
-}
-
-void
-rspamd_mempool_cleanup_tmp (rspamd_mempool_t * pool)
-{
-	struct _pool_chain *cur, *tmp;
-
-	POOL_MTX_LOCK ();
-
-	if (pool->pools[RSPAMD_MEMPOOL_TMP]) {
-		LL_FOREACH_SAFE (pool->pools[RSPAMD_MEMPOOL_TMP], cur, tmp) {
-			g_atomic_int_add (&mem_pool_stat->bytes_allocated,
-					-((gint)cur->slice_size));
-			g_atomic_int_add (&mem_pool_stat->chunks_allocated, -1);
-
-			free (cur);
-		}
-
-		pool->pools[RSPAMD_MEMPOOL_TMP] = NULL;
-	}
-
-	g_atomic_int_inc (&mem_pool_stat->pools_freed);
-	POOL_MTX_UNLOCK ();
+	free (pool); /* allocated by posix_memalign */
 }
 
 void
@@ -1003,38 +1154,88 @@ rspamd_mempool_wunlock_rwlock (rspamd_mempool_rwlock_t * lock)
 }
 #endif
 
+#define RSPAMD_MEMPOOL_VARS_HASH_SEED 0xb32ad7c55eb2e647ULL
 void
 rspamd_mempool_set_variable (rspamd_mempool_t *pool,
-	const gchar *name,
-	gpointer value,
-	rspamd_mempool_destruct_t destructor)
+							 const gchar *name,
+							 gpointer value,
+							 rspamd_mempool_destruct_t destructor)
 {
-	if (pool->variables == NULL) {
-		pool->variables = g_hash_table_new (rspamd_str_hash, rspamd_str_equal);
+	if (pool->priv->variables == NULL) {
+
+		pool->priv->variables = kh_init (rspamd_mempool_vars_hash);
+
+		if (pool->priv->entry->cur_vars > 0) {
+			/* Preallocate */
+			kh_resize (rspamd_mempool_vars_hash,
+					pool->priv->variables,
+					pool->priv->entry->cur_vars);
+		}
 	}
 
-	g_hash_table_insert (pool->variables, rspamd_mempool_strdup (pool,
-		name), value);
-	if (destructor != NULL) {
-		rspamd_mempool_add_destructor (pool, destructor, value);
+	gint hv = rspamd_cryptobox_fast_hash (name, strlen (name),
+			RSPAMD_MEMPOOL_VARS_HASH_SEED);
+	khiter_t it;
+	gint r;
+
+	it = kh_put (rspamd_mempool_vars_hash, pool->priv->variables, hv, &r);
+
+	if (it == kh_end (pool->priv->variables)) {
+		g_assert_not_reached ();
+	}
+	else {
+		struct rspamd_mempool_variable *pvar;
+
+		pvar = &kh_val (pool->priv->variables, it);
+		pvar->data = value;
+		pvar->dtor = destructor;
 	}
 }
 
 gpointer
 rspamd_mempool_get_variable (rspamd_mempool_t *pool, const gchar *name)
 {
-	if (pool->variables == NULL) {
+	if (pool->priv->variables == NULL) {
 		return NULL;
 	}
 
-	return g_hash_table_lookup (pool->variables, name);
+	khiter_t it;
+	gint hv = rspamd_cryptobox_fast_hash (name, strlen (name),
+			RSPAMD_MEMPOOL_VARS_HASH_SEED);
+
+	it = kh_get (rspamd_mempool_vars_hash, pool->priv->variables, hv);
+
+	if (it != kh_end (pool->priv->variables)) {
+		struct rspamd_mempool_variable *pvar;
+
+		pvar = &kh_val (pool->priv->variables, it);
+		return pvar->data;
+	}
+
+	return NULL;
 }
 
 void
 rspamd_mempool_remove_variable (rspamd_mempool_t *pool, const gchar *name)
 {
-	if (pool->variables != NULL) {
-		g_hash_table_remove (pool->variables, name);
+	if (pool->priv->variables != NULL) {
+		khiter_t it;
+		gint hv = rspamd_cryptobox_fast_hash (name, strlen (name),
+				RSPAMD_MEMPOOL_VARS_HASH_SEED);
+
+		it = kh_get (rspamd_mempool_vars_hash, pool->priv->variables, hv);
+
+		if (it != kh_end (pool->priv->variables)) {
+			struct rspamd_mempool_variable *pvar;
+
+			pvar = &kh_val (pool->priv->variables, it);
+
+			if (pvar->dtor) {
+				pvar->dtor (pvar->data);
+			}
+
+			kh_del (rspamd_mempool_vars_hash, pool->priv->variables, it);
+		}
 	}
 }
 
@@ -1078,4 +1279,16 @@ rspamd_mempool_glist_append (rspamd_mempool_t *pool, GList *l, gpointer p)
 	}
 
 	return l;
+}
+
+gsize
+rspamd_mempool_get_used_size (rspamd_mempool_t *pool)
+{
+	return pool->priv->used_memory;
+}
+
+gsize
+rspamd_mempool_get_wasted_size (rspamd_mempool_t *pool)
+{
+	return pool->priv->wasted_memory;
 }

@@ -46,11 +46,13 @@
 #define SET_PART_UTF(part) ((part)->flags |= RSPAMD_MIME_TEXT_PART_FLAG_UTF)
 
 static const gchar gtube_pattern_reject[] = "XJS*C4JDBQADN1.NSBN3*2IDNEN*"
-		"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
+				"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
 static const gchar gtube_pattern_add_header[] = "YJS*C4JDBQADN1.NSBN3*2IDNEN*"
-		"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
+				"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
 static const gchar gtube_pattern_rewrite_subject[] = "ZJS*C4JDBQADN1.NSBN3*2IDNEN*"
-		"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
+				"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
+static const gchar gtube_pattern_no_action[] = "AJS*C4JDBQADN1.NSBN3*2IDNEN*"
+				"GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
 struct rspamd_multipattern *gtube_matcher = NULL;
 static const guint64 words_hash_seed = 0xdeadbabe;
 
@@ -187,7 +189,9 @@ rspamd_mime_part_create_words (struct rspamd_task *task,
 			&part->utf_stripped_text,
 			tok_type, task->cfg,
 			part->exceptions,
-			NULL, NULL);
+			NULL,
+			NULL,
+			task->task_pool);
 
 
 	if (part->utf_words) {
@@ -240,7 +244,7 @@ rspamd_strip_newlines_parse (struct rspamd_task *task,
 			U8_NEXT (begin, off, pe - begin, uc);
 
 			if (uc != -1) {
-				while (p < pe) {
+				while (p < pe && off < (pe - begin)) {
 					if (IS_ZERO_WIDTH_SPACE (uc)) {
 						/* Invisible space ! */
 						task->flags |= RSPAMD_TASK_FLAG_BAD_UNICODE;
@@ -487,6 +491,12 @@ rspamd_strip_newlines_parse (struct rspamd_task *task,
 }
 
 static void
+rspamd_u_text_dtor (void *p)
+{
+	utext_close ((UText *)p);
+}
+
+static void
 rspamd_normalize_text_part (struct rspamd_task *task,
 		struct rspamd_mime_text_part *part)
 {
@@ -533,7 +543,7 @@ rspamd_normalize_text_part (struct rspamd_task *task,
 		}
 		else {
 			rspamd_mempool_add_destructor (task->task_pool,
-					(rspamd_mempool_destruct_t)utext_close,
+					rspamd_u_text_dtor,
 					&part->utf_stripped_text);
 		}
 	}
@@ -541,6 +551,8 @@ rspamd_normalize_text_part (struct rspamd_task *task,
 	rspamd_mempool_add_destructor (task->task_pool,
 			(rspamd_mempool_destruct_t) free_byte_array_callback,
 			part->utf_stripped_content);
+	rspamd_mempool_notify_alloc (task->task_pool,
+			part->utf_stripped_content->len);
 	rspamd_mempool_add_destructor (task->task_pool,
 			(rspamd_mempool_destruct_t) rspamd_ptr_array_free_hard,
 			part->newlines);
@@ -606,6 +618,16 @@ rspamd_multipattern_gtube_cb (struct rspamd_multipattern *mp,
 		gsize len,
 		void *context)
 {
+	struct rspamd_task *task = (struct rspamd_task *)context;
+
+	if (strnum > 0) {
+		if (task->cfg->enable_test_patterns) {
+			return strnum + 1;
+		}
+
+		return 0;
+	}
+
 	return strnum + 1; /* To distinguish from zero */
 }
 
@@ -629,6 +651,9 @@ rspamd_check_gtube (struct rspamd_task *task, struct rspamd_mime_text_part *part
 		rspamd_multipattern_add_pattern (gtube_matcher,
 				gtube_pattern_rewrite_subject,
 				RSPAMD_MULTIPATTERN_DEFAULT);
+		rspamd_multipattern_add_pattern (gtube_matcher,
+				gtube_pattern_no_action,
+				RSPAMD_MULTIPATTERN_DEFAULT);
 
 		g_assert (rspamd_multipattern_compile (gtube_matcher, NULL));
 	}
@@ -637,21 +662,27 @@ rspamd_check_gtube (struct rspamd_task *task, struct rspamd_mime_text_part *part
 			part->utf_content->len <= max_check_size) {
 		if ((ret = rspamd_multipattern_lookup (gtube_matcher, part->utf_content->data,
 				part->utf_content->len,
-				rspamd_multipattern_gtube_cb, NULL, NULL)) > 0) {
+				rspamd_multipattern_gtube_cb, task, NULL)) > 0) {
 
 			switch (ret) {
 			case 1:
 				act = METRIC_ACTION_REJECT;
 				break;
 			case 2:
+				g_assert (task->cfg->enable_test_patterns);
 				act = METRIC_ACTION_ADD_HEADER;
 				break;
 			case 3:
+				g_assert (task->cfg->enable_test_patterns);
 				act = METRIC_ACTION_REWRITE_SUBJECT;
+				break;
+			case 4:
+				g_assert (task->cfg->enable_test_patterns);
+				act = METRIC_ACTION_NOACTION;
 				break;
 			}
 
-			if (act != METRIC_ACTION_NOACTION) {
+			if (ret != 0) {
 				task->flags |= RSPAMD_TASK_FLAG_SKIP;
 				task->flags |= RSPAMD_TASK_FLAG_GTUBE;
 				msg_info_task (
@@ -686,71 +717,8 @@ rspamd_message_process_plain_text_part (struct rspamd_task *task,
 	rspamd_mime_text_part_maybe_convert (task, text_part);
 
 	if (text_part->utf_raw_content != NULL) {
-		/* Check for ical */
-		rspamd_ftok_t cal_ct;
-
-		/*
-		 * TODO: If we want to process more than that, we need
-		 * to create some generic framework that accepts a part
-		 * and returns a processed data
-		 */
-		RSPAMD_FTOK_ASSIGN (&cal_ct, "calendar");
-
-		if (rspamd_ftok_casecmp (&cal_ct, &text_part->mime_part->ct->subtype) == 0) {
-			lua_State *L = task->cfg->lua_state;
-			gint err_idx;
-
-			lua_pushcfunction (L, &rspamd_lua_traceback);
-			err_idx = lua_gettop (L);
-
-			/* Obtain function */
-			if (!rspamd_lua_require_function (L, "lua_ical", "ical_txt_values")) {
-				msg_err_task ("cannot require lua_ical.ical_txt_values");
-				lua_settop (L, err_idx - 1);
-
-				return FALSE;
-			}
-
-			lua_pushlstring (L, text_part->utf_raw_content->data,
-					text_part->utf_raw_content->len);
-
-			if (lua_pcall (L, 1, 1, err_idx) != 0) {
-				msg_err_task ("cannot call lua lua_ical.ical_txt_values: %s",
-						lua_tostring (L, -1));
-				lua_settop (L, err_idx - 1);
-
-				return FALSE;
-			}
-
-			if (lua_type (L, -1) == LUA_TSTRING) {
-				const char *ndata;
-				gsize nsize;
-
-				ndata = lua_tolstring (L, -1, &nsize);
-				text_part->utf_content = g_byte_array_sized_new (nsize);
-				g_byte_array_append (text_part->utf_content, ndata, nsize);
-				rspamd_mempool_add_destructor (task->task_pool,
-						(rspamd_mempool_destruct_t) free_byte_array_callback,
-						text_part->utf_content);
-			}
-			else if (lua_type (L, -1) == LUA_TNIL) {
-				msg_info_task ("cannot convert text/calendar to plain text");
-				text_part->utf_content = text_part->utf_raw_content;
-			}
-			else {
-				msg_err_task ("invalid return type when calling lua_ical.ical_txt_values: %s",
-						lua_typename (L, lua_type (L, -1)));
-				lua_settop (L, err_idx - 1);
-
-				return FALSE;
-			}
-
-			lua_settop (L, err_idx - 1);
-		}
-		else {
-			/* Just have the same content */
-			text_part->utf_content = text_part->utf_raw_content;
-		}
+		/* Just have the same content */
+		text_part->utf_content = text_part->utf_raw_content;
 	}
 	else {
 		/*
@@ -813,9 +781,10 @@ rspamd_message_process_text_part_maybe (struct rspamd_task *task,
 	gboolean found_html = FALSE, found_txt = FALSE, straight_ct = FALSE;
 	enum rspamd_action_type act;
 
-	if ((IS_CT_TEXT (mime_part->ct) && (straight_ct = TRUE)) ||
-					(mime_part->detected_type &&
-						strcmp (mime_part->detected_type, "text") == 0)) {
+	if (((mime_part->ct && (mime_part->ct->flags & RSPAMD_CONTENT_TYPE_TEXT)) &&
+		 (straight_ct = TRUE)) ||
+		(mime_part->detected_type &&
+		 strcmp (mime_part->detected_type, "text") == 0)) {
 		found_txt = TRUE;
 
 		html_tok.begin = "html";
@@ -864,7 +833,7 @@ rspamd_message_process_text_part_maybe (struct rspamd_task *task,
 	}
 
 	g_ptr_array_add (MESSAGE_FIELD (task, text_parts), text_part);
-	mime_part->flags |= RSPAMD_MIME_PART_TEXT;
+	mime_part->part_type = RSPAMD_MIME_PART_TEXT;
 	mime_part->specific.txt = text_part;
 
 	act = rspamd_check_gtube (task, text_part);
@@ -999,7 +968,7 @@ rspamd_message_from_data (struct rspamd_task *task, const guchar *start,
 			}
 			else {
 				/* Check sanity */
-				if (IS_CT_TEXT (part->ct)) {
+				if (part->ct && (part->ct->flags & RSPAMD_CONTENT_TYPE_TEXT)) {
 					RSPAMD_FTOK_FROM_STR (&srch, "application");
 
 					if (rspamd_ftok_cmp (&ct->type, &srch) == 0) {
@@ -1054,10 +1023,17 @@ rspamd_message_dtor (struct rspamd_message *msg)
 			rspamd_message_headers_unref (p->raw_headers);
 		}
 
-		if (IS_CT_MULTIPART (p->ct)) {
+		if (IS_PART_MULTIPART (p)) {
 			if (p->specific.mp->children) {
 				g_ptr_array_free (p->specific.mp->children, TRUE);
 			}
+		}
+
+		if (p->part_type == RSPAMD_MIME_PART_CUSTOM_LUA &&
+				p->specific.lua_specific.cbref != -1) {
+			luaL_unref (msg->task->cfg->lua_state,
+					LUA_REGISTRYINDEX,
+					p->specific.lua_specific.cbref);
 		}
 	}
 
@@ -1096,6 +1072,7 @@ rspamd_message_new (struct rspamd_task *task)
 
 	msg->parts = g_ptr_array_sized_new (4);
 	msg->text_parts = g_ptr_array_sized_new (2);
+	msg->task = task;
 
 	REF_INIT_RETAIN (msg, rspamd_message_dtor);
 
@@ -1361,7 +1338,7 @@ rspamd_message_process (struct rspamd_task *task)
 	guint tw, *ptw, dw;
 	struct rspamd_mime_part *part;
 	lua_State *L = NULL;
-	gint func_pos = -1;
+	gint magic_func_pos = -1, content_func_pos = -1, old_top = -1, funcs_top = -1;
 
 	if (task->cfg) {
 		L = task->cfg->lua_state;
@@ -1369,20 +1346,38 @@ rspamd_message_process (struct rspamd_task *task)
 
 	rspamd_archives_process (task);
 
+	if (L) {
+		old_top = lua_gettop (L);
+	}
+
 	if (L && rspamd_lua_require_function (L,
 			"lua_magic", "detect_mime_part")) {
-		func_pos = lua_gettop (L);
+		magic_func_pos = lua_gettop (L);
 	}
 	else {
 		msg_err_task ("cannot require lua_magic.detect_mime_part");
 	}
 
+	if (L && rspamd_lua_require_function (L,
+			"lua_content", "maybe_process_mime_part")) {
+		content_func_pos = lua_gettop (L);
+	}
+	else {
+		msg_err_task ("cannot require lua_content.maybe_process_mime_part");
+	}
+
+	if (L) {
+		funcs_top = lua_gettop (L);
+	}
+
 	PTR_ARRAY_FOREACH (MESSAGE_FIELD (task, parts), i, part) {
-		if (func_pos != -1 && part->parsed_data.len > 0) {
+		if (magic_func_pos != -1 && part->parsed_data.len > 0) {
 			struct rspamd_mime_part **pmime;
 			struct rspamd_task **ptask;
 
-			lua_pushvalue (L, func_pos);
+			lua_pushcfunction (L, &rspamd_lua_traceback);
+			gint err_idx = lua_gettop (L);
+			lua_pushvalue (L, magic_func_pos);
 			pmime = lua_newuserdata (L, sizeof (struct rspamd_mime_part *));
 			rspamd_lua_setclass (L, "rspamd{mimepart}", -1);
 			*pmime = part;
@@ -1390,7 +1385,7 @@ rspamd_message_process (struct rspamd_task *task)
 			rspamd_lua_setclass (L, "rspamd{task}", -1);
 			*ptask = task;
 
-			if (lua_pcall (L, 2, 2, 0) != 0) {
+			if (lua_pcall (L, 2, 2, err_idx) != 0) {
 				msg_err_task ("cannot detect type: %s", lua_tostring (L, -1));
 			}
 			else {
@@ -1430,14 +1425,39 @@ rspamd_message_process (struct rspamd_task *task)
 				}
 			}
 
-			lua_settop (L, func_pos);
+			lua_settop (L, funcs_top);
 		}
 
-		rspamd_message_process_text_part_maybe (task, part);
+		/* Now detect content */
+		if (content_func_pos != -1 && part->parsed_data.len > 0 &&
+			part->part_type == RSPAMD_MIME_PART_UNDEFINED) {
+			struct rspamd_mime_part **pmime;
+			struct rspamd_task **ptask;
+
+			lua_pushcfunction (L, &rspamd_lua_traceback);
+			gint err_idx = lua_gettop (L);
+			lua_pushvalue (L, content_func_pos);
+			pmime = lua_newuserdata (L, sizeof (struct rspamd_mime_part *));
+			rspamd_lua_setclass (L, "rspamd{mimepart}", -1);
+			*pmime = part;
+			ptask = lua_newuserdata (L, sizeof (struct rspamd_task *));
+			rspamd_lua_setclass (L, "rspamd{task}", -1);
+			*ptask = task;
+
+			if (lua_pcall (L, 2, 0, err_idx) != 0) {
+				msg_err_task ("cannot detect content: %s", lua_tostring (L, -1));
+			}
+
+			lua_settop (L, funcs_top);
+		}
+
+		if (part->part_type == RSPAMD_MIME_PART_UNDEFINED) {
+			rspamd_message_process_text_part_maybe (task, part);
+		}
 	}
 
-	if (func_pos != -1) {
-		lua_settop (L, func_pos - 1);
+	if (old_top != -1) {
+		lua_settop (L, old_top);
 	}
 
 	/* Calculate average words length and number of short words */

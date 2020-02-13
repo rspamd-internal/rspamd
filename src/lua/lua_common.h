@@ -231,7 +231,7 @@ struct rspamd_lua_ip *lua_check_ip (lua_State *L, gint pos);
 struct rspamd_lua_text *lua_check_text (lua_State *L, gint pos);
 /* Creates and *pushes* new rspamd text, data is copied if  RSPAMD_TEXT_FLAG_OWN is in flags*/
 struct rspamd_lua_text *lua_new_text (lua_State *L, const gchar *start,
-		gsize len, guint flags);
+		gsize len, gboolean own);
 
 struct rspamd_lua_regexp *lua_check_regexp (lua_State *L, gint pos);
 
@@ -345,6 +345,8 @@ void luaopen_udp (lua_State *L);
 void luaopen_worker (lua_State *L);
 
 void luaopen_kann (lua_State *L);
+
+void luaopen_spf (lua_State *L);
 
 void rspamd_lua_dostring (const gchar *line);
 
@@ -556,6 +558,13 @@ enum rspamd_lua_words_type {
  */
 gint rspamd_lua_push_words (lua_State *L, GArray *words,
 							enum rspamd_lua_words_type how);
+
+/**
+ * Returns newly allocated name for caller module name
+ * @param L
+ * @return
+ */
+gchar *rspamd_lua_get_module_name (lua_State *L);
 
 /* Paths defs */
 #define RSPAMD_CONFDIR_INDEX "CONFDIR"

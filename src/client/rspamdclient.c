@@ -15,8 +15,8 @@
  */
 #include "rspamdclient.h"
 #include "libutil/util.h"
-#include "libutil/http_connection.h"
-#include "libutil/http_private.h"
+#include "libserver/http/http_connection.h"
+#include "libserver/http/http_private.h"
 #include "libserver/protocol_internal.h"
 #include "unix-std.h"
 #include "contrib/zstd/zstd.h"
@@ -187,7 +187,7 @@ rspamd_client_finish_handler (struct rspamd_http_connection *conn,
 
 					if (zout.pos == zout.size) {
 						/* We need to extend output buffer */
-						zout.size = zout.size * 1.5 + 1.0;
+						zout.size = zout.size * 2;
 						zout.dst = g_realloc (zout.dst, zout.size);
 					}
 				}
@@ -324,6 +324,7 @@ rspamd_client_command (struct rspamd_client_connection *conn,
 	gsize dict_len = 0;
 	void *dict = NULL;
 	ZSTD_CCtx *zctx;
+	gboolean ret;
 
 	req = g_malloc0 (sizeof (struct rspamd_client_request));
 	req->conn = conn;
@@ -457,16 +458,16 @@ rspamd_client_command (struct rspamd_client_connection *conn,
 	conn->start_time = rspamd_get_ticks (FALSE);
 
 	if (compressed) {
-		rspamd_http_connection_write_message (conn->http_conn, req->msg, NULL,
-				"application/x-compressed", req,
+		ret = rspamd_http_connection_write_message (conn->http_conn, req->msg,
+				NULL,"application/x-compressed", req,
 				conn->timeout);
 	}
 	else {
-		rspamd_http_connection_write_message (conn->http_conn, req->msg, NULL,
-				"text/plain", req, conn->timeout);
+		ret = rspamd_http_connection_write_message (conn->http_conn, req->msg,
+				NULL,"text/plain", req, conn->timeout);
 	}
 
-	return TRUE;
+	return ret;
 }
 
 void

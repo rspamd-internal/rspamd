@@ -141,7 +141,17 @@ context("Selectors test", function()
 
     ["received by hostname"] = {
                 selector = "received:by_hostname",
-                expect = {{"server.chat-met-vreemden.nl"}}},
+                expect = {{"server1.chat-met-vreemden.nl", "server2.chat-met-vreemden.nl"}}},
+
+    ["received by hostname last"] = {
+      selector = "received:by_hostname.last",
+      expect = {"server2.chat-met-vreemden.nl"}
+    },
+
+    ["received by hostname first"] = {
+      selector = "received:by_hostname.first",
+      expect = {"server1.chat-met-vreemden.nl"}
+    },
 
     ["urls"] = {
                 selector = "urls",
@@ -149,7 +159,7 @@ context("Selectors test", function()
 
     ["emails"] = {
                 selector = "emails",
-                expect = {{"mailto://test@example.net"}}},
+                expect = {{"test@example.net"}}},
 
     ["specific_urls"] = {
       selector = "specific_urls({limit = 1})",
@@ -157,11 +167,11 @@ context("Selectors test", function()
 
     ["specific_urls + emails"] = {
       selector = "specific_urls({need_emails = true, limit = 2})",
-      expect = {{"http://example.net", "mailto://test@example.net"}}},
+      expect = {{"test@example.net", "http://example.net"}}},
 
     ["specific_urls + emails limit"] = {
       selector = "specific_urls({need_emails = true, limit = 1})",
-      expect = {{"mailto://test@example.net"}}},
+      expect = {{"test@example.net"}}},
 
     ["pool_var str, default type"] = {
                 selector = [[pool_var("str_var")]],
@@ -247,6 +257,10 @@ context("Selectors test", function()
                 selector = "rcpts.nth(2).lower",
                 expect = {'no-one@example.com'}},
 
+    ["transformation last"] = {
+      selector = "rcpts.last.lower",
+      expect = {'no-one@example.com'}},
+
     ["transformation substring"] = {
                 selector = "header(Subject, strong).substring(6)",
                 expect = {'subject'}},
@@ -291,6 +305,14 @@ context("Selectors test", function()
       selector = "words('full'):2",
       expect = {{'hello', 'world', '', 'mail', 'me'}}
     },
+    ["header X-Test first"] = {
+      selector = "header(X-Test, full).first",
+      expect = {"1"}
+    },
+    ["header X-Test last"] = {
+      selector = "header(X-Test, full).last",
+      expect = {"3"}
+    },
   }
 
   for case_name, case in pairs(cases) do
@@ -305,8 +327,12 @@ end)
 
 --[=========[ *******************  message  ******************* ]=========]
 msg = [[
-Received: from ca-18-193-131.service.infuturo.it ([151.18.193.131] helo=User)
-    by server.chat-met-vreemden.nl with esmtpa (Exim 4.76)
+Received: from ca-18-193-131.service1.infuturo.it ([151.18.193.131] helo=User)
+    by server1.chat-met-vreemden.nl with esmtpa (Exim 4.76)
+    (envelope-from <upwest201diana@outlook.com>)
+    id 1ZC1sl-0006b4-TU; Mon, 06 Jul 2015 10:36:08 +0200
+Received: from ca-18-193-131.service2.infuturo.it ([151.18.193.132] helo=User)
+    by server2.chat-met-vreemden.nl with esmtpa (Exim 4.76)
     (envelope-from <upwest201diana@outlook.com>)
     id 1ZC1sl-0006b4-TU; Mon, 06 Jul 2015 10:36:08 +0200
 From: <whoknows@nowhere.com>
@@ -314,6 +340,9 @@ To: <nobody@example.com>, <no-one@example.com>
 Date: Wed, 19 Sep 2018 14:36:51 +0100 (BST)
 subject: Second, lower-cased header subject
 Subject: Test subject
+X-Test: 1
+X-Test: 2
+X-Test: 3
 Content-Type: multipart/alternative;
     boundary="_000_6be055295eab48a5af7ad4022f33e2d0_"
 

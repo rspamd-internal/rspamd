@@ -423,7 +423,7 @@ lua_worker_add_control_handler (lua_State *L)
 		}
 
 		rspamd_mempool_t *pool = rspamd_mempool_new (
-				rspamd_mempool_suggest_size (), "lua_control");
+				rspamd_mempool_suggest_size (), "lua_control", 0);
 		cbd = rspamd_mempool_alloc0 (pool, sizeof (*cbd));
 		cbd->pool = pool;
 		cbd->event_loop = event_loop;
@@ -817,7 +817,7 @@ lua_worker_spawn_process (lua_State *L)
 		gint rc;
 		gchar inbuf[4];
 
-		rspamd_log_update_pid (w->cf->type, w->srv->logger);
+		rspamd_log_on_fork (w->cf->type, w->srv->cfg, w->srv->logger);
 		rc = ottery_init (w->srv->cfg->libs_ctx->ottery_cfg);
 
 		if (rc != OTTERY_ERR_NONE) {
@@ -841,7 +841,8 @@ lua_worker_spawn_process (lua_State *L)
 		/* Wait for parent to reply and exit */
 		rc = read (cbdata->sp[1], inbuf, sizeof (inbuf));
 
-		if (memcmp (inbuf, "\0\0\0\0", 4) == 0) {
+		if (rc >= sizeof (inbuf) &&
+			memcmp (inbuf, "\0\0\0\0", sizeof (inbuf)) == 0) {
 			exit (EXIT_SUCCESS);
 		}
 		else {

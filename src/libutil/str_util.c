@@ -27,6 +27,8 @@
 #endif
 #include <math.h>
 
+#include "contrib/fastutf8/fastutf8.h"
+
 const guchar lc_map[256] = {
 		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
 		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
@@ -1578,21 +1580,13 @@ rspamd_substring_preprocess_kmp (const gchar *pat, gsize len, goffset *fsm,
 }
 
 static inline goffset
-rspamd_substring_search_common (const gchar *in, gsize inlen,
-		const gchar *srch, gsize srchlen, rspamd_cmpchar_func_t f)
+rspamd_substring_search_preprocessed (const gchar *in, gsize inlen,
+								const gchar *srch,
+								gsize srchlen,
+								const goffset *fsm,
+								rspamd_cmpchar_func_t f)
 {
-	static goffset st_fsm[128];
-	goffset *fsm;
-	goffset i, j, k, ell, ret = -1;
-
-	if (G_LIKELY (srchlen < G_N_ELEMENTS (st_fsm))) {
-		fsm = st_fsm;
-	}
-	else {
-		fsm = g_malloc ((srchlen + 1) * sizeof (*fsm));
-	}
-
-	rspamd_substring_preprocess_kmp (srch, srchlen, fsm, f);
+	goffset i, j, k, ell;
 
 	for (ell = 1; f(srch[ell - 1], srch[ell]); ell++) {}
 	if (ell == srchlen) {
@@ -1614,8 +1608,7 @@ rspamd_substring_search_common (const gchar *in, gsize inlen,
 			}
 
 			if (k >= ell) {
-				ret = j;
-				goto out;
+				return j;
 			}
 		}
 
@@ -1635,7 +1628,26 @@ rspamd_substring_search_common (const gchar *in, gsize inlen,
 		}
 	}
 
-out:
+	return -1;
+}
+
+static inline goffset
+rspamd_substring_search_common (const gchar *in, gsize inlen,
+		const gchar *srch, gsize srchlen, rspamd_cmpchar_func_t f)
+{
+	static goffset st_fsm[128];
+	goffset *fsm, ret;
+
+	if (G_LIKELY (srchlen < G_N_ELEMENTS (st_fsm))) {
+		fsm = st_fsm;
+	}
+	else {
+		fsm = g_malloc ((srchlen + 1) * sizeof (*fsm));
+	}
+
+	rspamd_substring_preprocess_kmp (srch, srchlen, fsm, f);
+	ret = rspamd_substring_search_preprocessed (in, inlen, srch, srchlen, fsm, f);
+
 	if (G_UNLIKELY (srchlen >= G_N_ELEMENTS (st_fsm))) {
 		g_free (fsm);
 	}
@@ -2188,6 +2200,152 @@ decode:
 	return (o - out);
 }
 
+gssize
+rspamd_decode_uue_buf (const gchar *in, gsize inlen,
+					  gchar *out, gsize outlen)
+{
+	gchar *o, *out_end;
+	const gchar *p;
+	gssize remain;
+	gboolean base64 = FALSE;
+	goffset pos;
+	const gchar *nline = "\r\n";
+
+	p = in;
+	o = out;
+	out_end = out + outlen;
+	remain = inlen;
+
+	/* Skip newlines */
+#define SKIP_NEWLINE do { while (remain > 0 && (*p == '\n' || *p == '\r')) {p ++; remain --; } } while (0)
+	SKIP_NEWLINE;
+
+	/* First of all, we need to read the first line (and probably skip it) */
+	if (remain < sizeof ("begin-base64 ")) {
+		/* Obviously truncated */
+		return -1;
+	}
+
+	if (memcmp (p, "begin ", sizeof ("begin ") - 1) == 0) {
+		p += sizeof ("begin ") - 1;
+		remain -= sizeof ("begin ") - 1;
+
+		pos = rspamd_memcspn (p, nline, remain);
+	}
+	else if (memcmp (p, "begin-base64 ", sizeof ("begin-base64 ") - 1) == 0) {
+		base64 = TRUE;
+		p += sizeof ("begin-base64 ") - 1;
+		remain -= sizeof ("begin-base64 ") - 1;
+		pos = rspamd_memcspn (p, nline, remain);
+	}
+	else {
+		/* Crap */
+		return (-1);
+	}
+
+	if (pos == -1 || remain == 0) {
+		/* Crap */
+		return (-1);
+	}
+
+#define	DEC(c)	(((c) - ' ') & 077)		/* single character decode */
+#define IS_DEC(c) ( (((c) - ' ') >= 0) && (((c) - ' ') <= 077 + 1) )
+#define CHAR_OUT(c) do { if (o < out_end) { *o++ = c; } else { return (-1); } } while(0)
+
+	remain -= pos;
+	p = p + pos;
+	SKIP_NEWLINE;
+
+	if (base64) {
+		if (!rspamd_cryptobox_base64_decode (p,
+				remain,
+				out, &outlen)) {
+			return (-1);
+		}
+
+		return outlen;
+	}
+
+	while (remain > 0 && o < out_end) {
+		/* Main cycle */
+		const gchar *eol;
+		gint i, ch;
+
+		pos = rspamd_memcspn (p, nline, remain);
+
+		if (pos == 0) {
+			/* Skip empty lines */
+			SKIP_NEWLINE;
+
+			if (remain == 0) {
+				break;
+			}
+		}
+
+		eol = p + pos;
+		remain -= eol - p;
+
+		if ((i = DEC(*p)) <= 0) {
+			/* Last pos */
+			break;
+		}
+
+		/* i can be less than eol - p, it means uue padding which we ignore */
+		for (++p; i > 0 && p < eol; p += 4, i -= 3) {
+			if (i >= 3 && p + 3 < eol) {
+				/* Process 4 bytes of input */
+				if (!IS_DEC(*p)) {
+					return (-1);
+				}
+				if (!IS_DEC(*(p + 1))) {
+					return (-1);
+				}
+				if (!IS_DEC(*(p + 2))) {
+					return (-1);
+				}
+				if (!IS_DEC(*(p + 3))) {
+					return (-1);
+				}
+				ch = DEC(p[0]) << 2 | DEC(p[1]) >> 4;
+				CHAR_OUT(ch);
+				ch = DEC(p[1]) << 4 | DEC(p[2]) >> 2;
+				CHAR_OUT(ch);
+				ch = DEC(p[2]) << 6 | DEC(p[3]);
+				CHAR_OUT(ch);
+			}
+			else {
+				if (i >= 1 && p + 1 < eol) {
+					if (!IS_DEC(*p)) {
+						return (-1);
+					}
+					if (!IS_DEC(*(p + 1))) {
+						return (-1);
+					}
+
+					ch = DEC(p[0]) << 2 | DEC(p[1]) >> 4;
+					CHAR_OUT(ch);
+				}
+				if (i >= 2 && p + 2 < eol) {
+					if (!IS_DEC(*(p + 1))) {
+						return (-1);
+					}
+					if (!IS_DEC(*(p + 2))) {
+						return (-1);
+					}
+
+					ch = DEC(p[1]) << 4 | DEC(p[2]) >> 2;
+					CHAR_OUT(ch);
+				}
+			}
+		}
+		/* Skip newline */
+		p = eol;
+		SKIP_NEWLINE;
+	}
+
+	return (o - out);
+}
+
 #define BITOP(a,b,op) \
 		((a)[(gsize)(b)/(8*sizeof *(a))] op (gsize)1<<((gsize)(b)%(8*sizeof *(a))))
 
@@ -2725,7 +2883,7 @@ rspamd_str_regexp_escape (const gchar *pattern, gsize slen,
 	gsize len;
 	static const gchar hexdigests[16] = "0123456789abcdef";
 
-	len = slen;
+	len = 0;
 	p = pattern;
 
 	/* [-[\]{}()*+?.,\\^$|#\s] need to be escaped */
@@ -2776,18 +2934,15 @@ rspamd_str_regexp_escape (const gchar *pattern, gsize slen,
 	}
 
 	if (flags & RSPAMD_REGEXP_ESCAPE_UTF) {
-		if (!g_utf8_validate (pattern, slen, NULL)) {
-			tmp_utf = rspamd_str_make_utf_valid (pattern, slen, NULL);
+		if (rspamd_fast_utf8_validate (pattern, slen) != 0) {
+			tmp_utf = rspamd_str_make_utf_valid (pattern, slen, NULL, NULL);
 		}
 	}
 
-	if (slen == len) {
+	if (len == 0) {
+		/* No need to escape anything */
+
 		if (dst_len) {
-
-			if (tmp_utf) {
-				slen = strlen (tmp_utf);
-			}
-
 			*dst_len = slen;
 		}
 
@@ -2799,10 +2954,12 @@ rspamd_str_regexp_escape (const gchar *pattern, gsize slen,
 		}
 	}
 
+	/* Escape logic */
 	if (tmp_utf) {
 		pattern = tmp_utf;
 	}
 
+	len = slen + len;
 	res = g_malloc (len + 1);
 	p = pattern;
 	d = res;
@@ -2895,61 +3052,117 @@ rspamd_str_regexp_escape (const gchar *pattern, gsize slen,
 
 
 gchar *
-rspamd_str_make_utf_valid (const guchar *src, gsize slen, gsize *dstlen)
+rspamd_str_make_utf_valid (const guchar *src, gsize slen,
+		gsize *dstlen,
+		rspamd_mempool_t *pool)
 {
-	GString *dst;
-	const gchar *last;
-	gchar *dchar;
-	gsize valid, prev;
 	UChar32 uc;
-	gint32 i;
+	goffset err_offset;
+	const guchar *p;
+	gchar *dst, *d;
+	gsize remain = slen, dlen = 0;
 
 	if (src == NULL) {
 		return NULL;
 	}
 
 	if (slen == 0) {
-		slen = strlen (src);
+		if (dstlen) {
+			*dstlen = 0;
+		}
+
+		return pool ? rspamd_mempool_strdup (pool, "") : g_strdup ("");
 	}
 
-	dst = g_string_sized_new (slen);
-	i = 0;
-	last = src;
-	valid = 0;
-	prev = 0;
+	p = src;
+	dlen = slen + 1; /* As we add '\0' */
 
-	while (i < slen) {
-		U8_NEXT (src, i, slen, uc);
+	/* Check space required */
+	while (remain > 0 && (err_offset = rspamd_fast_utf8_validate (p, remain)) > 0) {
+		gint i = 0;
 
-		if (uc <= 0) {
-			if (valid > 0) {
-				g_string_append_len (dst, last, valid);
+		err_offset --; /* As it returns it 1 indexed */
+		p += err_offset;
+		remain -= err_offset;
+		dlen += err_offset;
+
+		/* Each invalid character of input requires 3 bytes of output (+2 bytes) */
+		while (i < remain) {
+			U8_NEXT (p, i, remain, uc);
+
+			if (uc < 0) {
+				dlen += 2;
 			}
-			/* 0xFFFD in UTF8 */
-			g_string_append_len (dst, "\357\277\275", 3);
-			valid = 0;
-			last = &src[i];
-		}
-		else {
-			valid += i - prev;
+			else {
+				break;
+			}
 		}
 
-		prev = i;
+		p += i;
+		remain -= i;
 	}
 
-	if (valid > 0) {
-		g_string_append_len (dst, last, valid);
+	if (pool) {
+		dst = rspamd_mempool_alloc (pool, dlen + 1);
+	}
+	else {
+		dst = g_malloc (dlen + 1);
 	}
 
-	dchar = dst->str;
+	p = src;
+	d = dst;
+	remain = slen;
+
+	while (remain > 0 && (err_offset = rspamd_fast_utf8_validate (p, remain)) > 0) {
+		/* Copy valid */
+		err_offset --; /* As it returns it 1 indexed */
+		memcpy (d, p, err_offset);
+		d += err_offset;
+
+		/* Append 0xFFFD for each bad character */
+		gint i = 0;
+
+		p += err_offset;
+		remain -= err_offset;
+
+		while (i < remain) {
+			gint old_i = i;
+			U8_NEXT (p, i, remain, uc);
+
+			if (uc < 0) {
+				*d++ = '\357';
+				*d++ = '\277';
+				*d++ = '\275';
+			}
+			else {
+				/* Adjust p and remaining stuff and go to the outer cycle */
+				i = old_i;
+				break;
+			}
+		}
+		/*
+		 * Now p is the first valid utf8 character and remain is the rest of the string
+		 * so we can continue our loop
+		 */
+		p += i;
+		remain -= i;
+	}
+
+	if (err_offset == 0 && remain > 0) {
+		/* Last piece */
+		memcpy (d, p, remain);
+		d += remain;
+	}
+
+	/* Last '\0' */
+	g_assert (dlen > d - dst);
+	*d = '\0';
 
 	if (dstlen) {
-		*dstlen = dst->len;
+		*dstlen = d - dst;
 	}
 
-	g_string_free (dst, FALSE);
-
-	return dchar;
+	return dst;
 }
 
 gsize
@@ -3111,4 +3324,75 @@ rspamd_string_len_split (const gchar *in, gsize len, const gchar *spill,
 	}
 
 	return res;
+}
+
+#if defined(__x86_64__)
+#include <x86intrin.h>
+#endif
+
+static inline gboolean
+rspamd_str_has_8bit_u64 (const guchar *beg, gsize len)
+{
+	guint8 orb = 0;
+
+	if (len >= 16) {
+		const guchar *nextd = beg+8;
+		guint64 n1 = 0, n2 = 0;
+
+		do {
+			n1 |= *(const guint64 *)beg;
+			n2 |= *(const guint64 *)nextd;
+			beg += 16;
+			nextd += 16;
+			len -= 16;
+		} while (len >= 16);
+
+		/*
+		 * Idea from Benny Halevy <bhalevy@scylladb.com>
+		 * - 7-th bit set   ==> orb = !(non-zero) - 1 = 0 - 1 = 0xFF
+		 * - 7-th bit clear ==> orb = !0 - 1          = 1 - 1 = 0x00
+		 */
+		orb = !((n1 | n2) & 0x8080808080808080ULL) - 1;
+	}
+
+	while (len--) {
+		orb |= *beg++;
+	}
+
+	return orb >= 0x80;
+}
+
+gboolean
+rspamd_str_has_8bit (const guchar *beg, gsize len)
+{
+#if defined(__x86_64__)
+	if (len >= 32) {
+		const uint8_t *nextd = beg + 16;
+
+		__m128i n1 = _mm_set1_epi8 (0), n2;
+
+		n2 = n1;
+
+		while (len >= 32) {
+			__m128i xmm1 = _mm_loadu_si128 ((const __m128i *)beg);
+			__m128i xmm2 = _mm_loadu_si128 ((const __m128i *)nextd);
+
+			n1 = _mm_or_si128 (n1, xmm1);
+			n2 = _mm_or_si128 (n2, xmm2);
+
+			beg += 32;
+			nextd += 32;
+			len -= 32;
+		}
+
+		n1 = _mm_or_si128 (n1, n2);
+
+		/* We assume 2 complement here */
+		if (_mm_movemask_epi8 (n1)) {
+			return TRUE;
+		}
+	}
+#endif
+
+	return rspamd_str_has_8bit_u64 (beg, len);
 }

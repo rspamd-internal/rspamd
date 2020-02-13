@@ -15,7 +15,7 @@
  */
 #include "lua_common.h"
 #include "lua_thread_pool.h"
-#include "libutil/ssl_util.h"
+#include "libserver/ssl_util.h"
 #include "utlist.h"
 #include "unix-std.h"
 #include <math.h>
@@ -396,7 +396,7 @@ lua_tcp_shift_handler (struct lua_tcp_cbdata *cbd)
 	}
 
 	if (hdl->type == LUA_WANT_READ) {
-		msg_debug_tcp ("switch from read handler");
+		msg_debug_tcp ("switch from read handler %d", hdl->h.r.cbref);
 		if (hdl->h.r.cbref && hdl->h.r.cbref != -1) {
 			luaL_unref (cbd->cfg->lua_state, LUA_REGISTRYINDEX, hdl->h.r.cbref);
 		}
@@ -406,7 +406,7 @@ lua_tcp_shift_handler (struct lua_tcp_cbdata *cbd)
 		}
 	}
 	else if (hdl->type == LUA_WANT_WRITE) {
-		msg_debug_tcp ("switch from write handler");
+		msg_debug_tcp ("switch from write handler %d", hdl->h.r.cbref);
 		if (hdl->h.w.cbref && hdl->h.w.cbref != -1) {
 			luaL_unref (cbd->cfg->lua_state, LUA_REGISTRYINDEX, hdl->h.w.cbref);
 		}
@@ -535,6 +535,7 @@ lua_tcp_push_error (struct lua_tcp_cbdata *cbd, gboolean is_fatal,
 	gint cbref, top;
 	struct lua_callback_state cbs;
 	lua_State *L;
+	gboolean callback_called = FALSE;
 
 	if (cbd->thread) {
 		va_start (ap, err);
@@ -591,13 +592,24 @@ lua_tcp_push_error (struct lua_tcp_cbdata *cbd, gboolean is_fatal,
 			lua_settop (L, top);
 
 			TCP_RELEASE (cbd);
+
+			callback_called = TRUE;
 		}
 
 		if (!is_fatal) {
-			/* Stop on the first callback found */
-			break;
+			if (callback_called) {
+				/* Stop on the first callback found */
+				break;
+			}
+			else {
+				/* Shift to another callback to inform about non fatal error */
+				msg_debug_tcp ("non fatal error find matching callback");
+				lua_tcp_shift_handler (cbd);
+				continue;
+			}
 		}
 		else {
+			msg_debug_tcp ("fatal error rollback all handlers");
 			lua_tcp_shift_handler (cbd);
 		}
 	}
@@ -726,7 +738,8 @@ lua_tcp_resume_thread (struct lua_tcp_cbdata *cbd, const guint8 *str, gsize len)
 	}
 
 	lua_tcp_shift_handler (cbd);
-	lua_thread_pool_set_running_entry (cbd->cfg->lua_thread_pool, cbd->thread);
+	lua_thread_pool_set_running_entry (cbd->cfg->lua_thread_pool,
+			cbd->thread);
 
 	if (cbd->item) {
 		rspamd_symcache_set_cur_item (cbd->task, cbd->item);
@@ -841,13 +854,18 @@ lua_tcp_write_helper (struct lua_tcp_cbdata *cbd)
 
 	if (r == -1) {
 		if (!(cbd->ssl_conn)) {
-			lua_tcp_push_error (cbd, FALSE,
-					"IO write error while trying to write %d bytes: %s",
-					(gint) remain, strerror (errno));
-			if (!IS_SYNC (cbd)) {
-				/* sync connection methods perform this inside */
-				lua_tcp_shift_handler (cbd);
-				lua_tcp_plan_handler_event (cbd, TRUE, FALSE);
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+				msg_debug_tcp ("got temporary failure, retry write");
+				lua_tcp_plan_handler_event (cbd, TRUE, TRUE);
+				return;
+			}
+			else {
+				lua_tcp_push_error (cbd, TRUE,
+						"IO write error while trying to write %d bytes: %s",
+						(gint) remain, strerror (errno));
+
+				msg_debug_tcp ("write error, terminate connection");
+				TCP_RELEASE (cbd);
 			}
 		}
 
@@ -1001,7 +1019,7 @@ lua_tcp_process_read (struct lua_tcp_cbdata *cbd,
 			lua_tcp_push_error (cbd, TRUE, "IO read error: connection terminated");
 		}
 
-		lua_tcp_plan_handler_event (cbd, FALSE, TRUE);
+		lua_tcp_plan_handler_event (cbd, FALSE, FALSE);
 	}
 	else {
 		/* An error occurred */
@@ -1013,10 +1031,18 @@ lua_tcp_process_read (struct lua_tcp_cbdata *cbd,
 		}
 
 		/* Fatal error */
-		lua_tcp_push_error (cbd, TRUE, "IO read error while trying to read data: %s",
-				strerror (errno));
+		cbd->eof = TRUE;
+		if (cbd->in->len > 0) {
+			/* We have some data to process */
+			lua_tcp_process_read_handler (cbd, rh, TRUE);
+		}
+		else {
+			lua_tcp_push_error (cbd, TRUE,
+					"IO read error while trying to read data: %s",
+					strerror (errno));
+		}
 
-		TCP_RELEASE (cbd);
+		lua_tcp_plan_handler_event (cbd, FALSE, FALSE);
 	}
 }
 
@@ -1141,7 +1167,6 @@ lua_tcp_plan_handler_event (struct lua_tcp_cbdata *cbd, gboolean can_read,
 				if (lua_tcp_process_read_handler (cbd, &hdl->h.r, FALSE)) {
 					if (!IS_SYNC(cbd)) {
 						/* We can go to the next handler */
-						lua_tcp_shift_handler (cbd);
 						lua_tcp_plan_handler_event (cbd, can_read, can_write);
 					}
 				}
@@ -1754,6 +1779,7 @@ lua_tcp_request (lua_State *L)
 		if (rspamd_session_blocked (session)) {
 			lua_tcp_push_error (cbd, TRUE, "async session is the blocked state");
 			TCP_RELEASE (cbd);
+			cbd->item = NULL; /* To avoid decrease with no watcher */
 			lua_pushboolean (L, FALSE);
 
 			return 1;
@@ -1770,6 +1796,7 @@ lua_tcp_request (lua_State *L)
 			lua_tcp_push_error (cbd, TRUE, "cannot connect to the host: %s", host);
 			lua_pushboolean (L, FALSE);
 
+			/* No reset of the item as watcher has been registered */
 			TCP_RELEASE (cbd);
 
 			return 1;
@@ -1781,7 +1808,7 @@ lua_tcp_request (lua_State *L)
 					RDNS_REQUEST_A, host)) {
 				lua_tcp_push_error (cbd, TRUE, "cannot resolve host: %s", host);
 				lua_pushboolean (L, FALSE);
-
+				cbd->item = NULL; /* To avoid decrease with no watcher */
 				TCP_RELEASE (cbd);
 
 				return 1;
@@ -1795,6 +1822,7 @@ lua_tcp_request (lua_State *L)
 					RDNS_REQUEST_A, host)) {
 				lua_tcp_push_error (cbd, TRUE, "cannot resolve host: %s", host);
 				lua_pushboolean (L, FALSE);
+				cbd->item = NULL; /* To avoid decrease with no watcher */
 
 				TCP_RELEASE (cbd);
 

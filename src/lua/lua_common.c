@@ -941,6 +941,7 @@ rspamd_lua_init (bool wipe_mem)
 	luaopen_udp (L);
 	luaopen_worker (L);
 	luaopen_kann (L);
+	luaopen_spf (L);
 #ifndef WITH_LUAJIT
 	rspamd_lua_add_preload (L, "bit", luaopen_bit);
 	lua_settop (L, 0);
@@ -1218,10 +1219,12 @@ rspamd_lua_dumpstack (lua_State *L)
 
 		}
 		if (i < top) {
-			r += rspamd_snprintf (buf + r, sizeof (buf) - r, " -> "); /* put a separator */
+			r += rspamd_snprintf (buf + r, sizeof (buf) - r,
+					" -> "); /* put a separator */
 		}
 	}
-	msg_info (buf);
+
+	msg_info ("%*s", r, buf);
 }
 
 gpointer
@@ -1827,8 +1830,14 @@ rspamd_lua_get_traceback_string (lua_State *L, luaL_Buffer *buf)
 {
 	const gchar *msg = lua_tostring (L, -1);
 
-	luaL_addstring (buf, msg);
-	lua_pop (L, 1); /* Error string */
+	if (msg) {
+		luaL_addstring (buf, msg);
+		lua_pop (L, 1); /* Error string */
+	}
+	else {
+		luaL_addstring (buf, "unknown error");
+	}
+
 	luaL_addstring (buf, "; trace:");
 	rspamd_lua_traceback_string (L, buf);
 }
@@ -2104,11 +2113,14 @@ gboolean
 rspamd_lua_require_function (lua_State *L, const gchar *modname,
 		const gchar *funcname)
 {
-	gint table_pos;
+	gint table_pos, err_pos;
 
+	lua_pushcfunction (L, &rspamd_lua_traceback);
+	err_pos = lua_gettop (L);
 	lua_getglobal (L, "require");
 
 	if (lua_isnil (L, -1)) {
+		lua_remove (L, err_pos);
 		lua_pop (L, 1);
 
 		return FALSE;
@@ -2118,13 +2130,21 @@ rspamd_lua_require_function (lua_State *L, const gchar *modname,
 
 	/* Now try to call */
 	if (lua_pcall (L, 1, 1, 0) != 0) {
+		lua_remove (L, err_pos);
+		msg_warn ("require of %s.%s failed: %s", modname,
+				funcname, lua_tostring (L, -1));
 		lua_pop (L, 1);
 
 		return FALSE;
 	}
 
+	lua_remove (L, err_pos);
+
 	/* Now we should have a table with results */
 	if (!lua_istable (L, -1)) {
+		msg_warn ("require of %s.%s failed: not a table but %s", modname,
+				funcname, lua_typename (L, lua_type (L, -1)));
+
 		lua_pop (L, 1);
 
 		return FALSE;
@@ -2139,6 +2159,10 @@ rspamd_lua_require_function (lua_State *L, const gchar *modname,
 		lua_remove (L, table_pos);
 
 		return TRUE;
+	}
+	else {
+		msg_warn ("require of %s.%s failed: not a function but %s", modname,
+				funcname, lua_typename (L, lua_type (L, -1)));
 	}
 
 	lua_pop (L, 2);
@@ -2322,4 +2346,35 @@ rspamd_lua_push_words (lua_State *L, GArray *words,
 	}
 
 	return 1;
+}
+
+gchar *
+rspamd_lua_get_module_name (lua_State *L)
+{
+	lua_Debug d;
+	gchar *p;
+	gchar func_buf[128];
+
+	if (lua_getstack (L, 1, &d) == 1) {
+		(void) lua_getinfo (L, "Sl", &d);
+		if ((p = strrchr (d.short_src, '/')) == NULL) {
+			p = d.short_src;
+		}
+		else {
+			p++;
+		}
+
+		if (strlen (p) > 20) {
+			rspamd_snprintf (func_buf, sizeof (func_buf), "%10s...]:%d", p,
+					d.currentline);
+		}
+		else {
+			rspamd_snprintf (func_buf, sizeof (func_buf), "%s:%d", p,
+					d.currentline);
+		}
+
+		return g_strdup (func_buf);
+	}
+
+	return NULL;
 }

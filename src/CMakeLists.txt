@@ -63,7 +63,7 @@ ENDMACRO(AddModules MLIST WLIST)
 # Rspamd core components
 IF (ENABLE_CLANG_PLUGIN MATCHES "ON")
 	SET(CMAKE_C_FLAGS
-			"${CMAKE_C_FLAGS} -Xclang -load -Xclang ${CMAKE_CURRENT_BINARY_DIR}/../clang-plugin/librspamd-clang.so -Xclang -add-plugin -Xclang rspamd-ast")
+			"${CMAKE_C_FLAGS} -Xclang -load -Xclang ${CMAKE_CURRENT_BINARY_DIR}/../clang-plugin/librspamd-clang${CMAKE_SHARED_LIBRARY_SUFFIX} -Xclang -add-plugin -Xclang rspamd-ast")
 	IF(CLANG_EXTRA_PLUGINS_LIBS)
 		FOREACH(_lib ${CLANG_EXTRA_PLUGINS_LIBS})
 			SET(CMAKE_C_FLAGS
@@ -96,11 +96,10 @@ SET(RSPAMDSRC	controller.c
 SET(PLUGINSSRC  plugins/regexp.c
 				plugins/chartable.c
 				plugins/fuzzy_check.c
-				plugins/spf.c
 				plugins/dkim_check.c
 				libserver/rspamd_control.c)
 
-SET(MODULES_LIST regexp chartable fuzzy_check spf dkim)
+SET(MODULES_LIST regexp chartable fuzzy_check dkim)
 SET(WORKERS_LIST normal controller fuzzy rspamd_proxy)
 IF (ENABLE_HYPERSCAN MATCHES "ON")
 	LIST(APPEND WORKERS_LIST "hs_helper")
@@ -184,6 +183,7 @@ TARGET_LINK_LIBRARIES(rspamd-server rspamd-cdb)
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-lpeg)
 TARGET_LINK_LIBRARIES(rspamd-server lcbtrie)
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-zstd)
+TARGET_LINK_LIBRARIES(rspamd-server rspamd-fastutf8)
 
 IF (ENABLE_CLANG_PLUGIN MATCHES "ON")
 	ADD_DEPENDENCIES(rspamd-server rspamd-clang)
@@ -206,7 +206,7 @@ IF (ENABLE_HYPERSCAN MATCHES "ON")
 	TARGET_LINK_LIBRARIES(rspamd-server hs)
 ENDIF()
 
-IF (WITH_BLAS)
+IF(WITH_BLAS)
 	TARGET_LINK_LIBRARIES(rspamd-server ${BLAS_REQUIRED_LIBRARIES})
 ENDIF()
 

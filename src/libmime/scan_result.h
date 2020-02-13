@@ -20,6 +20,7 @@ struct rspamd_classifier_config;
 
 struct rspamd_symbol_option {
 	gchar *option;
+	gsize optlen;
 	struct rspamd_symbol_option *prev, *next;
 };
 
@@ -39,6 +40,7 @@ struct rspamd_symbol_result {
 	struct rspamd_symbol_option *opts_head;        /**< head of linked list of options			*/
 	const gchar *name;
 	struct rspamd_symbol *sym;                     /**< symbol configuration					*/
+	gssize opts_len; /**< total size of all options (negative if truncated option is added) */
 	guint nshots;
 	enum rspamd_symbol_result_flags flags;
 };
@@ -141,7 +143,9 @@ struct rspamd_symbol_result *rspamd_task_insert_result_full (struct rspamd_task 
  * @param opt
  */
 gboolean rspamd_task_add_result_option (struct rspamd_task *task,
-										struct rspamd_symbol_result *s, const gchar *opt);
+										struct rspamd_symbol_result *s,
+										const gchar *opt,
+										gsize vlen);
 
 /**
  * Finds symbol result

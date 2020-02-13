@@ -60,7 +60,7 @@ void rspamd_upstreams_library_config (struct rspamd_config *cfg,
 /**
  * Add an error to an upstream
  */
-void rspamd_upstream_fail (struct upstream *up, gboolean addr_failure);
+void rspamd_upstream_fail (struct upstream *upstream, gboolean addr_failure, const gchar *reason);
 
 /**
  * Increase upstream successes count
@@ -89,6 +89,8 @@ void rspamd_upstreams_set_flags (struct upstream_list *ups,
 
 /**
  * Sets custom limits for upstreams
+ * This function allocates memory from the upstreams ctx pool and should
+ * not be called in cycles/constantly as this memory is likely persistent
  * @param ups
  * @param revive_time
  * @param revive_jitter
@@ -279,6 +281,17 @@ struct upstream *rspamd_upstream_get (struct upstream_list *ups,
  */
 struct upstream *rspamd_upstream_get_forced (struct upstream_list *ups,
 											 enum rspamd_upstream_rotation forced_type,
+											 const guchar *key, gsize keylen);
+
+/**
+ * Get new upstream from the list excepting the upstream specified
+ * @param ups upstream list
+ * @param type type of rotation algorithm, for `RSPAMD_UPSTREAM_HASHED` it is required to specify `key` and `keylen` as arguments
+ * @return
+ */
+struct upstream *rspamd_upstream_get_except (struct upstream_list *ups,
+											 struct upstream *except,
+											 enum rspamd_upstream_rotation default_type,
 											 const guchar *key, gsize keylen);
 
 /**

@@ -15,10 +15,10 @@
  */
 #include "config.h"
 #include "libutil/util.h"
-#include "libutil/map.h"
+#include "libserver/maps/map.h"
 #include "libutil/upstream.h"
-#include "libutil/http_connection.h"
-#include "libutil/http_private.h"
+#include "libserver/http/http_connection.h"
+#include "libserver/http/http_private.h"
 #include "libserver/protocol.h"
 #include "libserver/protocol_internal.h"
 #include "libserver/cfg_file.h"
@@ -1144,7 +1144,7 @@ proxy_request_decompress (struct rspamd_http_message *msg)
 
 			if (zout.pos == zout.size) {
 				/* We need to extend output buffer */
-				zout.size = zout.size * 1.5 + 1.0;
+				zout.size = zout.size * 2 + 1;
 				body = rspamd_fstring_grow (body, zout.size);
 				zout.size = body->allocated;
 				zout.dst = body->str;
@@ -1172,7 +1172,7 @@ proxy_session_refresh (struct rspamd_proxy_session *session)
 	session->client_addr = NULL;
 	nsession->ctx = session->ctx;
 	nsession->worker = session->worker;
-	nsession->pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "proxy");
+	nsession->pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "proxy", 0);
 	nsession->client_sock = session->client_sock;
 	session->client_sock = -1;
 	nsession->mirror_conns = g_ptr_array_sized_new (nsession->ctx->mirrors->len);
@@ -1293,7 +1293,7 @@ proxy_backend_mirror_error_handler (struct rspamd_http_connection *conn, GError 
 	msg_info_session ("abnormally closing connection from backend: %s:%s, "
 			"error: %e",
 			bk_conn->name,
-			rspamd_inet_address_to_string (
+			rspamd_inet_address_to_string_pretty (
 					rspamd_upstream_addr_cur (bk_conn->up)),
 			err);
 
@@ -1301,7 +1301,7 @@ proxy_backend_mirror_error_handler (struct rspamd_http_connection *conn, GError 
 		bk_conn->err = rspamd_mempool_strdup (session->pool, err->message);
 	}
 
-	rspamd_upstream_fail (bk_conn->up, FALSE);
+	rspamd_upstream_fail (bk_conn->up, FALSE, err ? err->message : "unknown");
 
 	proxy_backend_close_connection (bk_conn);
 	REF_RELEASE (bk_conn->s);
@@ -1378,7 +1378,7 @@ proxy_open_mirror_connections (struct rspamd_proxy_session *session)
 
 		if (bk_conn->backend_sock == -1) {
 			msg_err_session ("cannot connect upstream for %s", m->name);
-			rspamd_upstream_fail (bk_conn->up, TRUE);
+			rspamd_upstream_fail (bk_conn->up, TRUE, strerror (errno));
 			continue;
 		}
 
@@ -1415,8 +1415,7 @@ proxy_open_mirror_connections (struct rspamd_proxy_session *session)
 		}
 
 		if (m->local ||
-				rspamd_inet_address_is_local (
-						rspamd_upstream_addr_cur (bk_conn->up), FALSE)) {
+				rspamd_inet_address_is_local (rspamd_upstream_addr_cur (bk_conn->up))) {
 
 			if (session->fname) {
 				rspamd_http_message_add_header (msg, "File", session->fname);
@@ -1474,8 +1473,36 @@ proxy_client_write_error (struct rspamd_proxy_session *session, gint code,
 	}
 	else {
 		reply = rspamd_http_new_message (HTTP_RESPONSE);
-		reply->code = code;
-		reply->status = rspamd_fstring_new_init (status, strlen (status));
+
+		switch (code) {
+		case ETIMEDOUT:
+			reply->code = 504;
+			reply->status = RSPAMD_FSTRING_LIT ("Gateway timeout");
+			break;
+		case ECONNRESET:
+		case ECONNABORTED:
+			reply->code = 502;
+			reply->status = RSPAMD_FSTRING_LIT ("Gateway connection reset");
+			break;
+		case ECONNREFUSED:
+			reply->code = 502;
+			reply->status = RSPAMD_FSTRING_LIT ("Gateway connection refused");
+			break;
+		default:
+			if (code >= 300) {
+				/* Likely HTTP error */
+				reply->code = code;
+				reply->status = rspamd_fstring_new_init (status, strlen (status));
+			}
+			else {
+				reply->code = 502;
+				reply->status = RSPAMD_FSTRING_LIT ("Unknown gateway error: ");
+				reply->status = rspamd_fstring_append (reply->status,
+						status, strlen (status));
+			}
+			break;
+		}
+
 		rspamd_http_connection_write_message (session->client_conn,
 				reply, NULL, NULL, session,
 				session->ctx->timeout);
@@ -1489,18 +1516,18 @@ proxy_backend_master_error_handler (struct rspamd_http_connection *conn, GError 
 	struct rspamd_proxy_session *session;
 
 	session = bk_conn->s;
-	msg_info_session ("abnormally closing connection from backend: %s, error: %e,"
-			" retries left: %d",
-		rspamd_inet_address_to_string (
-				rspamd_upstream_addr_cur (session->master_conn->up)),
-		err,
-		session->ctx->max_retries - session->retries);
 	session->retries ++;
-	rspamd_upstream_fail (bk_conn->up, FALSE);
+	msg_info_session ("abnormally closing connection from backend: %s, error: %e,"
+					  " retries left: %d",
+			rspamd_inet_address_to_string_pretty (
+					rspamd_upstream_addr_cur (session->master_conn->up)),
+			err,
+			session->ctx->max_retries - session->retries);
+	rspamd_upstream_fail (bk_conn->up, FALSE, err ? err->message : "unknown");
 	proxy_backend_close_connection (session->master_conn);
 
-	if (session->ctx->max_retries &&
-			session->retries > session->ctx->max_retries) {
+	if (session->ctx->max_retries > 0 &&
+			session->retries >= session->ctx->max_retries) {
 		msg_err_session ("cannot connect to upstream, maximum retries "
 				"has been reached: %d", session->retries);
 		/* Terminate session immediately */
@@ -1726,7 +1753,7 @@ rspamd_proxy_self_scan (struct rspamd_proxy_session *session)
 	msg = session->client_message;
 	task = rspamd_task_new (session->worker, session->ctx->cfg,
 			session->pool, session->ctx->lang_det,
-			session->ctx->event_loop);
+			session->ctx->event_loop, FALSE);
 	task->flags |= RSPAMD_TASK_FLAG_MIME;
 
 	if (session->ctx->milter) {
@@ -1844,8 +1871,25 @@ retry:
 			goto err;
 		}
 
-		session->master_conn->up = rspamd_upstream_get (backend->u,
-				RSPAMD_UPSTREAM_ROUND_ROBIN, NULL, 0);
+		/* Provide hash key if hashing based on source address is desired */
+		guint hash_len;
+		gpointer hash_key = rspamd_inet_address_get_hash_key (session->client_addr,
+				&hash_len);
+
+		if (session->ctx->max_retries > 1 &&
+			session->retries == session->ctx->max_retries) {
+
+			session->master_conn->up = rspamd_upstream_get_except (backend->u,
+					session->master_conn->up,
+					RSPAMD_UPSTREAM_ROUND_ROBIN,
+					hash_key, hash_len);
+		}
+		else {
+			session->master_conn->up = rspamd_upstream_get (backend->u,
+					RSPAMD_UPSTREAM_ROUND_ROBIN,
+					hash_key, hash_len);
+		}
+
 		session->master_conn->timeout = backend->timeout;
 
 		if (session->master_conn->up == NULL) {
@@ -1861,10 +1905,11 @@ retry:
 		if (session->master_conn->backend_sock == -1) {
 			msg_err_session ("cannot connect upstream: %s(%s)",
 					host ? hostbuf : "default",
-							rspamd_inet_address_to_string (
+							rspamd_inet_address_to_string_pretty (
 									rspamd_upstream_addr_cur (
 											session->master_conn->up)));
-			rspamd_upstream_fail (session->master_conn->up, TRUE);
+			rspamd_upstream_fail (session->master_conn->up, TRUE,
+					strerror (errno));
 			session->retries ++;
 			goto retry;
 		}
@@ -1905,7 +1950,7 @@ retry:
 		if (backend->local ||
 				rspamd_inet_address_is_local (
 						rspamd_upstream_addr_cur (
-								session->master_conn->up), FALSE)) {
+								session->master_conn->up))) {
 
 			if (session->fname) {
 				rspamd_http_message_add_header (msg, "File", session->fname);
@@ -2086,8 +2131,9 @@ proxy_milter_error_handler (gint fd,
 	struct rspamd_proxy_session *session = ud;
 
 	msg_info_session ("abnormally closing milter connection from: %s, "
-			"error: %s", rspamd_inet_address_to_string (session->client_addr),
-			err->message);
+			"error: %e",
+			rspamd_inet_address_to_string_pretty (session->client_addr),
+			err);
 	/* Terminate session immediately */
 	proxy_backend_close_connection (session->master_conn);
 	REF_RELEASE (session);
@@ -2122,7 +2168,7 @@ proxy_accept_socket (EV_P_ ev_io *w, int revents)
 	session->mirror_conns = g_ptr_array_sized_new (ctx->mirrors->len);
 
 	session->pool = rspamd_mempool_new (rspamd_mempool_suggest_size (),
-			"proxy");
+			"proxy", 0);
 	session->ctx = ctx;
 	session->worker = worker;
 
@@ -2215,6 +2261,7 @@ void
 start_rspamd_proxy (struct rspamd_worker *worker)
 {
 	struct rspamd_proxy_ctx *ctx = worker->ctx;
+	gboolean is_controller = FALSE;
 
 	g_assert (rspamd_worker_check_context (worker->ctx, rspamd_rspamd_proxy_magic));
 	ctx->cfg = worker->srv->cfg;
@@ -2224,7 +2271,6 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 	ctx->resolver = rspamd_dns_resolver_init (worker->srv->logger,
 			ctx->event_loop,
 			worker->srv->cfg);
-	rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver, worker, 0);
 
 	rspamd_upstreams_library_config (worker->srv->cfg, ctx->cfg->ups_ctx,
 			ctx->event_loop, ctx->resolver->r);
@@ -2240,6 +2286,42 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 		rspamd_worker_init_scanner (worker, ctx->event_loop, ctx->resolver,
 				&ctx->lang_det);
 
+		if (worker->index == 0) {
+			/*
+			 * If there are no controllers and no normal workers,
+			 * then pretend that we are a controller
+			 */
+			gboolean controller_seen = FALSE;
+			GList *cur;
+
+			cur = worker->srv->cfg->workers;
+
+			while (cur) {
+				struct rspamd_worker_conf *cf;
+
+				cf = (struct rspamd_worker_conf *)cur->data;
+				if ((cf->type == g_quark_from_static_string ("controller")) ||
+						(cf->type == g_quark_from_static_string ("normal"))) {
+
+					if (cf->enabled && cf->count >= 0) {
+						controller_seen = TRUE;
+						break;
+					}
+				}
+
+				cur = g_list_next (cur);
+			}
+
+			if (!controller_seen) {
+				msg_info ("no controller or normal workers defined, execute "
+							  "controller periodics in this worker");
+				worker->flags |= RSPAMD_WORKER_CONTROLLER;
+				is_controller = TRUE;
+			}
+		}
+	}
+	else {
+		worker->flags &= ~RSPAMD_WORKER_SCANNER;
 	}
 
 	if (worker->srv->cfg->enable_sessions_cache) {
@@ -2256,6 +2338,20 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 	ctx->milter_ctx.cfg = ctx->cfg;
 	rspamd_milter_init_library (&ctx->milter_ctx);
 
+	if (is_controller) {
+		rspamd_worker_init_controller (worker, NULL);
+	}
+	else {
+		if (ctx->has_self_scan) {
+			rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver,
+					worker, RSPAMD_MAP_WATCH_SCANNER);
+		}
+		else {
+			rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver,
+					worker, RSPAMD_MAP_WATCH_WORKER);
+		}
+	}
+
 	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop,
 			worker);
 	adjust_upstreams_limits (ctx);
@@ -2267,8 +2363,12 @@ start_rspamd_proxy (struct rspamd_worker *worker)
 		rspamd_stat_close ();
 	}
 
+	if (is_controller) {
+		rspamd_controller_on_terminate (worker, NULL);
+	}
+
 	REF_RELEASE (ctx->cfg);
-	rspamd_log_close (worker->srv->logger, TRUE);
+	rspamd_log_close (worker->srv->logger);
 
 	exit (EXIT_SUCCESS);
 }

@@ -1570,7 +1570,9 @@ static EV_ATOMIC_T have_realtime; /* did clock_gettime (CLOCK_REALTIME) work? */
 
 #if EV_USE_MONOTONIC
 static EV_ATOMIC_T have_monotonic; /* did clock_gettime (CLOCK_MONOTONIC) work? */
+static EV_ATOMIC_T monotinic_clock_id;
 #endif
+static EV_ATOMIC_T have_cheap_timer = 0;
 
 #ifndef EV_FD_TO_WIN32_HANDLE
 # define EV_FD_TO_WIN32_HANDLE(fd) _get_osfhandle (fd)
@@ -1892,7 +1894,7 @@ get_clock (void)
   if (expect_true (have_monotonic))
     {
       struct timespec ts;
-      clock_gettime (CLOCK_MONOTONIC, &ts);
+      clock_gettime (monotinic_clock_id, &ts);
       return ts.tv_sec + ts.tv_nsec * 1e-9;
     }
 #endif
@@ -2889,8 +2891,27 @@ loop_init (EV_P_ unsigned int flags) EV_NOEXCEPT
         {
           struct timespec ts;
 
-          if (!clock_gettime (CLOCK_MONOTONIC, &ts))
+          if (!clock_gettime (CLOCK_MONOTONIC, &ts)) {
             have_monotonic = 1;
+            monotinic_clock_id = CLOCK_MONOTONIC;
+#define CHECK_CLOCK_SOURCE(id) do { \
+  if (!clock_gettime ((id), &ts) && \
+    !clock_getres ((id), &ts)) { \
+    if (ts.tv_sec == 0 && ts.tv_nsec < 10ULL * 1000000) { \
+      monotinic_clock_id = (id); \
+      have_cheap_timer = 1; \
+    } \
+  } \
+} while(0)
+#ifdef CLOCK_MONOTONIC_COARSE
+            CHECK_CLOCK_SOURCE(CLOCK_MONOTONIC_COARSE);
+#elif defined(CLOCK_MONOTONIC_FAST) /* BSD stuff */
+            CHECK_CLOCK_SOURCE(CLOCK_MONOTONIC_FAST);
+#elif defined(CLOCK_MONOTONIC_RAW_APPROX) /* OSX stuff */
+            CHECK_CLOCK_SOURCE(CLOCK_MONOTONIC_RAW_APPROX);
+#endif
+#undef CHECK_CLOCK_SOURCE
+          }
         }
 #endif
 
@@ -3787,6 +3808,12 @@ void
 ev_now_update (EV_P) EV_NOEXCEPT
 {
   time_update (EV_A_ 1e100);
+}
+
+void
+ev_now_update_if_cheap (EV_P) EV_NOEXCEPT
+{
+  if (have_cheap_timer) time_update (EV_A_ 1e100);
 }
 
 void

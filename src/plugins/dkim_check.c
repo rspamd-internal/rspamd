@@ -34,8 +34,8 @@
 #include "libmime/message.h"
 #include "libserver/dkim.h"
 #include "libutil/hash.h"
-#include "libutil/map.h"
-#include "libutil/map_helpers.h"
+#include "libserver/maps/map.h"
+#include "libserver/maps/map_helpers.h"
 #include "rspamd.h"
 #include "utlist.h"
 #include "unix-std.h"
@@ -435,7 +435,7 @@ dkim_module_config (struct rspamd_config *cfg)
 		rspamd_config_get_module_opt (cfg, "dkim", "whitelist")) != NULL) {
 
 		rspamd_config_radix_from_ucl (cfg, value, "DKIM whitelist",
-				&dkim_module_ctx->whitelist_ip, NULL);
+				&dkim_module_ctx->whitelist_ip, NULL, NULL);
 	}
 
 	if ((value =
@@ -445,7 +445,8 @@ dkim_module_config (struct rspamd_config *cfg)
 				rspamd_kv_list_read,
 				rspamd_kv_list_fin,
 				rspamd_kv_list_dtor,
-				(void **)&dkim_module_ctx->dkim_domains)) {
+				(void **)&dkim_module_ctx->dkim_domains,
+				NULL)) {
 			msg_warn_config ("cannot load dkim domains list from %s",
 				ucl_object_tostring (value));
 		}
@@ -461,7 +462,8 @@ dkim_module_config (struct rspamd_config *cfg)
 				rspamd_kv_list_read,
 				rspamd_kv_list_fin,
 				rspamd_kv_list_dtor,
-				(void **)&dkim_module_ctx->dkim_domains)) {
+				(void **)&dkim_module_ctx->dkim_domains,
+				NULL)) {
 			msg_warn_config ("cannot load dkim domains list from %s",
 					ucl_object_tostring (value));
 		}
@@ -538,7 +540,7 @@ dkim_module_config (struct rspamd_config *cfg)
 				0.0,
 				"DKIM check callback",
 				"policies",
-				RSPAMD_SYMBOL_FLAG_IGNORE,
+				RSPAMD_SYMBOL_FLAG_IGNORE_METRIC,
 				1,
 				1);
 		rspamd_config_add_symbol_group (cfg, "DKIM_CHECK", "dkim");
@@ -585,7 +587,7 @@ dkim_module_config (struct rspamd_config *cfg)
 				0.0,
 				"DKIM trace symbol",
 				"policies",
-				RSPAMD_SYMBOL_FLAG_IGNORE,
+				RSPAMD_SYMBOL_FLAG_IGNORE_METRIC,
 				1,
 				1);
 		rspamd_config_add_symbol_group (cfg, "DKIM_TRACE", "dkim");
@@ -1119,7 +1121,8 @@ dkim_symbol_callback (struct rspamd_task *task,
 	GError *err = NULL;
 	struct rspamd_mime_header *rh, *rh_cur;
 	struct dkim_check_result *res = NULL, *cur;
-	guint checked = 0, *dmarc_checks;
+	guint checked = 0;
+	gdouble *dmarc_checks;
 	struct dkim_ctx *dkim_module_ctx = dkim_get_context (task->cfg);
 
 	/* Allow dmarc */
@@ -1141,7 +1144,7 @@ dkim_symbol_callback (struct rspamd_task *task,
 	/* First check if plugin should be enabled */
 	if ((!dkim_module_ctx->check_authed && task->user != NULL)
 			|| (!dkim_module_ctx->check_local &&
-					rspamd_inet_address_is_local (task->from_addr, TRUE))) {
+			rspamd_ip_is_local_cfg (task->cfg, task->from_addr))) {
 		msg_info_task ("skip DKIM checks for local networks and authorized users");
 		rspamd_symcache_finalize_item (task, item);
 

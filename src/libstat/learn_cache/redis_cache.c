@@ -114,7 +114,7 @@ rspamd_redis_cache_timeout (EV_P_ ev_timer *w, int revents)
 
 	msg_err_task ("connection to redis server %s timed out",
 			rspamd_upstream_name (rt->selected));
-	rspamd_upstream_fail (rt->selected, FALSE);
+	rspamd_upstream_fail (rt->selected, FALSE, "timeout");
 
 	if (rt->has_event) {
 		rspamd_session_remove_event (task->s, rspamd_redis_cache_fin, rt);
@@ -166,7 +166,7 @@ rspamd_stat_cache_redis_get (redisAsyncContext *c, gpointer r, gpointer priv)
 		rspamd_upstream_ok (rt->selected);
 	}
 	else {
-		rspamd_upstream_fail (rt->selected, FALSE);
+		rspamd_upstream_fail (rt->selected, FALSE, c->errstr);
 	}
 
 	if (rt->has_event) {
@@ -188,7 +188,7 @@ rspamd_stat_cache_redis_set (redisAsyncContext *c, gpointer r, gpointer priv)
 		rspamd_upstream_ok (rt->selected);
 	}
 	else {
-		rspamd_upstream_fail (rt->selected, FALSE);
+		rspamd_upstream_fail (rt->selected, FALSE, c->errstr);
 	}
 
 	if (rt->has_event) {
@@ -396,7 +396,22 @@ rspamd_stat_cache_redis_runtime (struct rspamd_task *task,
 				rspamd_inet_address_get_port (addr));
 	}
 
-	g_assert (rt->redis != NULL);
+	if (rt->redis == NULL) {
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				strerror (errno));
+
+		return NULL;
+	}
+	else if (rt->redis->err != REDIS_OK) {
+		msg_warn_task ("cannot connect to redis server %s: %s",
+				rspamd_inet_address_to_string_pretty (addr),
+				rt->redis->errstr);
+		redisAsyncFree (rt->redis);
+		rt->redis = NULL;
+
+		return NULL;
+	}
 
 	redisLibevAttach (task->event_loop, rt->redis);
 
@@ -455,7 +470,7 @@ rspamd_stat_cache_redis_learn (struct rspamd_task *task,
 	gchar *h;
 	gint flag;
 
-	if (rspamd_session_blocked (task->s)) {
+	if (rt == NULL || rt->ctx == NULL || rspamd_session_blocked (task->s)) {
 		return RSPAMD_LEARN_INGORE;
 	}
 

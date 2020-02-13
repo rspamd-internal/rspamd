@@ -21,6 +21,7 @@
 #include "lua/lua_common.h"
 #include "libserver/cfg_file_private.h"
 #include "libmime/scan_result_private.h"
+#include "contrib/fastutf8/fastutf8.h"
 #include <math.h>
 #include "contrib/uthash/utlist.h"
 
@@ -289,20 +290,10 @@ insert_metric_result (struct rspamd_task *task,
 			single = TRUE;
 		}
 
-		/* Now check for the duplicate options */
-		if (opt && s->options) {
-			k = kh_get (rspamd_options_hash, s->options, opt);
+		s->nshots ++;
 
-			if (k == kh_end (s->options)) {
-				rspamd_task_add_result_option (task, s, opt);
-			}
-			else {
-				s->nshots ++;
-			}
-		}
-		else {
-			s->nshots ++;
-			rspamd_task_add_result_option (task, s, opt);
+		if (opt) {
+			rspamd_task_add_result_option (task, s, opt, strlen (opt));
 		}
 
 		/* Adjust diff */
@@ -468,7 +459,9 @@ insert_metric_result (struct rspamd_task *task,
 			s->score = 0;
 		}
 
-		rspamd_task_add_result_option (task, s, opt);
+		if (opt) {
+			rspamd_task_add_result_option (task, s, opt, strlen (opt));
+		}
 	}
 
 	msg_debug_metric ("final insertion for symbol %s, score %.2f, factor: %f",
@@ -510,46 +503,162 @@ rspamd_task_insert_result_full (struct rspamd_task *task,
 	return s;
 }
 
+static gchar *
+rspamd_task_option_safe_copy (struct rspamd_task *task,
+							  const gchar *val,
+							  gsize vlen,
+							  gsize *outlen)
+{
+	const gchar *p, *end;
+
+	p = val;
+	end = val + vlen;
+	vlen = 0; /* Reuse */
+
+	while (p < end) {
+		if (*p & 0x80) {
+			UChar32 uc;
+			gint off = 0;
+
+			U8_NEXT (p, off, end - p, uc);
+
+			if (uc > 0) {
+				if (u_isprint (uc)) {
+					vlen += off;
+				}
+				else {
+					/* We will replace it with 0xFFFD */
+					vlen += MAX (off, 3);
+				}
+			}
+			else {
+				vlen += MAX (off, 3);
+			}
+
+			p += off;
+		}
+		else if (!g_ascii_isprint (*p)) {
+			/* Another 0xFFFD */
+			vlen += 3;
+			p ++;
+		}
+		else {
+			p ++;
+			vlen ++;
+		}
+	}
+
+	gchar *dest, *d;
+
+	dest = rspamd_mempool_alloc (task->task_pool, vlen + 1);
+	d = dest;
+	p = val;
+
+	while (p < end) {
+		if (*p & 0x80) {
+			UChar32 uc;
+			gint off = 0;
+
+			U8_NEXT (p, off, end - p, uc);
+
+			if (uc > 0) {
+				if (u_isprint (uc)) {
+					memcpy (d, p, off);
+					d += off;
+				}
+				else {
+					/* We will replace it with 0xFFFD */
+					*d++ = '\357';
+					*d++ = '\277';
+					*d++ = '\275';
+				}
+			}
+			else {
+				*d++ = '\357';
+				*d++ = '\277';
+				*d++ = '\275';
+			}
+
+			p += off;
+		}
+		else if (!g_ascii_isprint (*p)) {
+			/* Another 0xFFFD */
+			*d++ = '\357';
+			*d++ = '\277';
+			*d++ = '\275';
+			p ++;
+		}
+		else {
+			*d++ = *p++;
+		}
+	}
+
+	*d = '\0';
+	*(outlen) = d - dest;
+
+	return dest;
+}
+
 gboolean
 rspamd_task_add_result_option (struct rspamd_task *task,
-		struct rspamd_symbol_result *s, const gchar *val)
+							   struct rspamd_symbol_result *s,
+							   const gchar *val,
+							   gsize vlen)
 {
-	struct rspamd_symbol_option *opt;
+	struct rspamd_symbol_option *opt, srch;
 	gboolean ret = FALSE;
-	gchar *opt_cpy;
+	gchar *opt_cpy = NULL;
+	gsize cpy_len;
 	khiter_t k;
 	gint r;
 
 	if (s && val) {
-		if (s->options && !(s->sym &&
-				(s->sym->flags & RSPAMD_SYMBOL_FLAG_ONEPARAM)) &&
+		if (s->opts_len < 0) {
+			/* Cannot add more options, give up */
+			msg_debug_task ("cannot add more options to symbol %s when adding option %s",
+					s->name, val);
+			return FALSE;
+		}
+
+		if (!s->options) {
+			s->options = kh_init (rspamd_options_hash);
+		}
+
+		if (vlen + s->opts_len > task->cfg->max_opts_len) {
+			/* Add truncated option */
+			msg_info_task ("cannot add more options to symbol %s when adding option %s",
+					s->name, val);
+			val = "...";
+			vlen = 3;
+			s->opts_len = -1;
+		}
+
+		if (!(s->sym && (s->sym->flags & RSPAMD_SYMBOL_FLAG_ONEPARAM)) &&
 				kh_size (s->options) < task->cfg->default_max_shots) {
+			opt_cpy = rspamd_task_option_safe_copy (task, val, vlen, &cpy_len);
 			/* Append new options */
-			k = kh_get (rspamd_options_hash, s->options, val);
+			srch.option = (gchar *)opt_cpy;
+			srch.optlen = cpy_len;
+			k = kh_get (rspamd_options_hash, s->options, &srch);
 
 			if (k == kh_end (s->options)) {
 				opt = rspamd_mempool_alloc0 (task->task_pool, sizeof (*opt));
-				opt_cpy = rspamd_mempool_strdup (task->task_pool, val);
-				k = kh_put (rspamd_options_hash, s->options, opt_cpy, &r);
-
-				kh_value (s->options, k) = opt;
+				opt->optlen = cpy_len;
 				opt->option = opt_cpy;
+
+				kh_put (rspamd_options_hash, s->options, opt, &r);
 				DL_APPEND (s->opts_head, opt);
 
 				ret = TRUE;
 			}
 		}
 		else {
-			s->options = kh_init (rspamd_options_hash);
-			opt = rspamd_mempool_alloc0 (task->task_pool, sizeof (*opt));
-			opt_cpy = rspamd_mempool_strdup (task->task_pool, val);
-			k = kh_put (rspamd_options_hash, s->options, opt_cpy, &r);
+			/* Skip addition */
+			ret = FALSE;
+		}
 
-			kh_value (s->options, k) = opt;
-			opt->option = opt_cpy;
-			DL_APPEND (s->opts_head, opt);
-
-			ret = TRUE;
+		if (ret && s->opts_len >= 0) {
+			s->opts_len += vlen;
 		}
 	}
 	else if (!val) {

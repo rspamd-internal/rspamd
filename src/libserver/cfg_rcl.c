@@ -279,7 +279,7 @@ rspamd_rcl_options_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 
 	HASH_FIND_STR (section->subsections, "upstream", upstream_section);
 
-	upstream = ucl_object_lookup (obj, "upstream");
+	upstream = ucl_object_lookup_any (obj, "upstream", "upstreams", NULL);
 	if (upstream_section != NULL && upstream != NULL) {
 		if (!rspamd_rcl_section_parse_defaults (cfg,
 				upstream_section, cfg->cfg_pool,
@@ -456,11 +456,10 @@ rspamd_rcl_symbol_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 	const gchar *description = NULL;
 	gdouble score = NAN;
 	guint priority = 1, flags = 0;
-	gint nshots;
+	gint nshots = 0;
 
 	g_assert (key != NULL);
 	cfg = sd->cfg;
-	nshots = cfg->default_max_shots;
 
 	if ((elt = ucl_object_lookup (obj, "one_shot")) != NULL) {
 		if (ucl_object_type (elt) != UCL_BOOLEAN) {
@@ -520,7 +519,23 @@ rspamd_rcl_symbol_handler (rspamd_mempool_t *pool, const ucl_object_t *obj,
 		}
 
 		if (ucl_object_toboolean (elt)) {
-			flags |= RSPAMD_SYMBOL_FLAG_IGNORE;
+			flags |= RSPAMD_SYMBOL_FLAG_IGNORE_METRIC;
+		}
+	}
+
+	if ((elt = ucl_object_lookup (obj, "enabled")) != NULL) {
+		if (ucl_object_type (elt) != UCL_BOOLEAN) {
+			g_set_error (err,
+					CFG_RCL_ERROR,
+					EINVAL,
+					"enabled attribute is not boolean for symbol: '%s'",
+					key);
+
+			return FALSE;
+		}
+
+		if (ucl_object_toboolean (elt)) {
+			flags |= RSPAMD_SYMBOL_FLAG_DISABLED;
 		}
 	}
 
@@ -1937,6 +1952,12 @@ rspamd_rcl_config_init (struct rspamd_config *cfg, GHashTable *skip_sections)
 				0,
 				"Disable monitoring completely");
 		rspamd_rcl_add_default_handler (sub,
+				"fips_mode",
+				rspamd_rcl_parse_struct_boolean,
+				G_STRUCT_OFFSET (struct rspamd_config, fips_mode),
+				0,
+				"Enable FIPS 140-2 mode in OpenSSL");
+		rspamd_rcl_add_default_handler (sub,
 				"dynamic_conf",
 				rspamd_rcl_parse_struct_string,
 				G_STRUCT_OFFSET (struct rspamd_config, dynamic_conf),
@@ -1948,6 +1969,12 @@ rspamd_rcl_config_init (struct rspamd_config *cfg, GHashTable *skip_sections)
 				G_STRUCT_OFFSET (struct rspamd_config, rrd_file),
 				RSPAMD_CL_FLAG_STRING_PATH,
 				"Path to RRD file");
+		rspamd_rcl_add_default_handler (sub,
+				"stats_file",
+				rspamd_rcl_parse_struct_string,
+				G_STRUCT_OFFSET (struct rspamd_config, stats_file),
+				RSPAMD_CL_FLAG_STRING_PATH,
+				"Path to stats file");
 		rspamd_rcl_add_default_handler (sub,
 				"history_file",
 				rspamd_rcl_parse_struct_string,
@@ -1966,6 +1993,12 @@ rspamd_rcl_config_init (struct rspamd_config *cfg, GHashTable *skip_sections)
 				G_STRUCT_OFFSET (struct rspamd_config, public_groups_only),
 				0,
 				"Output merely public groups everywhere");
+		rspamd_rcl_add_default_handler (sub,
+				"enable_test_patterns",
+				rspamd_rcl_parse_struct_boolean,
+				G_STRUCT_OFFSET (struct rspamd_config, enable_test_patterns),
+				0,
+				"Enable test GTUBE like patterns (not for production!)");
 		rspamd_rcl_add_default_handler (sub,
 				"enable_experimental",
 				rspamd_rcl_parse_struct_boolean,
@@ -2202,11 +2235,29 @@ rspamd_rcl_config_init (struct rspamd_config *cfg, GHashTable *skip_sections)
 				RSPAMD_CL_FLAG_INT_32,
 				"Maximum count of URLs to pass to Lua to avoid DoS (default: 1024)");
 		rspamd_rcl_add_default_handler (sub,
+				"max_urls",
+				rspamd_rcl_parse_struct_integer,
+				G_STRUCT_OFFSET (struct rspamd_config, max_urls),
+				RSPAMD_CL_FLAG_INT_32,
+				"Maximum count of URLs to process to avoid DoS (default: 10240)");
+		rspamd_rcl_add_default_handler (sub,
 				"max_blas_threads",
 				rspamd_rcl_parse_struct_integer,
 				G_STRUCT_OFFSET (struct rspamd_config, max_blas_threads),
 				RSPAMD_CL_FLAG_INT_32,
 				"Maximum number of Blas threads for learning neural networks (default: 1)");
+		rspamd_rcl_add_default_handler (sub,
+				"max_opts_len",
+				rspamd_rcl_parse_struct_integer,
+				G_STRUCT_OFFSET (struct rspamd_config, max_opts_len),
+				RSPAMD_CL_FLAG_INT_32,
+				"Maximum size of all options for a single symbol (default: 4096)");
+		rspamd_rcl_add_default_handler (sub,
+				"events_backend",
+				rspamd_rcl_parse_struct_string,
+				G_STRUCT_OFFSET (struct rspamd_config, events_backend),
+				0,
+				"Events backend to use: kqueue, epoll, select, poll or auto (default: auto)");
 
 		/* Neighbours configuration */
 		rspamd_rcl_add_section_doc (&sub->subsections, "neighbours", "name",

@@ -126,9 +126,10 @@ struct rspamd_symbols_group {
 
 enum rspamd_symbol_flags {
 	RSPAMD_SYMBOL_FLAG_NORMAL = 0,
-	RSPAMD_SYMBOL_FLAG_IGNORE = (1 << 1),
+	RSPAMD_SYMBOL_FLAG_IGNORE_METRIC = (1 << 1),
 	RSPAMD_SYMBOL_FLAG_ONEPARAM = (1 << 2),
 	RSPAMD_SYMBOL_FLAG_UNGROUPPED = (1 << 3),
+	RSPAMD_SYMBOL_FLAG_DISABLED = (1 << 4),
 };
 
 /**
@@ -225,7 +226,6 @@ struct rspamd_worker_conf {
 	guint64 rlimit_maxcore;                         /**< maximum core file size								*/
 	GHashTable *params;                             /**< params for worker									*/
 	GQueue *active_workers;                         /**< linked list of spawned workers						*/
-	gboolean has_socket;                            /**< whether we should make listening socket in main process */
 	gpointer *ctx;                                  /**< worker's context									*/
 	ucl_object_t *options;                          /**< other worker's options								*/
 	struct rspamd_worker_lua_script *scripts;       /**< registered lua scripts								*/
@@ -260,6 +260,8 @@ enum rspamd_log_format_type {
 	RSPAMD_LOG_SETTINGS_ID,
 	RSPAMD_LOG_GROUPS,
 	RSPAMD_LOG_PUBLIC_GROUPS,
+	RSPAMD_LOG_MEMPOOL_SIZE,
+	RSPAMD_LOG_MEMPOOL_WASTE,
 };
 
 enum rspamd_log_format_flags {
@@ -371,6 +373,7 @@ struct rspamd_config {
 	gboolean own_lua_state;                         /**< True if we have created lua_state internally		*/
 	gboolean soft_reject_on_timeout;                /**< If true emit soft reject on task timeout (if not reject) */
 	gboolean public_groups_only;                    /**< Output merely public groups everywhere				*/
+	gboolean enable_test_patterns;                  /**< Enable test patterns								*/
 
 	gsize max_cores_size;                           /**< maximum size occupied by rspamd core files			*/
 	gsize max_cores_count;                          /**< maximum number of core files						*/
@@ -427,6 +430,7 @@ struct rspamd_config {
 
 	gdouble monitored_interval;                     /**< interval between monitored checks					*/
 	gboolean disable_monitored;                     /**< disable monitoring completely						*/
+	gboolean fips_mode;                             /**< turn on fips mode for openssl						*/
 
 	struct rspamd_symcache *cache;                    /**< symbols cache object								*/
 	gchar *cache_filename;                          /**< filename of cache file								*/
@@ -437,8 +441,10 @@ struct rspamd_config {
 
 	gchar *rrd_file;                               /**< rrd file to store statistics						*/
 	gchar *history_file;                           /**< file to save rolling history						*/
+	gchar *stats_file;                           /**< file to save stats 						*/
 	gchar *tld_file;                               /**< file to load effective tld list from				*/
 	gchar *hs_cache_dir;                           /**< directory to save hyperscan databases				*/
+	gchar *events_backend;                         /**< string representation of the events backend used	*/
 
 	gdouble dns_timeout;                            /**< timeout in milliseconds for waiting for dns reply	*/
 	guint32 dns_retransmits;                        /**< maximum retransmits count							*/
@@ -463,7 +469,9 @@ struct rspamd_config {
 	guint lua_gc_pause;                                /**< lua gc pause										*/
 	guint full_gc_iters;                            /**< iterations between full gc cycle					*/
 	guint max_lua_urls;                             /**< maximum number of urls to be passed to Lua			*/
+	guint max_urls;                                 /**< maximum number of urls to be processed in general	*/
 	guint max_blas_threads;                         /**< maximum threads for openblas when learning ANN		*/
+	guint max_opts_len;                             /**< maximum length for all options for a symbol		*/
 
 	GList *classify_headers;                        /**< list of headers using for statistics				*/
 	struct module_s **compiled_modules;                /**< list of compiled C modules							*/
@@ -491,6 +499,7 @@ struct rspamd_config {
 
 	struct rspamd_config_settings_elt *setting_ids;    /**< preprocessed settings ids							*/
 	struct rspamd_lang_detector *lang_det;            /**< language detector									*/
+	struct rspamd_worker *cur_worker;               /**< set dynamically by each worker							*/
 
 	ref_entry_t ref;                                /**< reference counter									*/
 };
@@ -753,7 +762,8 @@ gboolean rspamd_config_radix_from_ucl (struct rspamd_config *cfg,
 									   const ucl_object_t *obj,
 									   const gchar *description,
 									   struct rspamd_radix_map_helper **target,
-									   GError **err);
+									   GError **err,
+									   struct rspamd_worker *worker);
 
 /**
  * Adds new settings id to be preprocessed
@@ -807,6 +817,46 @@ struct rspamd_action *rspamd_config_get_action (struct rspamd_config *cfg,
 
 struct rspamd_action *rspamd_config_get_action_by_type (struct rspamd_config *cfg,
 														enum rspamd_action_type type);
+
+int rspamd_config_ev_backend_get (struct rspamd_config *cfg);
+const gchar * rspamd_config_ev_backend_to_string (int ev_backend, gboolean *effective);
+
+struct rspamd_external_libs_ctx;
+
+/**
+ * Initialize rspamd libraries
+ */
+struct rspamd_external_libs_ctx *rspamd_init_libs (void);
+
+/**
+ * Reset and initialize decompressor
+ * @param ctx
+ */
+gboolean rspamd_libs_reset_decompression (struct rspamd_external_libs_ctx *ctx);
+
+/**
+ * Reset and initialize compressor
+ * @param ctx
+ */
+gboolean rspamd_libs_reset_compression (struct rspamd_external_libs_ctx *ctx);
+
+/**
+ * Destroy external libraries context
+ */
+void rspamd_deinit_libs (struct rspamd_external_libs_ctx *ctx);
+
+/**
+ * Returns TRUE if an address belongs to some local address
+ */
+gboolean rspamd_ip_is_local_cfg (struct rspamd_config *cfg,
+		const rspamd_inet_addr_t *addr);
+
+/**
+ * Configure libraries
+ */
+gboolean rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
+							 struct rspamd_config *cfg);
+void rspamd_openssl_maybe_init (void);
 
 #define msg_err_config(...) rspamd_default_log_function (G_LOG_LEVEL_CRITICAL, \
         cfg->cfg_pool->tag.tagname, cfg->checksum, \

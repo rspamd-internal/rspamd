@@ -11,6 +11,12 @@ ${RSPAMD_SCOPE}  Suite
 ${URL_TLD}      ${TESTDIR}/../lua/unit/test_tld.dat
 
 *** Test Cases ***
+SURBL resolve ip
+  ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/url7.eml
+  Should Contain  ${result.stdout}  URIBL_SBL_CSS (1.00)[8.8.8.9:example.ru
+  Should Contain  ${result.stdout}  URIBL_XBL (1.00)[8.8.8.8:example.ru
+  Should Contain  ${result.stdout}  URIBL_PBL (1.00)[8.8.8.8:example.ru
+
 SURBL Example.com domain
   ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/url4.eml
   Should Contain  ${result.stdout}  RSPAMD_URIBL
@@ -125,8 +131,25 @@ EMAILBL REPLY TO domain only
 EMAILBL REPLY TO full subdomain adress
   ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/replytosubdomain.eml
   Should Contain  ${result.stdout}  RSPAMD_EMAILBL_FULL (
-  Should Not Contain  ${result.stdout}  RSPAMD_EMAILBL_DOMAINONLY ( 
+  Should Not Contain  ${result.stdout}  RSPAMD_EMAILBL_DOMAINONLY (
 
+SURBL IDN domain
+  ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/url8.eml
+  Should Contain  ${result.stdout}  RSPAMD_URIBL
+  Should Contain  ${result.stdout}  DBL_SPAM
+  Should Not Contain  ${result.stdout}  DBL_PHISH
+  Should Not Contain  ${result.stdout}  URIBL_BLACK
+
+SURBL IDN Punycode domain
+  ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/url9.eml
+  Should Contain  ${result.stdout}  RSPAMD_URIBL
+  Should Contain  ${result.stdout}  DBL_SPAM
+  Should Not Contain  ${result.stdout}  DBL_PHISH
+  Should Not Contain  ${result.stdout}  URIBL_BLACK
+
+SURBL html entity &shy
+  ${result} =  Scan Message With Rspamc  ${TESTDIR}/messages/url10.eml
+  Should Contain  ${result.stdout}  RSPAMD_URIBL
 
 *** Keywords ***
 Surbl Setup

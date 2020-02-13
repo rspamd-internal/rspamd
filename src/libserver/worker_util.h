@@ -18,7 +18,7 @@
 
 #include "config.h"
 #include "util.h"
-#include "http_connection.h"
+#include "libserver/http/http_connection.h"
 #include "rspamd.h"
 
 #ifdef  __cplusplus
@@ -236,6 +236,38 @@ void rspamd_worker_throttle_accept_events (gint sock, void *data);
  */
 gboolean rspamd_check_termination_clause (struct rspamd_main *rspamd_main,
 										  struct rspamd_worker *wrk, int status);
+
+/**
+ * Call for final scripts for a worker
+ * @param worker
+ * @return
+ */
+gboolean rspamd_worker_call_finish_handlers (struct rspamd_worker *worker);
+
+struct rspamd_rrd_file;
+/**
+ * Terminate controller worker
+ * @param worker
+ */
+void rspamd_controller_on_terminate (struct rspamd_worker *worker,
+		struct rspamd_rrd_file *rrd);
+
+/**
+ * Inits controller worker
+ * @param worker
+ * @param ev_base
+ * @param prrd
+ */
+void rspamd_worker_init_controller (struct rspamd_worker *worker,
+								   struct rspamd_rrd_file **prrd);
+
+/**
+ * Saves stats
+ * @param rspamd_main
+ * @param cfg
+ */
+void rspamd_controller_store_saved_stats (struct rspamd_main *rspamd_main,
+									 struct rspamd_config *cfg);
 
 #ifdef WITH_HYPERSCAN
 struct rspamd_control_command;

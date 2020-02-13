@@ -19,7 +19,7 @@
 
 #include "config.h"
 #include "libutil/util.h"
-#include "libutil/map.h"
+#include "libserver/maps/map.h"
 #include "libutil/upstream.h"
 #include "libserver/protocol.h"
 #include "libserver/cfg_file.h"
@@ -27,16 +27,13 @@
 #include "libserver/dns.h"
 #include "libmime/message.h"
 #include "rspamd.h"
-#include "keypairs_cache.h"
 #include "libstat/stat_api.h"
 #include "libserver/worker_util.h"
 #include "libserver/rspamd_control.h"
 #include "worker_private.h"
-#include "utlist.h"
-#include "libutil/http_private.h"
-#include "libmime/lang_detection.h"
+#include "libserver/http/http_private.h"
+#include "libserver/cfg_file_private.h"
 #include <math.h>
-#include <src/libserver/cfg_file_private.h>
 #include "unix-std.h"
 
 #include "lua/lua_common.h"
@@ -57,68 +54,27 @@ worker_t normal_worker = {
 };
 
 #define msg_err_ctx(...) rspamd_default_log_function(G_LOG_LEVEL_CRITICAL, \
-        "controller", ctx->cfg->cfg_pool->tag.uid, \
+        "worker", ctx->cfg->cfg_pool->tag.uid, \
         G_STRFUNC, \
         __VA_ARGS__)
 #define msg_warn_ctx(...)   rspamd_default_log_function (G_LOG_LEVEL_WARNING, \
-        "controller", ctx->cfg->cfg_pool->tag.uid, \
+        "worker", ctx->cfg->cfg_pool->tag.uid, \
         G_STRFUNC, \
         __VA_ARGS__)
 #define msg_info_ctx(...)   rspamd_default_log_function (G_LOG_LEVEL_INFO, \
-        "controller", ctx->cfg->cfg_pool->tag.uid, \
+        "worker", ctx->cfg->cfg_pool->tag.uid, \
         G_STRFUNC, \
         __VA_ARGS__)
 
-static gboolean
-rspamd_worker_finalize (gpointer user_data)
-{
-	struct rspamd_task *task = user_data;
-
-	if (!(task->flags & RSPAMD_TASK_FLAG_PROCESSING)) {
-		msg_info_task ("finishing actions has been processed, terminating");
-		/* ev_break (task->event_loop, EVBREAK_ALL); */
-		rspamd_session_destroy (task->s);
-
-		return TRUE;
-	}
-
-	return FALSE;
-}
-
-static gboolean
-rspamd_worker_call_finish_handlers (struct rspamd_worker *worker)
-{
+struct rspamd_worker_session {
+	gint64 magic;
 	struct rspamd_task *task;
-	struct rspamd_config *cfg = worker->srv->cfg;
-	struct rspamd_abstract_worker_ctx *ctx;
-	struct rspamd_config_cfg_lua_script *sc;
-
-	if (cfg->on_term_scripts) {
-		ctx = worker->ctx;
-		/* Create a fake task object for async events */
-		task = rspamd_task_new (worker, cfg, NULL, NULL, ctx->event_loop);
-		task->resolver = ctx->resolver;
-		task->flags |= RSPAMD_TASK_FLAG_PROCESSING;
-		task->s = rspamd_session_create (task->task_pool,
-				rspamd_worker_finalize,
-				NULL,
-				(event_finalizer_t) rspamd_task_free,
-				task);
-
-		DL_FOREACH (cfg->on_term_scripts, sc) {
-			lua_call_finish_script (sc, task);
-		}
-
-		task->flags &= ~RSPAMD_TASK_FLAG_PROCESSING;
-
-		if (rspamd_session_pending (task->s)) {
-			return TRUE;
-		}
-	}
-
-	return FALSE;
-}
-
+	gint fd;
+	rspamd_inet_addr_t *addr;
+	struct rspamd_worker_ctx *ctx;
+	struct rspamd_http_connection *http_conn;
+	struct rspamd_worker *worker;
+};
 /*
  * Reduce number of tasks proceeded
  */
@@ -129,127 +85,20 @@ reduce_tasks_count (gpointer arg)
 
 	worker->nconns --;
 
-	if (worker->wanna_die && worker->nconns == 0) {
+	if (worker->state == rspamd_worker_wait_connections && worker->nconns == 0) {
+
+		worker->state = rspamd_worker_wait_final_scripts;
 		msg_info ("performing finishing actions");
-		rspamd_worker_call_finish_handlers (worker);
-	}
-}
 
-void
-rspamd_task_timeout (EV_P_ ev_timer *w, int revents)
-{
-	struct rspamd_task *task = (struct rspamd_task *)w->data;
-
-	if (!(task->processed_stages & RSPAMD_TASK_STAGE_FILTERS)) {
-		msg_info_task ("processing of task time out: %.1f second spent; forced processing",
-				ev_now (task->event_loop) - task->task_timestamp);
-
-		if (task->cfg->soft_reject_on_timeout) {
-			struct rspamd_action *action, *soft_reject;
-
-			action = rspamd_check_action_metric (task);
-
-			if (action->action_type != METRIC_ACTION_REJECT) {
-				soft_reject = rspamd_config_get_action_by_type (task->cfg,
-						METRIC_ACTION_SOFT_REJECT);
-				rspamd_add_passthrough_result (task,
-						soft_reject,
-						0,
-						NAN,
-						"timeout processing message",
-						"task timeout",
-						0);
-
-				ucl_object_replace_key (task->messages,
-						ucl_object_fromstring_common ("timeout processing message",
-								0, UCL_STRING_RAW),
-						"smtp_message", 0,
-						false);
-			}
-		}
-
-		ev_timer_again (EV_A_ w);
-		task->processed_stages |= RSPAMD_TASK_STAGE_FILTERS;
-		rspamd_session_cleanup (task->s);
-		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
-		rspamd_session_pending (task->s);
-	}
-	else {
-		/* Postprocessing timeout */
-		msg_info_task ("post-processing of task time out: %.1f second spent; forced processing",
-				ev_now (task->event_loop) - task->task_timestamp);
-
-		if (task->cfg->soft_reject_on_timeout) {
-			struct rspamd_action *action, *soft_reject;
-
-			action = rspamd_check_action_metric (task);
-
-			if (action->action_type != METRIC_ACTION_REJECT) {
-				soft_reject = rspamd_config_get_action_by_type (task->cfg,
-						METRIC_ACTION_SOFT_REJECT);
-				rspamd_add_passthrough_result (task,
-						soft_reject,
-						0,
-						NAN,
-						"timeout post-processing message",
-						"task timeout",
-						0);
-
-				ucl_object_replace_key (task->messages,
-						ucl_object_fromstring_common ("timeout post-processing message",
-								0, UCL_STRING_RAW),
-						"smtp_message", 0,
-						false);
-			}
-		}
-
-		ev_timer_stop (EV_A_ w);
-		task->processed_stages |= RSPAMD_TASK_STAGE_DONE;
-		rspamd_session_cleanup (task->s);
-		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
-		rspamd_session_pending (task->s);
-	}
-}
-
-void
-rspamd_worker_guard_handler (EV_P_ ev_io *w, int revents)
-{
-	struct rspamd_task *task = (struct rspamd_task *)w->data;
-	gchar fake_buf[1024];
-	gssize r;
-
-	r = read (w->fd, fake_buf, sizeof (fake_buf));
-
-	if (r > 0) {
-		msg_warn_task ("received extra data after task is loaded, ignoring");
-	}
-	else {
-		if (r == 0) {
-			/*
-			 * Poor man approach, that might break things in case of
-			 * shutdown (SHUT_WR) but sockets are so bad that there's no
-			 * reliable way to distinguish between shutdown(SHUT_WR) and
-			 * close.
-			 */
-			if (task->cmd != CMD_CHECK_V2 && task->cfg->enable_shutdown_workaround) {
-				msg_info_task ("workaround for shutdown enabled, please update "
-						"your client, this support might be removed in future");
-				shutdown (w->fd, SHUT_RD);
-				ev_io_stop (task->event_loop, &task->guard_ev);
-			}
-			else {
-				msg_err_task ("the peer has closed connection unexpectedly");
-				rspamd_session_destroy (task->s);
-			}
-		}
-		else if (errno != EAGAIN) {
-			msg_err_task ("the peer has closed connection unexpectedly: %s",
-					strerror (errno));
-			rspamd_session_destroy (task->s);
+		if (rspamd_worker_call_finish_handlers (worker)) {
+			worker->state = rspamd_worker_wait_final_scripts;
 		}
 		else {
-			return;
+			worker->state = rspamd_worker_wanna_die;
 		}
+	}
+	else if (worker->state != rspamd_worker_state_running) {
+		worker->state = rspamd_worker_wait_connections;
 	}
 }
 
@@ -258,10 +107,67 @@ rspamd_worker_body_handler (struct rspamd_http_connection *conn,
 	struct rspamd_http_message *msg,
 	const gchar *chunk, gsize len)
 {
-	struct rspamd_task *task = (struct rspamd_task *) conn->ud;
+	struct rspamd_worker_session *session = (struct rspamd_worker_session *)conn->ud;
+	struct rspamd_task *task;
 	struct rspamd_worker_ctx *ctx;
+	const rspamd_ftok_t *hv_tok;
+	gboolean debug_mempool = FALSE;
 
-	ctx = task->worker->ctx;
+	ctx = session->ctx;
+
+	/* Check debug */
+	if ((hv_tok = rspamd_http_message_find_header (msg, "Memory")) != NULL) {
+		rspamd_ftok_t cmp;
+
+		RSPAMD_FTOK_ASSIGN (&cmp, "debug");
+
+		if (rspamd_ftok_cmp (hv_tok, &cmp) == 0) {
+			debug_mempool = TRUE;
+		}
+	}
+
+	task = rspamd_task_new (session->worker,
+			session->ctx->cfg, NULL, session->ctx->lang_det,
+			session->ctx->event_loop,
+			debug_mempool);
+	session->task = task;
+
+	msg_info_task ("accepted connection from %s port %d, task ptr: %p",
+			rspamd_inet_address_to_string (session->addr),
+			rspamd_inet_address_get_port (session->addr),
+			task);
+
+	/* Copy some variables */
+	if (ctx->is_mime) {
+		task->flags |= RSPAMD_TASK_FLAG_MIME;
+	}
+	else {
+		task->flags &= ~RSPAMD_TASK_FLAG_MIME;
+	}
+
+	/* We actually transfer ownership from session to task here  */
+	task->sock = session->fd;
+	task->client_addr = session->addr;
+	task->worker = session->worker;
+	task->http_conn = session->http_conn;
+
+	task->resolver = ctx->resolver;
+	/* TODO: allow to disable autolearn in protocol */
+	task->flags |= RSPAMD_TASK_FLAG_LEARN_AUTO;
+
+	session->worker->nconns++;
+	rspamd_mempool_add_destructor (task->task_pool,
+			(rspamd_mempool_destruct_t)reduce_tasks_count,
+			session->worker);
+
+	/* Session memory is also now handled by task */
+	rspamd_mempool_add_destructor (task->task_pool,
+			(rspamd_mempool_destruct_t)g_free,
+			session);
+
+	/* Set up async session */
+	task->s = rspamd_session_create (task->task_pool, rspamd_task_fin,
+			rspamd_task_restore, (event_finalizer_t )rspamd_task_free, task);
 
 	if (!rspamd_protocol_handle_request (task, msg)) {
 		msg_err_task ("cannot handle request: %e", task->err);
@@ -285,12 +191,15 @@ rspamd_worker_body_handler (struct rspamd_http_connection *conn,
 		ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
 				ctx->task_timeout,
 				ctx->task_timeout);
+		ev_set_priority (&task->timeout_ev, EV_MAXPRI);
 		ev_timer_start (task->event_loop, &task->timeout_ev);
 	}
 
 	/* Set socket guard */
 	task->guard_ev.data = task;
-	ev_io_init (&task->guard_ev, rspamd_worker_guard_handler, task->sock, EV_READ);
+	ev_io_init (&task->guard_ev,
+			rspamd_worker_guard_handler,
+			task->sock, EV_READ);
 	ev_io_start (task->event_loop, &task->guard_ev);
 
 	rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
@@ -301,43 +210,84 @@ rspamd_worker_body_handler (struct rspamd_http_connection *conn,
 static void
 rspamd_worker_error_handler (struct rspamd_http_connection *conn, GError *err)
 {
-	struct rspamd_task *task = (struct rspamd_task *) conn->ud;
+	struct rspamd_worker_session *session = (struct rspamd_worker_session *)conn->ud;
+	struct rspamd_task *task;
 	struct rspamd_http_message *msg;
 	rspamd_fstring_t *reply;
 
-	msg_info_task ("abnormally closing connection from: %s, error: %e",
-		rspamd_inet_address_to_string (task->client_addr), err);
-	if (task->processed_stages & RSPAMD_TASK_STAGE_REPLIED) {
-		/* Terminate session immediately */
-		rspamd_session_destroy (task->s);
+	/*
+	 * This function can be called with both struct rspamd_worker_session *
+	 * and struct rspamd_task *
+	 *
+	 * The first case is when we read message and it is controlled by this code;
+	 * the second case is when a reply is written and we do not control it normally,
+	 * as it is managed by `rspamd_protocol_reply` in protocol.c
+	 *
+	 * Hence, we need to distinguish our arguments...
+	 *
+	 * The approach here is simple:
+	 * - struct rspamd_worker_session starts with gint64 `magic` and we set it to
+	 * MAX_INT64
+	 * - struct rspamd_task starts with a pointer (or pointer + command on 32 bit system)
+	 *
+	 * The idea is simple: no sane pointer would reach MAX_INT64, so if this field
+	 * is MAX_INT64 then it is our session, and if it is not then it is a task.
+	 */
+
+	if (session->magic == G_MAXINT64) {
+		task = session->task;
 	}
 	else {
-		task->processed_stages |= RSPAMD_TASK_STAGE_REPLIED;
-		msg = rspamd_http_new_message (HTTP_RESPONSE);
+		task = (struct rspamd_task *)conn->ud;
+	}
 
-		if (err) {
-			msg->status = rspamd_fstring_new_init (err->message,
-					strlen (err->message));
-			msg->code = err->code;
+
+	if (task) {
+		msg_info_task ("abnormally closing connection from: %s, error: %e",
+				rspamd_inet_address_to_string_pretty (task->client_addr), err);
+
+		if (task->processed_stages & RSPAMD_TASK_STAGE_REPLIED) {
+			/* Terminate session immediately */
+			rspamd_session_destroy (task->s);
 		}
 		else {
-			msg->status = rspamd_fstring_new_init ("Internal error",
-					strlen ("Internal error"));
-			msg->code = 500;
+			task->processed_stages |= RSPAMD_TASK_STAGE_REPLIED;
+			msg = rspamd_http_new_message (HTTP_RESPONSE);
+
+			if (err) {
+				msg->status = rspamd_fstring_new_init (err->message,
+						strlen (err->message));
+				msg->code = err->code;
+			}
+			else {
+				msg->status = rspamd_fstring_new_init ("Internal error",
+						strlen ("Internal error"));
+				msg->code = 500;
+			}
+
+			msg->date = time (NULL);
+
+			reply = rspamd_fstring_sized_new (msg->status->len + 16);
+			rspamd_printf_fstring (&reply, "{\"error\":\"%V\"}", msg->status);
+			rspamd_http_message_set_body_from_fstring_steal (msg, reply);
+			rspamd_http_connection_reset (task->http_conn);
+			rspamd_http_connection_write_message (task->http_conn,
+					msg,
+					NULL,
+					"application/json",
+					task,
+					1.0);
 		}
-
-		msg->date = time (NULL);
-
-		reply = rspamd_fstring_sized_new (msg->status->len + 16);
-		rspamd_printf_fstring (&reply, "{\"error\":\"%V\"}", msg->status);
-		rspamd_http_message_set_body_from_fstring_steal (msg, reply);
-		rspamd_http_connection_reset (task->http_conn);
-		rspamd_http_connection_write_message (task->http_conn,
-				msg,
-				NULL,
-				"application/json",
-				task,
-				1.0);
+	}
+	else {
+		/* If there was no task, then session is unmanaged */
+		msg_info ("no data received from: %s, error: %e",
+				rspamd_inet_address_to_string_pretty (session->addr), err);
+		rspamd_http_connection_reset (session->http_conn);
+		rspamd_http_connection_unref (session->http_conn);
+		rspamd_inet_address_free (session->addr);
+		close (session->fd);
+		g_free (session);
 	}
 }
 
@@ -345,16 +295,38 @@ static gint
 rspamd_worker_finish_handler (struct rspamd_http_connection *conn,
 	struct rspamd_http_message *msg)
 {
-	struct rspamd_task *task = (struct rspamd_task *) conn->ud;
+	struct rspamd_worker_session *session = (struct rspamd_worker_session *)conn->ud;
+	struct rspamd_task *task;
 
-	if (task->processed_stages & RSPAMD_TASK_STAGE_REPLIED) {
-		/* We are done here */
-		msg_debug_task ("normally closing connection from: %s",
-			rspamd_inet_address_to_string (task->client_addr));
-		rspamd_session_destroy (task->s);
+	/* Read the comment to rspamd_worker_error_handler */
+
+	if (session->magic == G_MAXINT64) {
+		task = session->task;
 	}
-	else if (task->processed_stages & RSPAMD_TASK_STAGE_DONE) {
-		rspamd_session_pending (task->s);
+	else {
+		task = (struct rspamd_task *)conn->ud;
+	}
+
+	if (task) {
+		if (task->processed_stages & RSPAMD_TASK_STAGE_REPLIED) {
+			/* We are done here */
+			msg_debug_task ("normally closing connection from: %s",
+					rspamd_inet_address_to_string (task->client_addr));
+			rspamd_session_destroy (task->s);
+		}
+		else if (task->processed_stages & RSPAMD_TASK_STAGE_DONE) {
+			rspamd_session_pending (task->s);
+		}
+	}
+	else {
+		/* If there was no task, then session is unmanaged */
+		msg_info ("no data received from: %s, closing connection",
+				rspamd_inet_address_to_string_pretty (session->addr));
+		rspamd_inet_address_free (session->addr);
+		rspamd_http_connection_reset (session->http_conn);
+		rspamd_http_connection_unref (session->http_conn);
+		close (session->fd);
+		g_free (session);
 	}
 
 	return 0;
@@ -368,7 +340,7 @@ accept_socket (EV_P_ ev_io *w, int revents)
 {
 	struct rspamd_worker *worker = (struct rspamd_worker *) w->data;
 	struct rspamd_worker_ctx *ctx;
-	struct rspamd_task *task;
+	struct rspamd_worker_session *session;
 	rspamd_inet_addr_t *addr;
 	gint nfd, http_opts = 0;
 
@@ -392,130 +364,36 @@ accept_socket (EV_P_ ev_io *w, int revents)
 		return;
 	}
 
-	task = rspamd_task_new (worker, ctx->cfg, NULL, ctx->lang_det, ctx->event_loop);
+	session = g_malloc0 (sizeof (*session));
+	session->magic = G_MAXINT64;
+	session->addr = addr;
+	session->fd = nfd;
+	session->ctx = ctx;
+	session->worker = worker;
 
-	msg_info_task ("accepted connection from %s port %d, task ptr: %p",
-		rspamd_inet_address_to_string (addr),
-		rspamd_inet_address_get_port (addr),
-		task);
-
-	/* Copy some variables */
-	if (ctx->is_mime) {
-		task->flags |= RSPAMD_TASK_FLAG_MIME;
-	}
-	else {
-		task->flags &= ~RSPAMD_TASK_FLAG_MIME;
-	}
-
-	task->sock = nfd;
-	task->client_addr = addr;
-
-	worker->srv->stat->connections_count++;
-	task->resolver = ctx->resolver;
-	/* TODO: allow to disable autolearn in protocol */
-	task->flags |= RSPAMD_TASK_FLAG_LEARN_AUTO;
-
-	if (ctx->encrypted_only && !rspamd_inet_address_is_local (addr, FALSE)) {
+	if (ctx->encrypted_only && !rspamd_inet_address_is_local (addr)) {
 		http_opts = RSPAMD_HTTP_REQUIRE_ENCRYPTION;
 	}
 
-	task->http_conn = rspamd_http_connection_new_server (
+	session->http_conn = rspamd_http_connection_new_server (
 			ctx->http_ctx,
 			nfd,
 			rspamd_worker_body_handler,
 			rspamd_worker_error_handler,
 			rspamd_worker_finish_handler,
 			http_opts);
-	rspamd_http_connection_set_max_size (task->http_conn, task->cfg->max_message);
-	worker->nconns++;
-	rspamd_mempool_add_destructor (task->task_pool,
-		(rspamd_mempool_destruct_t)reduce_tasks_count, worker);
 
-	/* Set up async session */
-	task->s = rspamd_session_create (task->task_pool, rspamd_task_fin,
-			rspamd_task_restore, (event_finalizer_t )rspamd_task_free, task);
+	worker->srv->stat->connections_count++;
+	rspamd_http_connection_set_max_size (session->http_conn,
+			ctx->cfg->max_message);
 
 	if (ctx->key) {
-		rspamd_http_connection_set_key (task->http_conn, ctx->key);
+		rspamd_http_connection_set_key (session->http_conn, ctx->key);
 	}
 
-	rspamd_http_connection_read_message (task->http_conn,
-			task,
+	rspamd_http_connection_read_message (session->http_conn,
+			session,
 			ctx->timeout);
-}
-
-static gboolean
-rspamd_worker_log_pipe_handler (struct rspamd_main *rspamd_main,
-		struct rspamd_worker *worker, gint fd,
-		gint attached_fd,
-		struct rspamd_control_command *cmd,
-		gpointer ud)
-{
-	struct rspamd_config *cfg = ud;
-	struct rspamd_worker_log_pipe *lp;
-	struct rspamd_control_reply rep;
-
-	memset (&rep, 0, sizeof (rep));
-	rep.type = RSPAMD_CONTROL_LOG_PIPE;
-
-	if (attached_fd != -1) {
-		lp = g_malloc0 (sizeof (*lp));
-		lp->fd = attached_fd;
-		lp->type = cmd->cmd.log_pipe.type;
-
-		DL_APPEND (cfg->log_pipes, lp);
-		msg_info ("added new log pipe");
-	}
-	else {
-		rep.reply.log_pipe.status = ENOENT;
-		msg_err ("cannot attach log pipe: invalid fd");
-	}
-
-	if (write (fd, &rep, sizeof (rep)) != sizeof (rep)) {
-		msg_err ("cannot write reply to the control socket: %s",
-				strerror (errno));
-	}
-
-	return TRUE;
-}
-
-static gboolean
-rspamd_worker_monitored_handler (struct rspamd_main *rspamd_main,
-		struct rspamd_worker *worker, gint fd,
-		gint attached_fd,
-		struct rspamd_control_command *cmd,
-		gpointer ud)
-{
-	struct rspamd_control_reply rep;
-	struct rspamd_monitored *m;
-	struct rspamd_monitored_ctx *mctx = worker->srv->cfg->monitored_ctx;
-	struct rspamd_config *cfg = ud;
-
-	memset (&rep, 0, sizeof (rep));
-	rep.type = RSPAMD_CONTROL_MONITORED_CHANGE;
-
-	if (cmd->cmd.monitored_change.sender != getpid ()) {
-		m = rspamd_monitored_by_tag (mctx, cmd->cmd.monitored_change.tag);
-
-		if (m != NULL) {
-			rspamd_monitored_set_alive (m, cmd->cmd.monitored_change.alive);
-			rep.reply.monitored_change.status = 1;
-			msg_info_config ("updated monitored status for %s: %s",
-					cmd->cmd.monitored_change.tag,
-					cmd->cmd.monitored_change.alive ? "alive" : "dead");
-		} else {
-			msg_err ("cannot find monitored by tag: %*s", 32,
-					cmd->cmd.monitored_change.tag);
-			rep.reply.monitored_change.status = 0;
-		}
-	}
-
-	if (write (fd, &rep, sizeof (rep)) != sizeof (rep)) {
-		msg_err ("cannot write reply to the control socket: %s",
-				strerror (errno));
-	}
-
-	return TRUE;
 }
 
 gpointer
@@ -596,46 +474,6 @@ init_worker (struct rspamd_config *cfg)
 	return ctx;
 }
 
-static gboolean
-rspamd_worker_on_terminate (struct rspamd_worker *worker)
-{
-	if (worker->nconns == 0) {
-		msg_info ("performing finishing actions");
-		if (rspamd_worker_call_finish_handlers (worker)) {
-			return TRUE;
-		}
-	}
-
-	return FALSE;
-}
-
-void
-rspamd_worker_init_scanner (struct rspamd_worker *worker,
-		struct ev_loop *ev_base,
-		struct rspamd_dns_resolver *resolver,
-		struct rspamd_lang_detector **plang_det)
-{
-	rspamd_stat_init (worker->srv->cfg, ev_base);
-	g_ptr_array_add (worker->finish_actions,
-			(gpointer) rspamd_worker_on_terminate);
-#ifdef WITH_HYPERSCAN
-	rspamd_control_worker_add_cmd_handler (worker,
-			RSPAMD_CONTROL_HYPERSCAN_LOADED,
-			rspamd_worker_hyperscan_ready,
-			NULL);
-#endif
-	rspamd_control_worker_add_cmd_handler (worker,
-			RSPAMD_CONTROL_LOG_PIPE,
-			rspamd_worker_log_pipe_handler,
-			worker->srv->cfg);
-	rspamd_control_worker_add_cmd_handler (worker,
-			RSPAMD_CONTROL_MONITORED_CHANGE,
-			rspamd_worker_monitored_handler,
-			worker->srv->cfg);
-
-	*plang_det = worker->srv->cfg->lang_det;
-}
-
 /*
  * Start worker process
  */
@@ -643,6 +481,7 @@ void
 start_worker (struct rspamd_worker *worker)
 {
 	struct rspamd_worker_ctx *ctx = worker->ctx;
+	gboolean is_controller = FALSE;
 
 	g_assert (rspamd_worker_check_context (worker->ctx, rspamd_worker_magic));
 	ctx->cfg = worker->srv->cfg;
@@ -662,7 +501,6 @@ start_worker (struct rspamd_worker *worker)
 	ctx->resolver = rspamd_dns_resolver_init (worker->srv->logger,
 			ctx->event_loop,
 			worker->srv->cfg);
-	rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver, worker, 0);
 	rspamd_upstreams_library_config (worker->srv->cfg, ctx->cfg->ups_ctx,
 			ctx->event_loop, ctx->resolver->r);
 
@@ -673,15 +511,57 @@ start_worker (struct rspamd_worker *worker)
 			ctx->http_ctx);
 	rspamd_worker_init_scanner (worker, ctx->event_loop, ctx->resolver,
 			&ctx->lang_det);
+
+	if (worker->index == 0) {
+		/* If there are no controllers, then pretend that we are a controller */
+		gboolean controller_seen = FALSE;
+		GList *cur;
+
+		cur = worker->srv->cfg->workers;
+
+		while (cur) {
+			struct rspamd_worker_conf *cf;
+
+			cf = (struct rspamd_worker_conf *)cur->data;
+			if (cf->type == g_quark_from_static_string ("controller")) {
+				if (cf->enabled && cf->count >= 0) {
+					controller_seen = TRUE;
+					break;
+				}
+			}
+
+			cur = g_list_next (cur);
+		}
+
+		if (!controller_seen) {
+			msg_info_ctx ("no controller workers defined, execute "
+				 "controller periodics in this worker");
+			worker->flags |= RSPAMD_WORKER_CONTROLLER;
+			is_controller = TRUE;
+		}
+	}
+
+	if (is_controller) {
+		rspamd_worker_init_controller (worker, NULL);
+	}
+	else {
+		rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver,
+				worker, RSPAMD_MAP_WATCH_SCANNER);
+	}
+
 	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop,
 			worker);
 
 	ev_loop (ctx->event_loop, 0);
 	rspamd_worker_block_signals ();
 
+	if (is_controller) {
+		rspamd_controller_on_terminate (worker, NULL);
+	}
+
 	rspamd_stat_close ();
 	REF_RELEASE (ctx->cfg);
-	rspamd_log_close (worker->srv->logger, TRUE);
+	rspamd_log_close (worker->srv->logger);
 
 	exit (EXIT_SUCCESS);
 }

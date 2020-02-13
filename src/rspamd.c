@@ -15,7 +15,7 @@
  */
 #include "config.h"
 #include "rspamd.h"
-#include "libutil/map.h"
+#include "libserver/maps/map.h"
 #include "lua/lua_common.h"
 #include "libserver/worker_util.h"
 #include "libserver/rspamd_control.h"
@@ -23,10 +23,6 @@
 #include "cryptobox.h"
 #include "utlist.h"
 #include "unix-std.h"
-/* sysexits */
-#ifdef HAVE_SYSEXITS_H
-#include <sysexits.h>
-#endif
 /* pwd and grp */
 #ifdef HAVE_PWD_H
 #include <pwd.h>
@@ -49,9 +45,6 @@
 #ifdef HAVE_LIBUTIL_H
 #include <libutil.h>
 #endif
-#ifdef WITH_GPERF_TOOLS
-#include <gperftools/profiler.h>
-#endif
 #ifdef HAVE_STROPS_H
 #include <stropts.h>
 #endif
@@ -59,8 +52,6 @@
 #ifdef HAVE_OPENSSL
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <src/libserver/rspamd_control.h>
-
 #endif
 
 #include "sqlite3.h"
@@ -70,7 +61,7 @@
 #define SOFT_FORK_TIME 2
 
 /* 10 seconds after getting termination signal to terminate all workers with SIGKILL */
-#define TERMINATION_ATTEMPTS 50
+#define TERMINATION_INTERVAL (0.2)
 
 static gboolean load_rspamd_config (struct rspamd_main *rspamd_main,
 									struct rspamd_config *cfg,
@@ -207,6 +198,35 @@ read_cmd_line (gint *argc, gchar ***argv, struct rspamd_config *cfg)
 	g_option_context_free (context);
 }
 
+static int
+rspamd_write_pid (struct rspamd_main *main)
+{
+	pid_t pid;
+
+	if (main->cfg->pid_file == NULL) {
+		return -1;
+	}
+	main->pfh = rspamd_pidfile_open (main->cfg->pid_file, 0644, &pid);
+
+	if (main->pfh == NULL) {
+		return -1;
+	}
+
+	if (main->is_privilleged) {
+		/* Force root user as owner of pid file */
+#ifdef HAVE_PIDFILE_FILENO
+		if (fchown (pidfile_fileno (main->pfh), 0, 0) == -1) {
+#else
+		if (fchown (main->pfh->pf_fd, 0, 0) == -1) {
+#endif
+		}
+	}
+
+	rspamd_pidfile_write (main->pfh);
+
+	return 0;
+}
+
 /* Detect privilleged mode */
 static void
 detect_priv (struct rspamd_main *rspamd_main)
@@ -263,12 +283,18 @@ config_logger (rspamd_mempool_t *pool, gpointer ud)
 {
 	struct rspamd_main *rspamd_main = ud;
 
-	rspamd_set_logger (rspamd_main->cfg, g_quark_try_string ("main"),
-			&rspamd_main->logger, rspamd_main->server_pool);
+	rspamd_main->logger = rspamd_log_open_specific (rspamd_main->server_pool,
+			rspamd_main->cfg,
+			"main",
+			rspamd_main->workers_uid,
+			rspamd_main->workers_gid);
 
-	if (rspamd_log_open_priv (rspamd_main->logger,
-			rspamd_main->workers_uid, rspamd_main->workers_gid) == -1) {
-		fprintf (stderr, "Fatal error, cannot open logfile, exiting\n");
+	if (rspamd_main->logger == NULL) {
+		/*
+		 * XXX:
+		 * Error has been already logged (in fact,
+		 * we might fall back to console logger here)
+		 */
 		exit (EXIT_FAILURE);
 	}
 
@@ -293,24 +319,18 @@ reread_config (struct rspamd_main *rspamd_main)
 	tmp_cfg->cfg_name = cfg_file;
 	old_cfg = rspamd_main->cfg;
 	rspamd_main->cfg = tmp_cfg;
+	rspamd_logger_t *old_logger = rspamd_main->logger;
 
 	if (!load_rspamd_config (rspamd_main, tmp_cfg, TRUE, load_opts, TRUE)) {
 		rspamd_main->cfg = old_cfg;
-		rspamd_log_close_priv (rspamd_main->logger,
-					FALSE,
-					rspamd_main->workers_uid,
-					rspamd_main->workers_gid);
-		rspamd_set_logger (rspamd_main->cfg, g_quark_try_string ("main"),
-				&rspamd_main->logger, rspamd_main->server_pool);
-		rspamd_log_open_priv (rspamd_main->logger,
-					rspamd_main->workers_uid,
-					rspamd_main->workers_gid);
+		rspamd_main->logger = old_logger;
 		msg_err_main ("cannot parse new config file, revert to old one");
 		REF_RELEASE (tmp_cfg);
 
 		return FALSE;
 	}
 	else {
+		rspamd_log_close (old_logger);
 		msg_info_main ("replacing config");
 		REF_RELEASE (old_cfg);
 		rspamd_main->cfg->rspamd_user = rspamd_user;
@@ -495,6 +515,21 @@ systemd_get_socket (struct rspamd_main *rspamd_main, gint number)
 	}
 
 	return result;
+}
+
+static void
+pass_signal_cb (gpointer key, gpointer value, gpointer ud)
+{
+	struct rspamd_worker *cur = value;
+	gint signo = GPOINTER_TO_INT (ud);
+
+	kill (cur->pid, signo);
+}
+
+static void
+rspamd_pass_signal (GHashTable * workers, gint signo)
+{
+	g_hash_table_foreach (workers, pass_signal_cb, GINT_TO_POINTER (signo));
 }
 
 static inline uintptr_t
@@ -691,8 +726,8 @@ kill_old_workers (gpointer key, gpointer value, gpointer unused)
 
 	rspamd_main = w->srv;
 
-	if (!w->wanna_die) {
-		w->wanna_die = TRUE;
+	if (w->state == rspamd_worker_state_running) {
+		w->state = rspamd_worker_state_terminating;
 		kill (w->pid, SIGUSR2);
 		ev_io_stop (rspamd_main->event_loop, &w->srv_ev);
 		msg_info_main ("send signal to worker %P", w->pid);
@@ -710,38 +745,27 @@ rspamd_worker_wait (struct rspamd_worker *w)
 
 	if (term_attempts < 0) {
 		if (w->cf->worker->flags & RSPAMD_WORKER_KILLABLE) {
-			msg_warn_main ("terminate worker %s(%P) with SIGKILL",
-					g_quark_to_string (w->type), w->pid);
 			if (kill (w->pid, SIGKILL) == -1) {
 				if (errno == ESRCH) {
 					/* We have actually killed the process */
 					return;
 				}
 			}
+			else {
+				msg_warn_main ("terminate worker %s(%P) with SIGKILL",
+						g_quark_to_string (w->type), w->pid);
+			}
 		}
 		else {
-			if (term_attempts > -(TERMINATION_ATTEMPTS * 2)) {
-				if (term_attempts % 10 == 0) {
-					msg_info_main ("waiting for worker %s(%P) to sync, "
-								   "%d seconds remain",
-							g_quark_to_string (w->type), w->pid,
-							(TERMINATION_ATTEMPTS * 2 + term_attempts) / 5);
-					kill (w->pid, SIGTERM);
-					if (errno == ESRCH) {
-						/* We have actually killed the process */
-						return;
-					}
-				}
+			kill (w->pid, SIGKILL);
+			if (errno == ESRCH) {
+				/* We have actually killed the process */
+				return;
 			}
 			else {
 				msg_err_main ("data corruption warning: terminating "
 							  "special worker %s(%P) with SIGKILL",
 						g_quark_to_string (w->type), w->pid);
-				kill (w->pid, SIGKILL);
-				if (errno == ESRCH) {
-					/* We have actually killed the process */
-					return;
-				}
 			}
 		}
 	}
@@ -940,7 +964,8 @@ rspamd_final_timer_handler (EV_P_ ev_timer *w, int revents)
 
 	term_attempts--;
 
-	g_hash_table_foreach (rspamd_main->workers, hash_worker_wait_callback, NULL);
+	g_hash_table_foreach (rspamd_main->workers, hash_worker_wait_callback,
+			NULL);
 
 	if (g_hash_table_size (rspamd_main->workers) == 0) {
 		ev_break (rspamd_main->event_loop, EVBREAK_ALL);
@@ -953,10 +978,14 @@ rspamd_term_handler (struct ev_loop *loop, ev_signal *w, int revents)
 {
 	struct rspamd_main *rspamd_main = (struct rspamd_main *)w->data;
 	static ev_timer ev_finale;
+	ev_tstamp shutdown_ts;
 
 	if (!rspamd_main->wanna_die) {
 		rspamd_main->wanna_die = TRUE;
-		msg_info_main ("catch termination signal, waiting for children");
+		shutdown_ts = MAX (SOFT_SHUTDOWN_TIME,
+				rspamd_main->cfg->task_timeout * 2.0);
+		msg_info_main ("catch termination signal, waiting for children for %.2f seconds",
+				valgrind_mode ? shutdown_ts * 10 : shutdown_ts);
 		/* Stop srv events to avoid false notifications */
 		g_hash_table_foreach (rspamd_main->workers, stop_srv_ev, rspamd_main);
 		rspamd_pass_signal (rspamd_main->workers, SIGTERM);
@@ -968,14 +997,15 @@ rspamd_term_handler (struct ev_loop *loop, ev_signal *w, int revents)
 
 		if (valgrind_mode) {
 			/* Special case if we are likely running with valgrind */
-			term_attempts = TERMINATION_ATTEMPTS * 10;
+			term_attempts = shutdown_ts / TERMINATION_INTERVAL * 10;
 		}
 		else {
-			term_attempts = TERMINATION_ATTEMPTS;
+			term_attempts = shutdown_ts / TERMINATION_INTERVAL;
 		}
 
 		ev_finale.data = rspamd_main;
-		ev_timer_init (&ev_finale, rspamd_final_timer_handler, 0.2, 0.2);
+		ev_timer_init (&ev_finale, rspamd_final_timer_handler,
+				TERMINATION_INTERVAL, TERMINATION_INTERVAL);
 		ev_timer_start (rspamd_main->event_loop, &ev_finale);
 	}
 }
@@ -986,7 +1016,8 @@ rspamd_usr1_handler (struct ev_loop *loop, ev_signal *w, int revents)
 	struct rspamd_main *rspamd_main = (struct rspamd_main *)w->data;
 
 	if (!rspamd_main->wanna_die) {
-		rspamd_log_reopen_priv (rspamd_main->logger,
+		rspamd_log_reopen (rspamd_main->logger,
+				rspamd_main->cfg,
 				rspamd_main->workers_uid,
 				rspamd_main->workers_gid);
 		msg_info_main ("logging reinitialised");
@@ -1040,12 +1071,6 @@ rspamd_hup_handler (struct ev_loop *loop, ev_signal *w, int revents)
 		/* Detach existing workers and stop their heartbeats */
 		g_hash_table_foreach (rspamd_main->workers, stop_srv_ev, rspamd_main);
 
-		/* Close log to avoid FDs leak, as reread_config will re-init logging */
-		rspamd_log_close_priv (rspamd_main->logger,
-				FALSE,
-				rspamd_main->workers_uid,
-				rspamd_main->workers_gid);
-
 		if (reread_config (rspamd_main)) {
 			msg_info_main ("kill old workers");
 			g_hash_table_foreach (rspamd_main->workers, kill_old_workers, NULL);
@@ -1092,14 +1117,12 @@ rspamd_cld_handler (EV_P_ ev_child *w, struct rspamd_main *rspamd_main,
 		close (wrk->srv_pipe[0]);
 	}
 
-	cmd.type = RSPAMD_CONTROL_CHILD_CHANGE;
-	cmd.cmd.child_change.what = rspamd_child_terminated;
-	cmd.cmd.child_change.pid = wrk->pid;
-	cmd.cmd.child_change.additional = w->rstatus;
-	rspamd_control_broadcast_srv_cmd (rspamd_main, &cmd, wrk->pid);
-
-	if (wrk->finish_actions) {
-		g_ptr_array_free (wrk->finish_actions, TRUE);
+	if (!rspamd_main->wanna_die) {
+		cmd.type = RSPAMD_CONTROL_CHILD_CHANGE;
+		cmd.cmd.child_change.what = rspamd_child_terminated;
+		cmd.cmd.child_change.pid = wrk->pid;
+		cmd.cmd.child_change.additional = w->rstatus;
+		rspamd_control_broadcast_srv_cmd (rspamd_main, &cmd, wrk->pid);
 	}
 
 	need_refork = rspamd_check_termination_clause (wrk->srv, wrk, w->rstatus);
@@ -1193,7 +1216,7 @@ main (gint argc, gchar **argv, gchar **env)
 	rspamd_main = (struct rspamd_main *) g_malloc0 (sizeof (struct rspamd_main));
 
 	rspamd_main->server_pool = rspamd_mempool_new (rspamd_mempool_suggest_size (),
-			"main");
+			"main", 0);
 	rspamd_main->stat = rspamd_mempool_alloc0_shared (rspamd_main->server_pool,
 			sizeof (struct rspamd_stat));
 	rspamd_main->cfg = rspamd_config_new (RSPAMD_CONFIG_INIT_DEFAULT);
@@ -1206,7 +1229,7 @@ main (gint argc, gchar **argv, gchar **env)
 	}
 
 #ifndef HAVE_SETPROCTITLE
-	init_title (rspamd_main, argc, argv, env);
+	init_title (rspamd_main->server_pool, argc, argv, env);
 #endif
 
 	rspamd_main->cfg->libs_ctx = rspamd_init_libs ();
@@ -1250,10 +1273,16 @@ main (gint argc, gchar **argv, gchar **env)
 	type = g_quark_from_static_string ("main");
 
 	/* First set logger to console logger */
-	rspamd_main->cfg->log_type = RSPAMD_LOG_CONSOLE;
-	rspamd_set_logger (rspamd_main->cfg, type,
-			&rspamd_main->logger, rspamd_main->server_pool);
-	(void) rspamd_log_open (rspamd_main->logger);
+	rspamd_main->logger = rspamd_log_open_emergency (rspamd_main->server_pool);
+	g_assert (rspamd_main->logger != NULL);
+
+	if (is_debug) {
+		rspamd_log_set_log_level (rspamd_main->logger, G_LOG_LEVEL_DEBUG);
+	}
+	else {
+		rspamd_log_set_log_level (rspamd_main->logger, G_LOG_LEVEL_MESSAGE);
+	}
+
 	g_log_set_default_handler (rspamd_glib_log_function, rspamd_main->logger);
 	g_set_printerr_handler (rspamd_glib_printerr_function);
 
@@ -1268,10 +1297,6 @@ main (gint argc, gchar **argv, gchar **env)
 
 	/* Init listen sockets hash */
 	listen_sockets = g_hash_table_new (g_direct_hash, g_direct_equal);
-
-	rspamd_log_close_priv (rspamd_main->logger, FALSE,
-			rspamd_main->workers_uid, rspamd_main->workers_gid);
-
 	sqlite3_initialize ();
 
 	/* Load config */
@@ -1287,14 +1312,12 @@ main (gint argc, gchar **argv, gchar **env)
 
 	/* Force debug log */
 	if (is_debug) {
-		rspamd_main->cfg->log_level = G_LOG_LEVEL_DEBUG;
+		rspamd_log_set_log_level (rspamd_main->logger, G_LOG_LEVEL_DEBUG);
 	}
 
 	/* Create rolling history */
 	rspamd_main->history = rspamd_roll_history_new (rspamd_main->server_pool,
 			rspamd_main->cfg->history_rows, rspamd_main->cfg);
-
-	gperf_profiler_init (rspamd_main->cfg, "main");
 
 	msg_info_main ("rspamd "
 			RVERSION
@@ -1351,9 +1374,6 @@ main (gint argc, gchar **argv, gchar **env)
 	/* Set title */
 	setproctitle ("main process");
 
-	/* Flush log */
-	rspamd_log_flush (rspamd_main->logger);
-
 	/* Open control socket if needed */
 	control_fd = -1;
 	if (rspamd_main->cfg->control_socket_path) {
@@ -1380,49 +1400,23 @@ main (gint argc, gchar **argv, gchar **env)
 			rspamd_main->cfg->history_file);
 	}
 
-#if defined(WITH_GPERF_TOOLS)
-	ProfilerStop ();
-#endif
 	/* Spawn workers */
 	rspamd_main->workers = g_hash_table_new (g_direct_hash, g_direct_equal);
 
 	/* Init event base */
-	event_loop = ev_default_loop (EVFLAG_SIGNALFD|EVBACKEND_ALL);
+	event_loop = ev_default_loop (EVFLAG_SIGNALFD|
+			rspamd_config_ev_backend_get (rspamd_main->cfg));
 	rspamd_main->event_loop = event_loop;
 
 	if (event_loop) {
-		unsigned loop_type = ev_backend (event_loop);
-		const gchar *loop_str = "unknown";
-		gboolean poor_backend = TRUE;
+		int loop_type = ev_backend (event_loop);
+		gboolean effective_backend;
+		const gchar *loop_str;
 
-		switch (loop_type) {
-		case EVBACKEND_EPOLL:
-			loop_str = "epoll";
-			poor_backend = FALSE;
-			break;
-		case EVBACKEND_POLL:
-			loop_str = "poll";
-			break;
-		case EVBACKEND_SELECT:
-			loop_str = "select";
-			break;
-		case EVBACKEND_KQUEUE:
-			loop_str = "kqueue";
-			poor_backend = FALSE;
-			break;
-		case EVBACKEND_PORT:
-			loop_str = "port";
-			poor_backend = FALSE;
-			break;
-		case EVBACKEND_DEVPOLL:
-			loop_str = "/dev/poll";
-			poor_backend = FALSE;
-			break;
-		default:
-			break;
-		}
+		loop_str =
+				rspamd_config_ev_backend_to_string (loop_type, &effective_backend);
 
-		if (poor_backend) {
+		if (!effective_backend) {
 			msg_warn_main ("event loop uses non-optimal backend: %s", loop_str);
 		}
 		else {
@@ -1491,7 +1485,7 @@ main (gint argc, gchar **argv, gchar **env)
 	msg_info_main ("terminating...");
 
 	REF_RELEASE (rspamd_main->cfg);
-	rspamd_log_close (rspamd_main->logger, TRUE);
+	rspamd_log_close (rspamd_main->logger);
 	g_hash_table_unref (rspamd_main->spairs);
 	g_hash_table_unref (rspamd_main->workers);
 	rspamd_mempool_delete (rspamd_main->server_pool);

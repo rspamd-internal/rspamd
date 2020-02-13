@@ -15,13 +15,11 @@
  */
 #include "config.h"
 #include "libserver/dynamic_cfg.h"
-#include "libserver/cfg_file_private.h"
 #include "libutil/rrd.h"
 #include "libutil/map.h"
 #include "libutil/map_helpers.h"
 #include "libutil/map_private.h"
 #include "libutil/http_private.h"
-#include "libutil/http_router.h"
 #include "libstat/stat_api.h"
 #include "rspamd.h"
 #include "libserver/worker_util.h"
@@ -105,8 +103,12 @@ INIT_LOG_MODULE(controller)
 #define COLOR_REJECT "#CB4B4B"
 #define COLOR_TOTAL "#9440ED"
 
-static const ev_tstamp rrd_update_time = 1.0;
-static const guint64 rspamd_controller_ctx_magic = 0xf72697805e6941faULL;
+const struct timeval rrd_update_time = {
+		.tv_sec = 1,
+		.tv_usec = 0
+};
+
+const guint64 rspamd_controller_ctx_magic = 0xf72697805e6941faULL;
 
 extern void fuzzy_stat_command (struct rspamd_task *task);
 
@@ -128,13 +130,14 @@ worker_t controller_worker = {
 struct rspamd_controller_worker_ctx {
 	guint64 magic;
 	/* Events base */
-	struct ev_loop *event_loop;
+	struct event_base *ev_base;
 	/* DNS resolver */
 	struct rspamd_dns_resolver *resolver;
 	/* Config */
 	struct rspamd_config *cfg;
 	/* END OF COMMON PART */
-	ev_tstamp timeout;
+	guint32 timeout;
+	struct timeval io_tv;
 	/* Whether we use ssl for this server */
 	gboolean use_ssl;
 	/* Webui password */
@@ -145,10 +148,9 @@ struct rspamd_controller_worker_ctx {
 	rspamd_ftok_t cached_password;
 	rspamd_ftok_t cached_enable_password;
 	/* HTTP server */
-	struct rspamd_http_context *http_ctx;
 	struct rspamd_http_connection_router *http;
 	/* Server's start time */
-	ev_tstamp start_time;
+	time_t start_time;
 	/* Main server */
 	struct rspamd_main *srv;
 	/* SSL cert */
@@ -177,9 +179,9 @@ struct rspamd_controller_worker_ctx {
 	/* Local keypair */
 	gpointer key;
 
-	ev_timer rrd_event;
+	struct event *rrd_event;
 	struct rspamd_rrd_file *rrd;
-	ev_timer save_stats_event;
+	struct event save_stats_event;
 	struct rspamd_lang_detector *lang_det;
 	gdouble task_timeout;
 };
@@ -434,8 +436,7 @@ rspamd_controller_check_forwarded (struct rspamd_controller_session *session,
 			comma = hdr->begin;
 		}
 		if (rspamd_parse_inet_address (&addr, comma,
-				(hdr->begin + hdr->len) - comma,
-				RSPAMD_INET_ADDRESS_PARSE_NO_UNIX)) {
+				(hdr->begin + hdr->len) - comma)) {
 			/* We have addr now, so check if it is still trusted */
 			if (ctx->secure_map &&
 					rspamd_match_radix_map_addr (ctx->secure_map, addr) != NULL) {
@@ -464,8 +465,7 @@ rspamd_controller_check_forwarded (struct rspamd_controller_session *session,
 		hdr = rspamd_http_message_find_header (msg, alt_hdr_name);
 
 		if (hdr) {
-			if (rspamd_parse_inet_address (&addr, hdr->begin, hdr->len,
-					RSPAMD_INET_ADDRESS_PARSE_NO_UNIX)) {
+			if (rspamd_parse_inet_address (&addr, hdr->begin, hdr->len)) {
 				/* We have addr now, so check if it is still trusted */
 				if (ctx->secure_map &&
 						rspamd_match_radix_map_addr (ctx->secure_map, addr) != NULL) {
@@ -729,7 +729,7 @@ rspamd_controller_handle_auth (struct rspamd_http_connection_entry *conn_ent,
 	data[4] = st->actions_stat[METRIC_ACTION_SOFT_REJECT];
 
 	/* Get uptime */
-	uptime = ev_time () - session->ctx->start_time;
+	uptime = time (NULL) - session->ctx->start_time;
 
 	ucl_object_insert_key (obj, ucl_object_fromstring (
 			RVERSION),			   "version",  0, false);
@@ -864,7 +864,8 @@ rspamd_controller_handle_actions (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
 	struct rspamd_controller_session *session = conn_ent->ud;
-	struct rspamd_action *act, *tmp;
+	struct rspamd_action *act;
+	gint i;
 	ucl_object_t *obj, *top;
 
 	if (!rspamd_controller_check_password (conn_ent, session, msg, FALSE)) {
@@ -873,14 +874,15 @@ rspamd_controller_handle_actions (struct rspamd_http_connection_entry *conn_ent,
 
 	top = ucl_object_typed_new (UCL_ARRAY);
 
-	HASH_ITER (hh, session->cfg->actions, act, tmp) {
+	/* Get actions for default metric */
+	for (i = METRIC_ACTION_REJECT; i < METRIC_ACTION_MAX; i++) {
+		act = &session->cfg->actions[i];
 		obj = ucl_object_typed_new (UCL_OBJECT);
 		ucl_object_insert_key (obj,
-				ucl_object_fromstring (act->name),
-				"action", 0, false);
-		ucl_object_insert_key (obj,
-				ucl_object_fromdouble (act->threshold),
-				"value", 0, false);
+				ucl_object_fromstring (rspamd_action_to_str (
+						act->action)), "action", 0, false);
+		ucl_object_insert_key (obj, ucl_object_fromdouble (
+				act->score), "value", 0, false);
 		ucl_array_append (top, obj);
 	}
 
@@ -997,7 +999,7 @@ rspamd_controller_handle_get_map (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_controller_session *session = conn_ent->ud;
 	GList *cur;
 	struct rspamd_map *map;
-	struct rspamd_map_backend *bk = NULL;
+	struct rspamd_map_backend *bk;
 	const rspamd_ftok_t *idstr;
 	struct stat st;
 	gint fd;
@@ -1038,7 +1040,7 @@ rspamd_controller_handle_get_map (struct rspamd_http_connection_entry *conn_ent,
 		cur = g_list_next (cur);
 	}
 
-	if (!found || bk == NULL) {
+	if (!found) {
 		msg_info_session ("map not found");
 		rspamd_controller_send_error (conn_ent, 404, "Map not found");
 		return 0;
@@ -1075,8 +1077,8 @@ rspamd_controller_handle_get_map (struct rspamd_http_connection_entry *conn_ent,
 	rspamd_http_connection_reset (conn_ent->conn);
 	rspamd_http_router_insert_headers (conn_ent->rt, reply);
 	rspamd_http_connection_write_message (conn_ent->conn, reply, NULL,
-			"text/plain", conn_ent,
-			conn_ent->rt->timeout);
+		"text/plain", conn_ent, conn_ent->conn->fd,
+		conn_ent->rt->ptv, conn_ent->rt->ev_base);
 	conn_ent->is_reply = TRUE;
 
 	return 0;
@@ -1203,7 +1205,7 @@ rspamd_controller_graph_point (gulong t, gulong step,
 
 /*
  * Graph command handler:
- * request: /graph?type=<day|week|month|year>
+ * request: /graph?type=<hourly|daily|weekly|monthly>
  * headers: Password
  * reply: json [
  *      { label: "Foo", data: 11 },
@@ -1225,10 +1227,10 @@ rspamd_controller_handle_graph (
 	gdouble *acc;
 	ucl_object_t *res, *elt[METRIC_ACTION_MAX];
 	enum {
-		rra_day = 0,
-		rra_week,
-		rra_month,
-		rra_year,
+		rra_hourly = 0,
+		rra_daily,
+		rra_weekly,
+		rra_monthly,
 		rra_invalid
 	} rra_num = rra_invalid;
 	/* How many points are we going to send to display */
@@ -1262,17 +1264,17 @@ rspamd_controller_handle_graph (
 		return 0;
 	}
 
-	if (value->len == 3 && rspamd_lc_cmp (value->begin, "day", value->len) == 0) {
-		rra_num = rra_day;
+	if (value->len == 6 && rspamd_lc_cmp (value->begin, "hourly", value->len) == 0) {
+		rra_num = rra_hourly;
 	}
-	else if (value->len == 4 && rspamd_lc_cmp (value->begin, "week", value->len) == 0) {
-		rra_num = rra_week;
+	else if (value->len == 5 && rspamd_lc_cmp (value->begin, "daily", value->len) == 0) {
+		rra_num = rra_daily;
 	}
-	else if (value->len == 5 && rspamd_lc_cmp (value->begin, "month", value->len) == 0) {
-		rra_num = rra_month;
+	else if (value->len == 6 && rspamd_lc_cmp (value->begin, "weekly", value->len) == 0) {
+		rra_num = rra_weekly;
 	}
-	else if (value->len == 4 && rspamd_lc_cmp (value->begin, "year", value->len) == 0) {
-		rra_num = rra_year;
+	else if (value->len == 7 && rspamd_lc_cmp (value->begin, "monthly", value->len) == 0) {
+		rra_num = rra_monthly;
 	}
 
 	g_hash_table_unref (query);
@@ -1386,13 +1388,13 @@ rspamd_controller_handle_legacy_history (
 		row = &copied_rows[row_num];
 		/* Get only completed rows */
 		if (row->completed) {
-			rspamd_localtime (row->timestamp, &tm);
+			rspamd_localtime (row->tv.tv_sec, &tm);
 			strftime (timebuf, sizeof (timebuf) - 1, "%Y-%m-%d %H:%M:%S", &tm);
 			obj = ucl_object_typed_new (UCL_OBJECT);
 			ucl_object_insert_key (obj, ucl_object_fromstring (
 					timebuf),		  "time", 0, false);
 			ucl_object_insert_key (obj, ucl_object_fromint (
-					row->timestamp), "unix_time", 0, false);
+					row->tv.tv_sec), "unix_time", 0, false);
 			ucl_object_insert_key (obj, ucl_object_fromstring (
 					row->message_id), "id",	  0, false);
 			ucl_object_insert_key (obj, ucl_object_fromstring (row->from_addr),
@@ -1522,7 +1524,7 @@ rspamd_controller_handle_lua_history (lua_State *L,
 
 			if (lua_isfunction (L, -1)) {
 				task = rspamd_task_new (session->ctx->worker, session->cfg,
-						session->pool, ctx->lang_det, ctx->event_loop);
+						session->pool, ctx->lang_det, ctx->ev_base);
 
 				task->resolver = ctx->resolver;
 				task->s = rspamd_session_create (session->pool,
@@ -1680,7 +1682,7 @@ rspamd_controller_handle_history_reset (struct rspamd_http_connection_entry *con
 	struct rspamd_controller_session *session = conn_ent->ud;
 	struct rspamd_controller_worker_ctx *ctx;
 	struct roll_history_row *row;
-	guint completed_rows, i, t;
+	guint start_row, i, t;
 	lua_State *L;
 
 	ctx = session->ctx;
@@ -1692,15 +1694,13 @@ rspamd_controller_handle_history_reset (struct rspamd_http_connection_entry *con
 
 	if (!ctx->srv->history->disabled) {
 		/* Clean from start to the current row */
-		completed_rows = g_atomic_int_get (&ctx->srv->history->cur_row);
+		start_row = g_atomic_int_get (&ctx->srv->history->cur_row);
 
-		completed_rows = MIN (completed_rows, ctx->srv->history->nrows - 1);
-
-		for (i = 0; i <= completed_rows; i ++) {
+		for (i = 0; i < start_row; i ++) {
 			t = g_atomic_int_get (&ctx->srv->history->cur_row);
 
 			/* We somehow come to the race condition */
-			if (i > t) {
+			if (i >= t) {
 				break;
 			}
 
@@ -1708,9 +1708,14 @@ rspamd_controller_handle_history_reset (struct rspamd_http_connection_entry *con
 			memset (row, 0, sizeof (*row));
 		}
 
-		msg_info_session ("<%s> cleared %d entries from history",
-				rspamd_inet_address_to_string (session->from_addr),
-				completed_rows);
+		start_row = g_atomic_int_get (&ctx->srv->history->cur_row);
+		/* Optimistically set all bytes to zero (might cause race) */
+		memset (ctx->srv->history->rows,
+				0,
+				sizeof (*row) * (ctx->srv->history->nrows - start_row));
+
+		msg_info_session ("<%s> reset history",
+				rspamd_inet_address_to_string (session->from_addr));
 		rspamd_controller_send_string (conn_ent, "{\"success\":true}");
 	}
 	else {
@@ -1819,7 +1824,7 @@ rspamd_controller_handle_lua (struct rspamd_http_connection_entry *conn_ent,
 	}
 
 	task = rspamd_task_new (session->ctx->worker, session->cfg, session->pool,
-			ctx->lang_det, ctx->event_loop);
+			ctx->lang_det, ctx->ev_base);
 
 	task->resolver = ctx->resolver;
 	task->s = rspamd_session_create (session->pool,
@@ -1872,8 +1877,7 @@ rspamd_controller_learn_fin_task (void *ud)
 	session = conn_ent->ud;
 
 	if (task->err != NULL) {
-		msg_info_session ("cannot learn <%s>: %e",
-				MESSAGE_FIELD (task, message_id), task->err);
+		msg_info_session ("cannot learn <%s>: %e", task->message_id, task->err);
 		rspamd_controller_send_error (conn_ent, task->err->code, "%s",
 				task->err->message);
 
@@ -1885,14 +1889,13 @@ rspamd_controller_learn_fin_task (void *ud)
 		msg_info_task ("<%s> learned message as %s: %s",
 				rspamd_inet_address_to_string (session->from_addr),
 				session->is_spam ? "spam" : "ham",
-				MESSAGE_FIELD (task, message_id));
+						task->message_id);
 		rspamd_controller_send_string (conn_ent, "{\"success\":true}");
 		return TRUE;
 	}
 
 	if (!rspamd_task_process (task, RSPAMD_TASK_PROCESS_LEARN)) {
-		msg_info_task ("cannot learn <%s>: %e",
-				MESSAGE_FIELD (task, message_id), task->err);
+		msg_info_task ("cannot learn <%s>: %e", task->message_id, task->err);
 
 		if (task->err) {
 			rspamd_controller_send_error (conn_ent, task->err->code, "%s",
@@ -1913,7 +1916,7 @@ rspamd_controller_learn_fin_task (void *ud)
 			msg_info_task ("<%s> learned message as %s: %s",
 					rspamd_inet_address_to_string (session->from_addr),
 					session->is_spam ? "spam" : "ham",
-					MESSAGE_FIELD (task, message_id));
+							task->message_id);
 			rspamd_controller_send_string (conn_ent, "{\"success\":true}");
 		}
 
@@ -1938,7 +1941,8 @@ rspamd_controller_scan_reply (struct rspamd_task *task)
 	rspamd_http_connection_reset (conn_ent->conn);
 	rspamd_http_router_insert_headers (conn_ent->rt, msg);
 	rspamd_http_connection_write_message (conn_ent->conn, msg, NULL,
-			"application/json", conn_ent, conn_ent->rt->timeout);
+			"application/json", conn_ent, conn_ent->conn->fd, conn_ent->rt->ptv,
+			conn_ent->rt->ev_base);
 	conn_ent->is_reply = TRUE;
 }
 
@@ -1952,8 +1956,7 @@ rspamd_controller_check_fin_task (void *ud)
 	conn_ent = task->fin_arg;
 
 	if (task->err) {
-		msg_info_task ("cannot check <%s>: %e",
-				MESSAGE_FIELD (task, message_id), task->err);
+		msg_info_task ("cannot check <%s>: %e", task->message_id, task->err);
 		rspamd_controller_send_error (conn_ent, task->err->code, "%s",
 				task->err->message);
 		return TRUE;
@@ -2004,7 +2007,7 @@ rspamd_controller_handle_learn_common (
 	}
 
 	task = rspamd_task_new (session->ctx->worker, session->cfg, session->pool,
-			session->ctx->lang_det, ctx->event_loop);
+			session->ctx->lang_det, ctx->ev_base);
 
 	task->resolver = ctx->resolver;
 	task->s = rspamd_session_create (session->pool,
@@ -2032,8 +2035,7 @@ rspamd_controller_handle_learn_common (
 	rspamd_learn_task_spam (task, is_spam, session->classifier, NULL);
 
 	if (!rspamd_task_process (task, RSPAMD_TASK_PROCESS_LEARN)) {
-		msg_warn_session ("<%s> message cannot be processed",
-				MESSAGE_FIELD (task, message_id));
+		msg_warn_session ("<%s> message cannot be processed", task->message_id);
 		goto end;
 	}
 
@@ -2103,7 +2105,7 @@ rspamd_controller_handle_scan (struct rspamd_http_connection_entry *conn_ent,
 	}
 
 	task = rspamd_task_new (session->ctx->worker, session->cfg, session->pool,
-			ctx->lang_det, ctx->event_loop);
+			ctx->lang_det, ctx->ev_base);
 
 	task->resolver = ctx->resolver;
 	task->s = rspamd_session_create (session->pool,
@@ -2130,10 +2132,13 @@ rspamd_controller_handle_scan (struct rspamd_http_connection_entry *conn_ent,
 	}
 
 	if (ctx->task_timeout > 0.0) {
-		task->timeout_ev.data = task;
-		ev_timer_init (&task->timeout_ev, rspamd_task_timeout,
-				ctx->task_timeout, ctx->task_timeout);
-		ev_timer_start (task->event_loop, &task->timeout_ev);
+		struct timeval task_tv;
+
+		event_set (&task->timeout_ev, -1, EV_TIMEOUT, rspamd_task_timeout,
+				task);
+		event_base_set (ctx->ev_base, &task->timeout_ev);
+		double_to_tv (ctx->task_timeout, &task_tv);
+		event_add (&task->timeout_ev, &task_tv);
 	}
 
 end:
@@ -2212,7 +2217,6 @@ rspamd_controller_handle_saveactions (
 
 		switch (i) {
 		case 0:
-		default:
 			act = METRIC_ACTION_REJECT;
 			break;
 		case 1:
@@ -2234,8 +2238,8 @@ rspamd_controller_handle_saveactions (
 			score = ucl_object_todouble (cur);
 		}
 
-		if ((isnan (session->cfg->actions[act].threshold) != isnan (score)) ||
-				(session->cfg->actions[act].threshold != score)) {
+		if ((isnan (session->cfg->actions[act].score) != isnan (score)) ||
+				(session->cfg->actions[act].score != score)) {
 			add_dynamic_action (ctx->cfg, DEFAULT_METRIC, act, score);
 			added ++;
 		}
@@ -2407,7 +2411,7 @@ rspamd_controller_handle_savemap (struct rspamd_http_connection_entry *conn_ent,
 {
 	struct rspamd_controller_session *session = conn_ent->ud;
 	GList *cur;
-	struct rspamd_map *map = NULL;
+	struct rspamd_map *map;
 	struct rspamd_map_backend *bk;
 	struct rspamd_controller_worker_ctx *ctx;
 	const rspamd_ftok_t *idstr;
@@ -2599,7 +2603,7 @@ rspamd_controller_handle_stat_common (
 	ctx = session->ctx;
 
 	task = rspamd_task_new (session->ctx->worker, session->cfg, session->pool,
-			ctx->lang_det, ctx->event_loop);
+			ctx->lang_det, ctx->ev_base);
 	task->resolver = ctx->resolver;
 	cbdata = rspamd_mempool_alloc0 (session->pool, sizeof (*cbdata));
 	cbdata->conn_ent = conn_ent;
@@ -2906,7 +2910,9 @@ rspamd_controller_handle_ping (struct rspamd_http_connection_entry *conn_ent,
 			NULL,
 			"text/plain",
 			conn_ent,
-			conn_ent->rt->timeout);
+			conn_ent->conn->fd,
+			conn_ent->rt->ptv,
+			conn_ent->rt->ev_base);
 	conn_ent->is_reply = TRUE;
 
 	return 0;
@@ -2940,7 +2946,9 @@ rspamd_controller_handle_unknown (struct rspamd_http_connection_entry *conn_ent,
 				NULL,
 				"text/plain",
 				conn_ent,
-				conn_ent->rt->timeout);
+				conn_ent->conn->fd,
+				conn_ent->rt->ptv,
+				conn_ent->rt->ev_base);
 		conn_ent->is_reply = TRUE;
 	}
 	else {
@@ -2956,7 +2964,9 @@ rspamd_controller_handle_unknown (struct rspamd_http_connection_entry *conn_ent,
 				NULL,
 				"text/plain",
 				conn_ent,
-				conn_ent->rt->timeout);
+				conn_ent->conn->fd,
+				conn_ent->rt->ptv,
+				conn_ent->rt->ev_base);
 		conn_ent->is_reply = TRUE;
 	}
 
@@ -3001,7 +3011,7 @@ rspamd_controller_handle_lua_plugin (struct rspamd_http_connection_entry *conn_e
 	}
 
 	task = rspamd_task_new (session->ctx->worker, session->cfg, session->pool,
-			ctx->lang_det, ctx->event_loop);
+			ctx->lang_det, ctx->ev_base);
 
 	task->resolver = ctx->resolver;
 	task->s = rspamd_session_create (session->pool,
@@ -3080,9 +3090,9 @@ rspamd_controller_finish_handler (struct rspamd_http_connection_entry *conn_ent)
 }
 
 static void
-rspamd_controller_accept_socket (EV_P_ ev_io *w, int revents)
+rspamd_controller_accept_socket (gint fd, short what, void *arg)
 {
-	struct rspamd_worker *worker = (struct rspamd_worker *)w->data;
+	struct rspamd_worker *worker = (struct rspamd_worker *) arg;
 	struct rspamd_controller_worker_ctx *ctx;
 	struct rspamd_controller_session *session;
 	rspamd_inet_addr_t *addr;
@@ -3091,8 +3101,7 @@ rspamd_controller_accept_socket (EV_P_ ev_io *w, int revents)
 	ctx = worker->ctx;
 
 	if ((nfd =
-		rspamd_accept_from_socket (w->fd, &addr,
-				rspamd_worker_throttle_accept_events, worker->accept_events)) == -1) {
+		rspamd_accept_from_socket (fd, &addr, worker->accept_events)) == -1) {
 		msg_warn_ctx ("accept failed: %s", strerror (errno));
 		return;
 	}
@@ -3117,10 +3126,9 @@ rspamd_controller_accept_socket (EV_P_ ev_io *w, int revents)
 }
 
 static void
-rspamd_controller_rrd_update (EV_P_ ev_timer *w, int revents)
+rspamd_controller_rrd_update (gint fd, short what, void *arg)
 {
-	struct rspamd_controller_worker_ctx *ctx =
-			(struct rspamd_controller_worker_ctx *)w->data;
+	struct rspamd_controller_worker_ctx *ctx = arg;
 	struct rspamd_stat *stat;
 	GArray ar;
 	gdouble points[METRIC_ACTION_MAX];
@@ -3144,7 +3152,8 @@ rspamd_controller_rrd_update (EV_P_ ev_timer *w, int revents)
 	}
 
 	/* Plan new event */
-	ev_timer_again (ctx->event_loop, &ctx->rrd_event);
+	event_del (ctx->rrd_event);
+	evtimer_add (ctx->rrd_event, &rrd_update_time);
 }
 
 static void
@@ -3237,8 +3246,6 @@ rspamd_controller_store_saved_stats (struct rspamd_controller_worker_ctx *ctx)
 	}
 
 	if (rspamd_file_lock (fd, FALSE) == -1) {
-		msg_err_ctx ("cannot lock controller stats in %s: %s",
-				ctx->saved_stats_path, strerror (errno));
 		close (fd);
 
 		return;
@@ -3280,13 +3287,11 @@ rspamd_controller_store_saved_stats (struct rspamd_controller_worker_ctx *ctx)
 }
 
 static void
-rspamd_controller_stats_save_periodic (EV_P_ ev_timer *w, int revents)
+rspamd_controller_stats_save_periodic (int fd, short what, gpointer ud)
 {
-	struct rspamd_controller_worker_ctx *ctx =
-			(struct rspamd_controller_worker_ctx *)w->data;
+	struct rspamd_controller_worker_ctx *ctx = ud;
 
 	rspamd_controller_store_saved_stats (ctx);
-	ev_timer_again (EV_A_ w);
 }
 
 static void
@@ -3379,7 +3384,7 @@ init_controller_worker (struct rspamd_config *cfg)
 			ctx,
 			G_STRUCT_OFFSET (struct rspamd_controller_worker_ctx,
 					timeout),
-			RSPAMD_CL_FLAG_TIME_FLOAT,
+			RSPAMD_CL_FLAG_TIME_INTEGER,
 			"Protocol timeout");
 
 	rspamd_rcl_register_worker_option (cfg,
@@ -3471,7 +3476,7 @@ luaopen_controller (lua_State * L)
 struct rspamd_http_connection_entry *
 lua_check_controller_entry (lua_State * L, gint pos)
 {
-	void *ud = rspamd_lua_check_udata (L, pos, "rspamd{csession}");
+	void *ud = luaL_checkudata (L, pos, "rspamd{csession}");
 	luaL_argcheck (L, ud != NULL, pos, "'csession' expected");
 	return ud ? *((struct rspamd_http_connection_entry **)ud) : NULL;
 }
@@ -3480,14 +3485,14 @@ static int
 lua_csession_get_ev_base (lua_State *L)
 {
 	struct rspamd_http_connection_entry *c = lua_check_controller_entry (L, 1);
-	struct ev_loop **pbase;
+	struct event_base **pbase;
 	struct rspamd_controller_session *s;
 
 	if (c) {
 		s = c->ud;
-		pbase = lua_newuserdata (L, sizeof (struct ev_loop *));
+		pbase = lua_newuserdata (L, sizeof (struct event_base *));
 		rspamd_lua_setclass (L, "rspamd{ev_base}", -1);
-		*pbase = s->ctx->event_loop;
+		*pbase = s->ctx->ev_base;
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -3568,7 +3573,7 @@ lua_csession_send_string (lua_State *L)
 	return 0;
 }
 
-static void
+static gboolean
 rspamd_controller_on_terminate (struct rspamd_worker *worker)
 {
 	struct rspamd_controller_worker_ctx *ctx = worker->ctx;
@@ -3577,9 +3582,11 @@ rspamd_controller_on_terminate (struct rspamd_worker *worker)
 
 	if (ctx->rrd) {
 		msg_info ("closing rrd file: %s", ctx->rrd->filename);
-		ev_timer_stop (ctx->event_loop, &ctx->rrd_event);
+		event_del (ctx->rrd_event);
 		rspamd_rrd_close (ctx->rrd);
 	}
+
+	return FALSE;
 }
 
 static void
@@ -3696,15 +3703,17 @@ start_controller_worker (struct rspamd_worker *worker)
 	GHashTableIter iter;
 	gpointer key, value;
 	guint i;
-	const ev_tstamp save_stats_interval = 60; /* 1 minute */
+	struct rspamd_keypair_cache *cache;
+	struct timeval stv;
+	const guint save_stats_interval = 60 * 1000; /* 1 minute */
 	gpointer m;
 
-	g_assert (rspamd_worker_check_context (worker->ctx, rspamd_controller_ctx_magic));
-	ctx->event_loop = rspamd_prepare_worker (worker,
+	ctx->ev_base = rspamd_prepare_worker (worker,
 			"controller",
 			rspamd_controller_accept_socket);
+	msec_to_tv (ctx->timeout, &ctx->io_tv);
 
-	ctx->start_time = ev_time ();
+	ctx->start_time = time (NULL);
 	ctx->worker = worker;
 	ctx->cfg = worker->srv->cfg;
 	ctx->srv = worker->srv;
@@ -3735,6 +3744,8 @@ start_controller_worker (struct rspamd_worker *worker)
 				DEFAULT_STATS_PATH);
 	}
 
+	g_ptr_array_add (worker->finish_actions,
+			(gpointer)rspamd_controller_on_terminate);
 	rspamd_controller_load_saved_stats (ctx);
 	ctx->lang_det = ctx->cfg->lang_det;
 
@@ -3745,10 +3756,10 @@ start_controller_worker (struct rspamd_worker *worker)
 		ctx->rrd = rspamd_rrd_file_default (ctx->cfg->rrd_file, &rrd_err);
 
 		if (ctx->rrd) {
-			ctx->rrd_event.data = ctx;
-			ev_timer_init (&ctx->rrd_event, rspamd_controller_rrd_update,
-					rrd_update_time, rrd_update_time);
-			ev_timer_start (ctx->event_loop, &ctx->rrd_event);
+			ctx->rrd_event = g_malloc0 (sizeof (*ctx->rrd_event));
+			evtimer_set (ctx->rrd_event, rspamd_controller_rrd_update, ctx);
+			event_base_set (ctx->ev_base, ctx->rrd_event);
+			event_add (ctx->rrd_event, &rrd_update_time);
 		}
 		else if (rrd_err) {
 			msg_err ("cannot load rrd from %s: %e", ctx->cfg->rrd_file,
@@ -3768,14 +3779,10 @@ start_controller_worker (struct rspamd_worker *worker)
 			"password");
 
 	/* Accept event */
-	ctx->http_ctx = rspamd_http_context_create (ctx->cfg, ctx->event_loop,
-			ctx->cfg->ups_ctx);
-	rspamd_mempool_add_destructor (ctx->cfg->cfg_pool,
-			(rspamd_mempool_destruct_t)rspamd_http_context_free,
-			ctx->http_ctx);
+	cache = rspamd_keypair_cache_new (256);
 	ctx->http = rspamd_http_router_new (rspamd_controller_error_handler,
-			rspamd_controller_finish_handler, ctx->timeout,
-			ctx->static_files_dir, ctx->http_ctx);
+			rspamd_controller_finish_handler, &ctx->io_tv, ctx->ev_base,
+			ctx->static_files_dir, cache);
 
 	/* Add callbacks for different methods */
 	rspamd_http_router_add_path (ctx->http,
@@ -3886,49 +3893,41 @@ start_controller_worker (struct rspamd_worker *worker)
 	rspamd_http_router_set_unknown_handler (ctx->http,
 			rspamd_controller_handle_unknown);
 
-	ctx->resolver = rspamd_dns_resolver_init (worker->srv->logger,
-			ctx->event_loop,
+	ctx->resolver = dns_resolver_init (worker->srv->logger,
+			ctx->ev_base,
 			worker->srv->cfg);
 
 	rspamd_upstreams_library_config (worker->srv->cfg, worker->srv->cfg->ups_ctx,
-			ctx->event_loop, ctx->resolver->r);
-	rspamd_symcache_start_refresh (worker->srv->cfg->cache, ctx->event_loop,
+			ctx->ev_base, ctx->resolver->r);
+	rspamd_symcache_start_refresh (worker->srv->cfg->cache, ctx->ev_base,
 			worker);
-	rspamd_stat_init (worker->srv->cfg, ctx->event_loop);
+	rspamd_stat_init (worker->srv->cfg, ctx->ev_base);
 
 	if (worker->index == 0) {
 		if (!ctx->cfg->disable_monitored) {
-			rspamd_worker_init_monitored (worker, ctx->event_loop, ctx->resolver);
+			rspamd_worker_init_monitored (worker, ctx->ev_base, ctx->resolver);
 		}
 
-		rspamd_map_watch (worker->srv->cfg, ctx->event_loop,
+		rspamd_map_watch (worker->srv->cfg, ctx->ev_base,
 				ctx->resolver, worker, TRUE);
-
-		/* Schedule periodic stats saving, see #1823 */
-		ctx->save_stats_event.data = ctx;
-		ev_timer_init (&ctx->save_stats_event,
-				rspamd_controller_stats_save_periodic,
-				save_stats_interval, save_stats_interval);
-		ev_timer_start (ctx->event_loop, &ctx->save_stats_event);
 	}
 	else {
-		rspamd_map_watch (worker->srv->cfg, ctx->event_loop,
+		rspamd_map_watch (worker->srv->cfg, ctx->ev_base,
 				ctx->resolver, worker, FALSE);
 	}
 
-	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop, worker);
+	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->ev_base, worker);
 
-#ifdef WITH_HYPERSCAN
-	rspamd_control_worker_add_cmd_handler (worker,
-			RSPAMD_CONTROL_HYPERSCAN_LOADED,
-			rspamd_worker_hyperscan_ready,
-			NULL);
-#endif
+	/* Schedule periodic stats saving, see #1823 */
+	evtimer_set (&ctx->save_stats_event, rspamd_controller_stats_save_periodic,
+			ctx);
+	event_base_set (ctx->ev_base, &ctx->save_stats_event);
+	msec_to_tv (save_stats_interval, &stv);
+	evtimer_add (&ctx->save_stats_event, &stv);
 
 	/* Start event loop */
-	ev_loop (ctx->event_loop, 0);
+	event_base_loop (ctx->ev_base, 0);
 	rspamd_worker_block_signals ();
-	rspamd_controller_on_terminate (worker);
 
 	rspamd_stat_close ();
 	rspamd_http_router_free (ctx->http);
@@ -3945,7 +3944,6 @@ start_controller_worker (struct rspamd_worker *worker)
 
 	g_hash_table_unref (ctx->plugins);
 	g_hash_table_unref (ctx->custom_commands);
-
 	REF_RELEASE (ctx->cfg);
 	rspamd_log_close (worker->srv->logger, TRUE);
 

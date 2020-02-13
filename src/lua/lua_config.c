@@ -431,9 +431,10 @@ LUA_FUNCTION_DEF (config, add_condition);
 LUA_FUNCTION_DEF (config, enable_symbol);
 
 /***
- * @method rspamd_config:disable_symbol(symbol)
+ * @method rspamd_config:disable_symbol(symbol, [disable_parent=true])
  * Disables execution for the specified symbol
  * @param {string} symbol symbol's name
+ * @param {boolean} disable_parent if true then disable parent execution in case of a virtual symbol
  */
 LUA_FUNCTION_DEF (config, disable_symbol);
 
@@ -452,6 +453,15 @@ LUA_FUNCTION_DEF (config, get_symbol_parent);
  * @return {list|string} list of all symbols in a specific group
  */
 LUA_FUNCTION_DEF (config, get_group_symbols);
+
+/***
+ * @method rspamd_config:get_groups([need_private])
+ * Returns list of all groups defined
+ * @param {boolean} need_private optional flag to include private groups
+ * @available 2.3+
+ * @return {list|table} list of all groups
+ */
+LUA_FUNCTION_DEF (config, get_groups);
 
 /***
  * @method rspamd_config:register_settings_id(name, symbols_enabled, symbols_disabled)
@@ -578,7 +588,7 @@ rspamd_config:add_on_load(function(cfg, ev_base)
 	rspamd_config:add_periodic(ev_base, 1.0, function(cfg, ev_base)
 		local logger = require "rspamd_logger"
 		logger.infox(cfg, "periodic function")
-		return true -- if return false, then the periodic event is removed
+		return true -- if return numeric, a new interval is set. if return false, then the periodic event is removed
 	end)
 end)
  */
@@ -871,6 +881,7 @@ static const struct luaL_reg configlib_m[] = {
 	LUA_INTERFACE_DEF (config, get_symbols_counters),
 	{"get_symbols_scores", lua_config_get_symbols},
 	LUA_INTERFACE_DEF (config, get_symbols),
+	LUA_INTERFACE_DEF (config, get_groups),
 	LUA_INTERFACE_DEF (config, get_symbol_callback),
 	LUA_INTERFACE_DEF (config, set_symbol_callback),
 	LUA_INTERFACE_DEF (config, get_symbol_stat),
@@ -1256,24 +1267,45 @@ lua_metric_symbol_callback (struct rspamd_task *task,
 
 					for (i = level + first_opt; i <= last_pos; i++) {
 						if (lua_type (L, i) == LUA_TSTRING) {
-							const char *opt = lua_tostring (L, i);
+							gsize optlen;
+							const char *opt = lua_tolstring (L, i, &optlen);
 
-							rspamd_task_add_result_option (task, s, opt);
+							rspamd_task_add_result_option (task, s, opt, optlen);
+						}
+						else if (lua_type (L, i) == LUA_TUSERDATA) {
+							struct rspamd_lua_text *t = lua_check_text (L, i);
+
+							if (t) {
+								rspamd_task_add_result_option (task, s, t->start,
+										t->len);
+							}
 						}
 						else if (lua_type (L, i) == LUA_TTABLE) {
-							lua_pushvalue (L, i);
+							gsize objlen = rspamd_lua_table_size (L, i);
 
-							for (lua_pushnil (L); lua_next (L, -2); lua_pop (L, 1)) {
-								const char *opt = lua_tostring (L, -1);
+							for (guint j = 1; j <= objlen; j ++) {
+								lua_rawgeti (L, i, j);
 
-								rspamd_task_add_result_option (task, s, opt);
+								if (lua_type (L, -1) == LUA_TSTRING) {
+									gsize optlen;
+									const char *opt = lua_tolstring (L, -1, &optlen);
+
+									rspamd_task_add_result_option (task, s, opt, optlen);
+								}
+								else if (lua_type (L, -1) == LUA_TUSERDATA) {
+									struct rspamd_lua_text *t = lua_check_text (L, -1);
+
+									if (t) {
+										rspamd_task_add_result_option (task, s, t->start,
+												t->len);
+									}
+								}
+
+								lua_pop (L, 1);
 							}
-
-							lua_pop (L, 1);
 						}
 					}
 				}
-
 			}
 
 			lua_pop (L, nresults);
@@ -1392,20 +1424,42 @@ lua_metric_symbol_callback_return (struct thread_entry *thread_entry, int ret)
 
 				for (i = cd->stack_level + first_opt; i <= last_pos; i++) {
 					if (lua_type (L, i) == LUA_TSTRING) {
-						const char *opt = lua_tostring (L, i);
+						gsize optlen;
+						const char *opt = lua_tolstring (L, i, &optlen);
 
-						rspamd_task_add_result_option (task, s, opt);
+						rspamd_task_add_result_option (task, s, opt, optlen);
+					}
+					else if (lua_type (L, i) == LUA_TUSERDATA) {
+						struct rspamd_lua_text *t = lua_check_text (L, i);
+
+						if (t) {
+							rspamd_task_add_result_option (task, s, t->start,
+									t->len);
+						}
 					}
 					else if (lua_type (L, i) == LUA_TTABLE) {
-						lua_pushvalue (L, i);
+						gsize objlen = rspamd_lua_table_size (L, i);
 
-						for (lua_pushnil (L); lua_next (L, -2); lua_pop (L, 1)) {
-							const char *opt = lua_tostring (L, -1);
+						for (guint j = 1; j <= objlen; j ++) {
+							lua_rawgeti (L, i, j);
 
-							rspamd_task_add_result_option (task, s, opt);
+							if (lua_type (L, -1) == LUA_TSTRING) {
+								gsize optlen;
+								const char *opt = lua_tolstring (L, -1, &optlen);
+
+								rspamd_task_add_result_option (task, s, opt, optlen);
+							}
+							else if (lua_type (L, -1) == LUA_TUSERDATA) {
+								struct rspamd_lua_text *t = lua_check_text (L, -1);
+
+								if (t) {
+									rspamd_task_add_result_option (task, s, t->start,
+											t->len);
+								}
+							}
+
+							lua_pop (L, 1);
 						}
-
-						lua_pop (L, 1);
 					}
 				}
 			}
@@ -2318,7 +2372,7 @@ lua_config_set_metric_symbol (lua_State * L)
 				nshots = 1;
 			}
 			if (strstr (flags_str, "ignore") != NULL) {
-				flags |= RSPAMD_SYMBOL_FLAG_IGNORE;
+				flags |= RSPAMD_SYMBOL_FLAG_IGNORE_METRIC;
 			}
 			if (strstr (flags_str, "one_param") != NULL) {
 				flags |= RSPAMD_SYMBOL_FLAG_ONEPARAM;
@@ -2888,9 +2942,14 @@ lua_config_disable_symbol (lua_State *L)
 	LUA_TRACE_POINT;
 	struct rspamd_config *cfg = lua_check_config (L, 1);
 	const gchar *sym = luaL_checkstring (L, 2);
+	gboolean disable_parent = TRUE;
 
 	if (cfg && sym) {
-		rspamd_symcache_disable_symbol_perm (cfg->cache, sym);
+		if (lua_isboolean (L, 3)) {
+			disable_parent = lua_toboolean (L, 3);
+		}
+
+		rspamd_symcache_disable_symbol_perm (cfg->cache, sym, disable_parent);
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -3157,8 +3216,9 @@ lua_periodic_callback (struct ev_loop *loop, ev_timer *w, int revents)
 	pev_base = lua_newuserdata (L, sizeof (*pev_base));
 	rspamd_lua_setclass (L, "rspamd{ev_base}", -1);
 	*pev_base = periodic->event_loop;
+	lua_pushnumber (L, ev_now (periodic->event_loop));
 
-	lua_thread_call (thread, 2);
+	lua_thread_call (thread, 3);
 }
 
 static void
@@ -3185,6 +3245,14 @@ lua_periodic_callback_finish (struct thread_entry *thread, int ret)
 
 		lua_pop (L, 1); /* Return value */
 	}
+
+	if (periodic->cfg->cur_worker) {
+		if (periodic->cfg->cur_worker->state != rspamd_worker_state_running) {
+			/* We are terminating, no more periodics */
+			plan_more = FALSE;
+		}
+	}
+
 	if (plan_more) {
 		if (periodic->need_jitter) {
 			timeout = rspamd_time_jitter (timeout, 0.0);
@@ -3367,7 +3435,7 @@ lua_metric_symbol_inserter (gpointer k, gpointer v, gpointer ud)
 	lua_pushstring (L, "flags");
 	lua_createtable (L, 0, 3);
 
-	if (s->flags & RSPAMD_SYMBOL_FLAG_IGNORE) {
+	if (s->flags & RSPAMD_SYMBOL_FLAG_IGNORE_METRIC) {
 		lua_pushstring (L, "ignore");
 		lua_pushboolean (L, true);
 		lua_settable (L, -3);
@@ -3379,6 +3447,11 @@ lua_metric_symbol_inserter (gpointer k, gpointer v, gpointer ud)
 	}
 	if (s->flags & RSPAMD_SYMBOL_FLAG_UNGROUPPED) {
 		lua_pushstring (L, "ungroupped");
+		lua_pushboolean (L, true);
+		lua_settable (L, -3);
+	}
+	if (s->flags & RSPAMD_SYMBOL_FLAG_DISABLED) {
+		lua_pushstring (L, "disabled");
 		lua_pushboolean (L, true);
 		lua_settable (L, -3);
 	}
@@ -3633,6 +3706,53 @@ lua_config_get_group_symbols (lua_State *L)
 				lua_pushstring (L, k);
 				lua_rawseti (L, -2, i);
 				i ++;
+			}
+		}
+	}
+	else {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	return 1;
+}
+
+static gint
+lua_config_get_groups (lua_State *L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_config *cfg = lua_check_config (L, 1);
+	gboolean need_private;
+	struct rspamd_symbols_group *gr;
+	GHashTableIter it;
+	gpointer k, v;
+
+	if (cfg) {
+		if (lua_isboolean (L, 2)) {
+			need_private = lua_toboolean (L, 2);
+		}
+		else {
+			need_private = !(cfg->public_groups_only);
+		}
+
+		lua_createtable (L, 0, g_hash_table_size (cfg->groups));
+		g_hash_table_iter_init (&it, cfg->groups);
+
+		while (g_hash_table_iter_next (&it, &k, &v)) {
+			gr = (struct rspamd_symbols_group *)v;
+
+			if (need_private || (gr->flags & RSPAMD_SYMBOL_GROUP_PUBLIC)) {
+				lua_createtable (L, 0, 4);
+
+				lua_pushstring (L, gr->description);
+				lua_setfield (L, -2, "description");
+				lua_pushnumber (L, gr->max_score);
+				lua_setfield (L, -2, "max_score");
+				lua_pushboolean (L, (gr->flags & RSPAMD_SYMBOL_GROUP_PUBLIC) != 0);
+				lua_setfield (L, -2, "is_public");
+				/* TODO: maybe push symbols as well */
+
+				/* Parent table indexed by group name */
+				lua_setfield (L, -2, gr->name);
 			}
 		}
 	}
@@ -4179,7 +4299,7 @@ lua_config_init_subsystem (lua_State *L)
 				struct ev_loop *ev_base = lua_check_ev_base (L, 3);
 
 				if (ev_base) {
-					cfg->dns_resolver = rspamd_dns_resolver_init (rspamd_logger_get_singleton (),
+					cfg->dns_resolver = rspamd_dns_resolver_init (rspamd_log_default_logger (),
 							ev_base,
 							cfg);
 				}

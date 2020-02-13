@@ -28,6 +28,7 @@ local fun = require "fun"
 local lua_settings = require "lua_settings"
 local meta_functions = require "lua_meta"
 local ts = require("tableshape").types
+local lua_verdict = require "lua_verdict"
 local N = "neural"
 
 -- Module vars
@@ -97,15 +98,16 @@ end
 -- key1 - ann key
 -- key2 - spam or ham
 -- key3 - maximum trains
--- returns 1 or 0: 1 - allow learn, 0 - not allow learn
+-- key4 - sampling coin (as Redis scripts do not allow math.random calls)
+-- returns 1 or 0 + reason: 1 - allow learn, 0 - not allow learn
 local redis_lua_script_can_store_train_vec = [[
   local prefix = KEYS[1]
   local locked = redis.call('HGET', prefix, 'lock')
-  if locked then return 0 end
+  if locked then return {tostring(-1),'locked by another process: ' .. locked} end
   local nspam = 0
   local nham = 0
   local lim = tonumber(KEYS[3])
-  lim = lim + lim * 0.1
+  local coin = tonumber(KEYS[4])
 
   local ret = redis.call('LLEN', prefix .. '_spam')
   if ret then nspam = tonumber(ret) end
@@ -114,19 +116,33 @@ local redis_lua_script_can_store_train_vec = [[
 
   if KEYS[2] == 'spam' then
     if nspam <= lim then
-      return tostring(nspam)
-    else
-      return tostring(-(nspam))
+      if nspam > nham then
+        -- Apply sampling
+        local skip_rate = 1.0 - nham / (nspam + 1)
+        if coin < skip_rate then
+          return {tostring(-(nspam)),'sampled out with probability ' .. tostring(skip_rate)}
+        end
+      end
+      return {tostring(nspam),'can learn'}
+    else -- Enough learns
+      return {tostring(-(nspam)),'too many spam samples'}
     end
   else
     if nham <= lim then
-      return tostring(nham)
+      if nham > nspam then
+        -- Apply sampling
+        local skip_rate = 1.0 - nspam / (nham + 1)
+        if coin < skip_rate then
+          return {tostring(-(nham)),'sampled out with probability ' .. tostring(skip_rate)}
+        end
+      end
+      return {tostring(nham),'can learn'}
     else
-      return tostring(-(nham))
+      return {tostring(-(nham)),'too many ham samples'}
     end
   end
 
-  return tostring(0)
+  return {tostring(-1),'bad input'}
 ]]
 local redis_can_store_train_vec_id = nil
 
@@ -416,44 +432,55 @@ local function ann_push_task_result(rule, task, verdict, score, set)
     if learn_spam then learn_type = 'spam' else learn_type = 'ham' end
 
     local function can_train_cb(err, data)
-      if not err and tonumber(data) >= 0 then
-        local coin = math.random()
-        if coin < 1.0 - train_opts.train_prob then
-          rspamd_logger.infox(task, 'probabilistically skip sample: %s', coin)
-          return
-        end
-        local vec = result_to_vector(task, set)
+      if not err and type(data) == 'table' then
+        local nsamples,reason = tonumber(data[1]),data[2]
 
-        local str = rspamd_util.zstd_compress(table.concat(vec, ';'))
-        local target_key = set.ann.redis_key .. '_' .. learn_type
+        if nsamples >= 0 then
+          local coin = math.random()
 
-        local function learn_vec_cb(_err)
-          if _err then
-            rspamd_logger.errx(task, 'cannot store train vector for %s:%s: %s',
-                rule.prefix, set.name, _err)
-          else
-            lua_util.debugm(N, task,
-                "add train data for ANN rule " ..
-                "%s:%s, save %s vector of %s elts in %s key; %s bytes compressed",
-                rule.prefix, set.name, learn_type, #vec, target_key, #str)
+          if coin < 1.0 - train_opts.train_prob then
+            rspamd_logger.infox(task, 'probabilistically skip sample: %s', coin)
+            return
           end
-        end
 
-        lua_redis.redis_make_request(task,
-            rule.redis,
-            nil,
-            true, -- is write
-            learn_vec_cb, --callback
-            'LPUSH', -- command
-            { target_key, str } -- arguments
-        )
+          local vec = result_to_vector(task, set)
+
+          local str = rspamd_util.zstd_compress(table.concat(vec, ';'))
+          local target_key = set.ann.redis_key .. '_' .. learn_type
+
+          local function learn_vec_cb(_err)
+            if _err then
+              rspamd_logger.errx(task, 'cannot store train vector for %s:%s: %s',
+                  rule.prefix, set.name, _err)
+            else
+              lua_util.debugm(N, task,
+                  "add train data for ANN rule " ..
+                      "%s:%s, save %s vector of %s elts in %s key; %s bytes compressed",
+                  rule.prefix, set.name, learn_type, #vec, target_key, #str)
+            end
+          end
+
+          lua_redis.redis_make_request(task,
+              rule.redis,
+              nil,
+              true, -- is write
+              learn_vec_cb, --callback
+              'LPUSH', -- command
+              { target_key, str } -- arguments
+          )
+        else
+          -- Negative result returned
+          rspamd_logger.infox(task, "cannot learn %s ANN %s:%s: %s (%s vectors stored)",
+              learn_type, rule.prefix, set.name, reason, -tonumber(nsamples))
+        end
       else
         if err then
           rspamd_logger.errx(task, 'cannot check if we can train %s:%s : %s',
               rule.prefix, set.name, err)
-        elseif tonumber(data) < 0 then
-          rspamd_logger.infox(task, "cannot learn ANN %s:%s: too many %s samples: %s",
-              rule.prefix, set.name, learn_type, -tonumber(data))
+        else
+          rspamd_logger.errx(task, 'cannot check if we can train %s:%s : type of Redis key %s is %s, expected table' ..
+              'please remove this key from Redis manually if you perform upgrade from the previous version',
+              rule.prefix, set.name, set.ann.redis_key, type(data))
         end
       end
     end
@@ -466,7 +493,12 @@ local function ann_push_task_result(rule, task, verdict, score, set)
     lua_redis.exec_redis_script(redis_can_store_train_vec_id,
         {task = task, is_write = true},
         can_train_cb,
-        { set.ann.redis_key, learn_type, tostring(train_opts.max_trains)})
+        {
+          set.ann.redis_key,
+          learn_type,
+          tostring(train_opts.max_trains),
+          tostring(math.random()),
+        })
   else
     lua_util.debugm(N, task, 'do not push data: train condition not satisfied; reason: %s',
         skip_reason)
@@ -542,7 +574,6 @@ local function spawn_train(worker, ev_base, rule, set, ann_key, ham_vec, spam_ve
     local inputs, outputs = {}, {}
 
     -- Used to show sparsed vectors in a convenient format (for debugging only)
-    --[[
     local function debug_vec(t)
       local ret = {}
       for i,v in ipairs(t) do
@@ -553,7 +584,6 @@ local function spawn_train(worker, ev_base, rule, set, ann_key, ham_vec, spam_ve
 
       return ret
     end
-    ]]--
 
     -- Make training set by joining vectors
     -- KANN automatically shuffles those samples
@@ -573,22 +603,44 @@ local function spawn_train(worker, ev_base, rule, set, ann_key, ham_vec, spam_ve
     -- Called in child process
     local function train()
       local log_thresh = rule.train.max_iterations / 10
+      local seen_nan = false
+
+      local function train_cb(iter, train_cost, value_cost)
+        if (iter * (rule.train.max_iterations / log_thresh)) % (rule.train.max_iterations) == 0 then
+          if train_cost ~= train_cost and not seen_nan then
+            -- We have nan :( try to log lot's of stuff to dig into a problem
+            seen_nan = true
+            rspamd_logger.errx(rspamd_config, 'ANN %s:%s: train error: observed nan in error cost!; value cost = %s',
+                rule.prefix, set.name,
+                value_cost)
+            for i,e in ipairs(inputs) do
+              lua_util.debugm(N, rspamd_config, 'train vector %s -> %s',
+                  debug_vec(e), outputs[i][1])
+            end
+          end
+
+          rspamd_logger.infox(rspamd_config,
+              "ANN %s:%s: learned from %s redis key in %s iterations, error: %s, value cost: %s",
+              rule.prefix, set.name,
+              ann_key,
+              iter,
+              train_cost,
+              value_cost)
+        end
+      end
+
       train_ann:train1(inputs, outputs, {
         lr = rule.train.learning_rate,
         max_epoch = rule.train.max_iterations,
-        cb = function(iter, train_cost, _)
-          if (iter * (rule.train.max_iterations / log_thresh)) % (rule.train.max_iterations) == 0 then
-            rspamd_logger.infox(rspamd_config,
-                "ANN %s:%s: learned from %s redis key in %s iterations, error: %s",
-                rule.prefix, set.name,
-                ann_key,
-                iter, train_cost)
-          end
-        end
+        cb = train_cb,
       })
 
-      local out = train_ann:save()
-      return out
+      if not seen_nan then
+        local out = train_ann:save()
+        return out
+      else
+        return nil
+      end
     end
 
     set.learning_spawned = true
@@ -967,21 +1019,27 @@ local function maybe_train_existing_ann(worker, ev_base, rule, set, profiles)
         ann_key)
 
     -- Create continuation closure
-    local redis_len_cb_gen = function(cont_cb, what)
+    local redis_len_cb_gen = function(cont_cb, what, is_final)
       return function(err, data)
         if err then
           rspamd_logger.errx(rspamd_config,
               'cannot get ANN %s trains %s from redis: %s', what, ann_key, err)
         elseif data and type(data) == 'number' or type(data) == 'string' then
           if tonumber(data) and tonumber(data) >= rule.train.max_trains then
-            rspamd_logger.debugm(N, rspamd_config,
-                'ANN %s has %s %s learn vectors (%s required)',
-                ann_key, tonumber(data), what, rule.train.max_trains)
+            if is_final then
+              rspamd_logger.debugm(N, rspamd_config,
+                  'can start ANN %s learn as it has %s learn vectors; %s required, after checking %s vectors',
+                  ann_key, tonumber(data), rule.train.max_trains, what)
+            else
+              rspamd_logger.debugm(N, rspamd_config,
+                  'checked %s vectors in ANN %s: %s vectors; %s required, need to check other class vectors',
+                  what, ann_key, tonumber(data), rule.train.max_trains)
+            end
             cont_cb()
           else
             rspamd_logger.debugm(N, rspamd_config,
-                'no need to learn ANN %s %s %s learn vectors (%s required)',
-                ann_key, tonumber(data), what, rule.train.max_trains)
+                'cannot learn ANN %s now: there are not enough %s learn vectors (has %s vectors; %s required)',
+                ann_key, what, tonumber(data), rule.train.max_trains)
           end
         end
       end
@@ -1002,7 +1060,7 @@ local function maybe_train_existing_ann(worker, ev_base, rule, set, profiles)
           rule.redis,
           nil,
           false, -- is write
-          redis_len_cb_gen(initiate_train, 'ham'), --callback
+          redis_len_cb_gen(initiate_train, 'ham', true), --callback
           'LLEN', -- command
           {ann_key .. '_ham'}
       )
@@ -1013,7 +1071,7 @@ local function maybe_train_existing_ann(worker, ev_base, rule, set, profiles)
         rule.redis,
         nil,
         false, -- is write
-        redis_len_cb_gen(check_ham_len, 'spam'), --callback
+        redis_len_cb_gen(check_ham_len, 'spam', false), --callback
         'LLEN', -- command
         {ann_key .. '_spam'}
     )
@@ -1113,11 +1171,18 @@ local function ann_push_vector(task)
     return
   end
 
-  local verdict,score = lua_util.get_task_verdict(task)
+  local verdict,score = lua_verdict.get_specific_verdict(N, task)
 
   if verdict == 'passthrough' then
     lua_util.debugm(N, task, 'ignore task as its verdict is %s(%s)',
         verdict, score)
+
+    return
+  end
+
+  if score ~= score then
+    lua_util.debugm(N, task, 'ignore task as its score is nan (%s verdict)',
+        verdict)
 
     return
   end
@@ -1171,7 +1236,29 @@ local function process_rules_settings()
 
     lua_redis.register_prefix(selt.prefix, N,
         string.format('NN prefix for rule "%s"; settings id "%s"',
-            rule.prefix, selt.name), {persistent = true})
+            rule.prefix, selt.name), {
+          persistent = true,
+          type = 'zlist',
+        })
+    -- Versions
+    lua_redis.register_prefix(selt.prefix .. '_\\d+', N,
+        string.format('NN storage for rule "%s"; settings id "%s"',
+            rule.prefix, selt.name), {
+          persistent = true,
+          type = 'hash',
+        })
+    lua_redis.register_prefix(selt.prefix .. '_\\d+_spam', N,
+        string.format('NN learning set (spam) for rule "%s"; settings id "%s"',
+            rule.prefix, selt.name), {
+          persistent = true,
+          type = 'list',
+        })
+    lua_redis.register_prefix(selt.prefix .. '_\\d+_ham', N,
+        string.format('NN learning set (spam) for rule "%s"; settings id "%s"',
+            rule.prefix, selt.name), {
+          persistent = true,
+          type = 'list',
+        })
   end
 
   for _,rule in pairs(settings.rules) do

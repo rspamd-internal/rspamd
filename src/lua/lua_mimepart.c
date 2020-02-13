@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <src/libmime/message.h>
 #include "lua_common.h"
 #include "libmime/message.h"
 #include "libmime/lang_detection.h"
@@ -522,6 +523,26 @@ LUA_FUNCTION_DEF (mimepart, headers_foreach);
  */
 LUA_FUNCTION_DEF (mimepart, get_parent);
 
+/***
+ * @method mime_part:get_specific()
+ * Returns specific lua content for this part
+ * @return {any} specific lua content
+ */
+LUA_FUNCTION_DEF (mimepart, get_specific);
+
+/***
+ * @method mime_part:set_specific(<any>)
+ * Sets a specific content for this part
+ * @return {any} previous specific lua content (or nil)
+ */
+LUA_FUNCTION_DEF (mimepart, set_specific);
+
+/***
+ * @method mime_part:is_specific(<any>)
+ * Returns true if part has specific lua content
+ * @return {boolean} flag
+ */
+LUA_FUNCTION_DEF (mimepart, is_specific);
 
 static const struct luaL_reg mimepartlib_m[] = {
 	LUA_INTERFACE_DEF (mimepart, get_content),
@@ -555,6 +576,9 @@ static const struct luaL_reg mimepartlib_m[] = {
 	LUA_INTERFACE_DEF (mimepart, get_digest),
 	LUA_INTERFACE_DEF (mimepart, get_id),
 	LUA_INTERFACE_DEF (mimepart, headers_foreach),
+	LUA_INTERFACE_DEF (mimepart, get_specific),
+	LUA_INTERFACE_DEF (mimepart, set_specific),
+	LUA_INTERFACE_DEF (mimepart, is_specific),
 	{"__tostring", rspamd_lua_class_tostring},
 	{NULL, NULL}
 };
@@ -601,7 +625,7 @@ lua_textpart_has_8bit_raw (lua_State * L)
 	struct rspamd_mime_text_part *part = lua_check_textpart (L);
 
 	if (part) {
-		if (part->flags & RSPAMD_MIME_TEXT_PART_FLAG_8BIT) {
+		if (part->flags & RSPAMD_MIME_TEXT_PART_FLAG_8BIT_RAW) {
 			lua_pushboolean (L, TRUE);
 		}
 		else {
@@ -1564,14 +1588,14 @@ lua_mimepart_get_boundary (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (IS_CT_MULTIPART (part->ct)) {
+	if (IS_PART_MULTIPART (part)) {
 		lua_pushlstring (L, part->specific.mp->boundary.begin,
 				part->specific.mp->boundary.len);
 	}
 	else {
 		parent = part->parent_part;
 
-		if (!parent || !IS_CT_MULTIPART (parent->ct)) {
+		if (!parent || !IS_PART_MULTIPART (parent)) {
 			lua_pushnil (L);
 		}
 		else {
@@ -1670,7 +1694,7 @@ lua_mimepart_is_image (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	lua_pushboolean (L, (part->flags & RSPAMD_MIME_PART_IMAGE) ? true : false);
+	lua_pushboolean (L, part->part_type == RSPAMD_MIME_PART_IMAGE);
 
 	return 1;
 }
@@ -1685,7 +1709,7 @@ lua_mimepart_is_archive (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	lua_pushboolean (L, (part->flags & RSPAMD_MIME_PART_ARCHIVE) ? true : false);
+	lua_pushboolean (L, part->part_type == RSPAMD_MIME_PART_ARCHIVE);
 
 	return 1;
 }
@@ -1700,7 +1724,7 @@ lua_mimepart_is_multipart (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	lua_pushboolean (L, IS_CT_MULTIPART (part->ct) ? true : false);
+	lua_pushboolean (L, IS_PART_MULTIPART (part) ? true : false);
 
 	return 1;
 }
@@ -1715,7 +1739,7 @@ lua_mimepart_is_message (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	lua_pushboolean (L, IS_CT_MESSAGE (part->ct) ? true : false);
+	lua_pushboolean (L, IS_PART_MESSAGE (part) ? true : false);
 
 	return 1;
 }
@@ -1730,7 +1754,7 @@ lua_mimepart_is_attachment (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (!(part->flags & (RSPAMD_MIME_PART_IMAGE))) {
+	if (part->part_type != RSPAMD_MIME_PART_IMAGE) {
 		if (part->cd && part->cd->type == RSPAMD_CT_ATTACHMENT) {
 			lua_pushboolean (L, true);
 		}
@@ -1761,7 +1785,7 @@ lua_mimepart_is_text (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	lua_pushboolean (L, (part->flags & RSPAMD_MIME_PART_TEXT) ? true : false);
+	lua_pushboolean (L, part->part_type == RSPAMD_MIME_PART_TEXT);
 
 	return 1;
 }
@@ -1798,7 +1822,7 @@ lua_mimepart_get_image (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (!(part->flags & RSPAMD_MIME_PART_IMAGE) || part->specific.img == NULL) {
+	if (part->part_type != RSPAMD_MIME_PART_IMAGE || part->specific.img == NULL) {
 		lua_pushnil (L);
 	}
 	else {
@@ -1821,7 +1845,7 @@ lua_mimepart_get_archive (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (!(part->flags & RSPAMD_MIME_PART_ARCHIVE) || part->specific.arch == NULL) {
+	if (part->part_type != RSPAMD_MIME_PART_ARCHIVE || part->specific.arch == NULL) {
 		lua_pushnil (L);
 	}
 	else {
@@ -1845,7 +1869,7 @@ lua_mimepart_get_children (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (!IS_CT_MULTIPART (part->ct) || part->specific.mp->children == NULL) {
+	if (!IS_PART_MULTIPART (part) || part->specific.mp->children == NULL) {
 		lua_pushnil (L);
 	}
 	else {
@@ -1897,7 +1921,7 @@ lua_mimepart_get_text (lua_State * L)
 		return luaL_error (L, "invalid arguments");
 	}
 
-	if (!(part->flags & RSPAMD_MIME_PART_TEXT) || part->specific.txt == NULL) {
+	if (part->part_type != RSPAMD_MIME_PART_TEXT || part->specific.txt == NULL) {
 		lua_pushnil (L);
 	}
 	else {
@@ -1987,7 +2011,7 @@ lua_mimepart_headers_foreach (lua_State *L)
 		if (part->headers_order) {
 			hdr = part->headers_order;
 
-			LL_FOREACH (hdr, cur) {
+			LL_FOREACH2 (hdr, cur, ord_next) {
 				if (re && re->re) {
 					if (!rspamd_regexp_match (re->re, cur->name,
 							strlen (cur->name),FALSE)) {
@@ -2023,6 +2047,101 @@ lua_mimepart_headers_foreach (lua_State *L)
 	}
 
 	return 0;
+}
+
+static gint
+lua_mimepart_get_specific (lua_State * L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_mime_part *part = lua_check_mimepart (L);
+
+	if (part == NULL) {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	if (part->part_type != RSPAMD_MIME_PART_CUSTOM_LUA) {
+		lua_pushnil (L);
+	}
+	else {
+		lua_rawgeti (L, LUA_REGISTRYINDEX, part->specific.lua_specific.cbref);
+	}
+
+	return 1;
+}
+
+static gint
+lua_mimepart_is_specific (lua_State * L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_mime_part *part = lua_check_mimepart (L);
+
+	if (part == NULL) {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	lua_pushboolean (L, part->part_type == RSPAMD_MIME_PART_CUSTOM_LUA);
+
+	return 1;
+}
+
+static gint
+lua_mimepart_set_specific (lua_State * L)
+{
+	LUA_TRACE_POINT;
+	struct rspamd_mime_part *part = lua_check_mimepart (L);
+
+	if (part == NULL || lua_isnil (L, 2)) {
+		return luaL_error (L, "invalid arguments");
+	}
+
+	if (part->part_type != RSPAMD_MIME_PART_UNDEFINED &&
+			part->part_type != RSPAMD_MIME_PART_CUSTOM_LUA) {
+		return luaL_error (L,
+				"internal error: trying to set specific lua content on part of type %d",
+				part->part_type);
+	}
+
+	if (part->part_type == RSPAMD_MIME_PART_CUSTOM_LUA) {
+		/* Push old specific data */
+		lua_rawgeti (L, LUA_REGISTRYINDEX, part->specific.lua_specific.cbref);
+		luaL_unref (L, LUA_REGISTRYINDEX, part->specific.lua_specific.cbref);
+	}
+	else {
+		part->part_type = RSPAMD_MIME_PART_CUSTOM_LUA;
+		lua_pushnil (L);
+	}
+
+	/* Now, we push argument on the position 2 and save its reference */
+	lua_pushvalue (L, 2);
+	part->specific.lua_specific.cbref = luaL_ref (L, LUA_REGISTRYINDEX);
+	/* Now stack has just a return value as luaL_ref removes value from stack */
+
+	gint ltype = lua_type (L, 2);
+
+	switch (ltype) {
+	case LUA_TTABLE:
+		part->specific.lua_specific.type = RSPAMD_LUA_PART_TABLE;
+		break;
+	case LUA_TSTRING:
+		part->specific.lua_specific.type = RSPAMD_LUA_PART_STRING;
+		break;
+	case LUA_TUSERDATA:
+		if (rspamd_lua_check_udata_maybe (L, 2, "rspamd{text}")) {
+			part->specific.lua_specific.type = RSPAMD_LUA_PART_TEXT;
+		}
+		else {
+			part->specific.lua_specific.type = RSPAMD_LUA_PART_UNKNOWN;
+		}
+		break;
+	case LUA_TFUNCTION:
+		part->specific.lua_specific.type = RSPAMD_LUA_PART_FUNCTION;
+		break;
+	default:
+		part->specific.lua_specific.type = RSPAMD_LUA_PART_UNKNOWN;
+		break;
+	}
+
+	return 1;
 }
 
 void

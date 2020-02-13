@@ -16,7 +16,6 @@
 #include "config.h"
 #include "addr.h"
 #include "util.h"
-#include "map_helpers.h"
 #include "logger.h"
 #include "cryptobox.h"
 #include "unix-std.h"
@@ -29,7 +28,7 @@
 #include <grp.h>
 #endif
 
-static struct rspamd_radix_map_helper *local_addrs;
+static void *local_addrs;
 
 enum {
 	RSPAMD_IPV6_UNDEFINED = 0,
@@ -146,34 +145,39 @@ static void
 rspamd_ip_check_ipv6 (void)
 {
 	if (ipv6_status == RSPAMD_IPV6_UNDEFINED) {
-		gint s, r;
-		struct sockaddr_in6 sin6;
-		const struct in6_addr ip6_local = IN6ADDR_LOOPBACK_INIT;
+		gint s;
 
 		s = socket (AF_INET6, SOCK_STREAM, 0);
+
 		if (s == -1) {
 			ipv6_status = RSPAMD_IPV6_UNSUPPORTED;
 		}
 		else {
 			/*
-			 * Some systems allow ipv6 sockets creating but not binding,
-			 * so here we try to bind to some local address and check, whether it
-			 * is possible
+			 * Try to check /proc if we are on Linux (the common case)
 			 */
-			memset (&sin6, 0, sizeof (sin6));
-			sin6.sin6_family = AF_INET6;
-			sin6.sin6_port = rspamd_random_uint64_fast () % 40000 + 20000;
-			sin6.sin6_addr = ip6_local;
-
-			r = bind (s, (struct sockaddr *)&sin6, sizeof (sin6));
-			if (r == -1 && errno != EADDRINUSE) {
-				ipv6_status = RSPAMD_IPV6_UNSUPPORTED;
-			}
-			else {
-				ipv6_status = RSPAMD_IPV6_SUPPORTED;
-			}
+			struct stat st;
 
 			close (s);
+
+			if (stat ("/proc/net/dev", &st) != -1) {
+				if (stat ("/proc/net/if_inet6", &st) != -1) {
+					if (st.st_size != 0) {
+						ipv6_status = RSPAMD_IPV6_SUPPORTED;
+					}
+					else {
+						/* Empty file, no ipv6 configuration at all */
+						ipv6_status = RSPAMD_IPV6_UNSUPPORTED;
+					}
+				}
+				else {
+					ipv6_status = RSPAMD_IPV6_UNSUPPORTED;
+				}
+			}
+			else {
+				/* Not a Linux, so we assume it supports ipv6 somehow... */
+				ipv6_status = RSPAMD_IPV6_SUPPORTED;
+			}
 		}
 	}
 }
@@ -248,18 +252,19 @@ rspamd_accept_from_socket (gint sock, rspamd_inet_addr_t **target,
 				addr = rspamd_inet_addr_create (AF_INET, NULL);
 				memcpy (&addr->u.in.addr.s4.sin_addr, &p[12],
 						sizeof (struct in_addr));
+				addr->u.in.addr.s4.sin_port = su.s6.sin6_port;
 			}
 			else {
 				/* Something strange but not mapped v4 address */
 				addr = rspamd_inet_addr_create (AF_INET6, NULL);
-				memcpy (&addr->u.in.addr.s6.sin6_addr, &su.s6.sin6_addr,
-						sizeof (struct in6_addr));
+				memcpy (&addr->u.in.addr.s6, &su.s6,
+						sizeof (struct sockaddr_in6));
 			}
 		}
 		else {
 			addr = rspamd_inet_addr_create (AF_INET6, NULL);
-			memcpy (&addr->u.in.addr.s6.sin6_addr, &su.s6.sin6_addr,
-					sizeof (struct in6_addr));
+			memcpy (&addr->u.in.addr.s6, &su.s6,
+					sizeof (struct sockaddr_in6));
 		}
 
 	}
@@ -1439,8 +1444,18 @@ rspamd_parse_host_port_priority (const gchar *str,
 					portbuf, 0, pool);
 		}
 		else {
+			const gchar *second_semicolon = strchr (p + 1, ':');
+
 			name = str;
-			namelen = p - str;
+
+			if (second_semicolon) {
+				/* name + port part excluding priority */
+				namelen = second_semicolon - str;
+			}
+			else {
+				/* Full ip/name + port */
+				namelen = strlen (str);
+			}
 
 			if (!rspamd_check_port_priority (p, default_port, priority, portbuf,
 					sizeof (portbuf), pool)) {
@@ -1860,8 +1875,7 @@ rspamd_inet_address_port_equal (gconstpointer a, gconstpointer b)
 #endif
 
 gboolean
-rspamd_inet_address_is_local (const rspamd_inet_addr_t *addr,
-		gboolean check_laddrs)
+rspamd_inet_address_is_local (const rspamd_inet_addr_t *addr)
 {
 	if (addr == NULL) {
 		return FALSE;
@@ -1885,21 +1899,21 @@ rspamd_inet_address_is_local (const rspamd_inet_addr_t *addr,
 				return TRUE;
 			}
 		}
-
-		if (check_laddrs && local_addrs) {
-			if (rspamd_match_radix_map_addr (local_addrs, addr) != NULL) {
-				return TRUE;
-			}
-		}
 	}
 
 	return FALSE;
 }
 
-struct rspamd_radix_map_helper **
+void **
 rspamd_inet_library_init (void)
 {
 	return &local_addrs;
+}
+
+void *
+rspamd_inet_library_get_lib_ctx (void)
+{
+	return local_addrs;
 }
 
 void

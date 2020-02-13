@@ -104,9 +104,9 @@ local function yield_result(task, rule, vname, dyn_weight, is_fail)
       rspamd_logger.infox(task, '%s: "%s" is in whitelist', rule.log_prefix, tm)
     else
       all_whitelisted = false
-      task:insert_result(symname, symscore, tm)
       rspamd_logger.infox(task, '%s: result - %s: "%s - score: %s"',
           rule.log_prefix, threat_info, tm, symscore)
+      task:insert_result(symname, symscore, tm)
     end
   end
 
@@ -116,7 +116,7 @@ local function yield_result(task, rule, vname, dyn_weight, is_fail)
         lua_util.template(rule.message or 'Rejected', {
           SCANNER = rule.name,
           VIRUS = threat_table,
-        }), rule.name)
+        }), rule.name, nil, nil, 'least')
   end
 end
 
@@ -431,7 +431,7 @@ local function check_parts_match(task, rule)
         -- We know what to scan!
         local magic = lua_magic_types[detected_ext] or {}
 
-        if magic.av_check ~= false then
+        if p:is_attachment() or magic.av_check ~= false then
           extension_check = true
         end
       else

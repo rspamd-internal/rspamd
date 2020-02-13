@@ -54,7 +54,7 @@ local transform_function = {
       ['list'] = true,
     },
     ['process'] = function(inp, t)
-      return fun.nth(#inp, inp),pure_type(t)
+      return fun.nth(fun.length(inp), inp),pure_type(t)
     end,
     ['description'] = 'Returns the last element',
   },

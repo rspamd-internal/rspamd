@@ -423,6 +423,30 @@ end
 exports.list_to_hash = list_to_hash
 
 --[[[
+-- @function lua_util.nkeys(table|gen, param, state)
+-- Returns number of keys in a table (i.e. from both the array and hash parts combined)
+-- @param {table} list numerically-indexed table or string, which is treated as a one-element list
+-- @return {number} number of keys
+-- @example
+-- print(lua_util.nkeys({}))  -- 0
+-- print(lua_util.nkeys({ "a", nil, "b" }))  -- 2
+-- print(lua_util.nkeys({ dog = 3, cat = 4, bird = nil }))  -- 2
+-- print(lua_util.nkeys({ "a", dog = 3, cat = 4 }))  -- 3
+--
+--]]
+local function nkeys(gen, param, state)
+  local n = 0
+  if not param then
+    for _,_ in pairs(gen) do n = n + 1 end
+  else
+    for _,_ in fun.iter(gen, param, state) do n = n + 1 end
+  end
+  return n
+end
+
+exports.nkeys = nkeys
+
+--[[[
 -- @function lua_util.parse_time_interval(str)
 -- Parses human readable time interval
 -- Accepts 's' for seconds, 'm' for minutes, 'h' for hours, 'd' for days,
@@ -1026,35 +1050,9 @@ end
 -- * `uncertain`: all other cases
 --]]
 exports.get_task_verdict = function(task)
-  local result = task:get_metric_result()
+  local lua_verdict = require "lua_verdict"
 
-  if result then
-
-    if result.passthrough then
-      return 'passthrough',nil
-    end
-
-    local score = result.score
-
-    local action = result.action
-
-    if action == 'reject' and result.npositive > 1 then
-      return 'spam',score
-    elseif action == 'no action' then
-      if score < 0 or result.nnegative > 3 then
-        return 'ham',score
-      end
-    else
-      -- All colors of junk
-      if action == 'add header' or action == 'rewrite subject' then
-        if result.npositive > 2 then
-          return 'junk',score
-        end
-      end
-    end
-
-    return 'uncertain',score
-  end
+  return lua_verdict.get_default_verdict(task)
 end
 
 ---[[[
@@ -1293,6 +1291,64 @@ exports.toboolean = function(v)
   else
     return false, string.format( 'cannot convert %q to boolean', v);
   end
+end
+
+---[[[
+-- @function lua_util.config_check_local_or_authed(config, modname)
+-- Reads check_local and check_authed from the config as this is used in many modules
+-- @param {rspamd_config} config `rspamd_config` global
+-- @param {name} module name
+-- @return {boolean} v converted to boolean
+--]]]
+exports.config_check_local_or_authed = function(rspamd_config, modname, def_local, def_authed)
+  local check_local = def_local or false
+  local check_authed = def_authed or false
+
+  local function try_section(where)
+    local ret = false
+    local opts = rspamd_config:get_all_opt(where)
+    if type(opts) == 'table' then
+      if type(opts['check_local']) == 'boolean' then
+        check_local = opts['check_local']
+        ret = true
+      end
+      if type(opts['check_authed']) == 'boolean' then
+        check_authed = opts['check_authed']
+        ret = true
+      end
+    end
+
+    return ret
+  end
+
+  if not try_section(modname) then
+    try_section('options')
+  end
+
+  return {check_local, check_authed}
+end
+
+---[[[
+-- @function lua_util.is_skip_local_or_authed(task, conf[, ip])
+-- Returns `true` if local or authenticated task should be skipped for this module
+-- @param {rspamd_task} task
+-- @param {table} conf table returned from `config_check_local_or_authed`
+-- @param {rspamd_ip} ip optional ip address (can be obtained from a task)
+-- @return {boolean} true if check should be skipped
+--]]]
+exports.is_skip_local_or_authed = function(task, conf, ip)
+  if not ip then
+    ip = task:get_from_ip()
+  end
+  if not conf then
+    conf = {false, false}
+  end
+  if ((not conf[2] and task:get_user()) or
+      (not conf[1] and type(ip) == 'userdata' and ip:is_local())) then
+    return true
+  end
+
+  return false
 end
 
 return exports

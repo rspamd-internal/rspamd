@@ -21,10 +21,10 @@
 #include "libserver/fuzzy_wire.h"
 #include "util.h"
 #include "rspamd.h"
-#include "map.h"
-#include "map_helpers.h"
+#include "libserver/maps/map.h"
+#include "libserver/maps/map_helpers.h"
 #include "fuzzy_wire.h"
-#include "fuzzy_backend.h"
+#include "libserver/fuzzy_backend/fuzzy_backend.h"
 #include "ottery.h"
 #include "ref.h"
 #include "xxhash.h"
@@ -33,9 +33,8 @@
 #include "libcryptobox/cryptobox.h"
 #include "libcryptobox/keypairs_cache.h"
 #include "libcryptobox/keypair.h"
-#include "libserver/rspamd_control.h"
 #include "libutil/hash.h"
-#include "libutil/map_private.h"
+#include "libserver/maps/map_private.h"
 #include "contrib/uthash/utlist.h"
 #include "unix-std.h"
 
@@ -112,6 +111,7 @@ struct fuzzy_key_stat {
 	guint64 deleted;
 	guint64 errors;
 	rspamd_lru_hash_t *last_ips;
+	ref_entry_t ref;
 };
 
 struct rspamd_fuzzy_mirror {
@@ -230,10 +230,14 @@ struct rspamd_updates_cbdata {
 	GArray *updates_pending;
 	struct rspamd_fuzzy_storage_ctx *ctx;
 	gchar *source;
+	gboolean final;
 };
 
 
 static void rspamd_fuzzy_write_reply (struct fuzzy_session *session);
+static gboolean rspamd_fuzzy_process_updates_queue (
+		struct rspamd_fuzzy_storage_ctx *ctx,
+		const gchar *source, gboolean final);
 
 static gboolean
 rspamd_fuzzy_check_ratelimit (struct fuzzy_session *session)
@@ -376,6 +380,16 @@ fuzzy_key_stat_dtor (gpointer p)
 	if (st->last_ips) {
 		rspamd_lru_hash_destroy (st->last_ips);
 	}
+
+	g_free (st);
+}
+
+static void
+fuzzy_key_stat_unref (gpointer p)
+{
+	struct fuzzy_key_stat *st = p;
+
+	REF_RELEASE (st);
 }
 
 static void
@@ -383,8 +397,12 @@ fuzzy_key_dtor (gpointer p)
 {
 	struct fuzzy_key *key = p;
 
-	if (key->stat) {
-		fuzzy_key_stat_dtor (key->stat);
+	if (key) {
+		if (key->stat) {
+			REF_RELEASE (key->stat);
+		}
+
+		g_free (key);
 	}
 }
 
@@ -458,6 +476,11 @@ rspamd_fuzzy_updates_cb (gboolean success,
 		rspamd_fuzzy_backend_version (ctx->backend, source,
 				fuzzy_update_version_callback, g_strdup (source));
 		ctx->updates_failed = 0;
+
+		if (cbdata->final || ctx->worker->state != rspamd_worker_state_running) {
+			/* Plan exit */
+			ev_break (ctx->event_loop, EVBREAK_ALL);
+		}
 	}
 	else {
 		if (++ctx->updates_failed > ctx->updates_maxfail) {
@@ -466,6 +489,11 @@ rspamd_fuzzy_updates_cb (gboolean success,
 					cbdata->updates_pending->len,
 					ctx->updates_maxfail);
 			ctx->updates_failed = 0;
+
+			if (cbdata->final || ctx->worker->state != rspamd_worker_state_running) {
+				/* Plan exit */
+				ev_break (ctx->event_loop, EVBREAK_ALL);
+			}
 		}
 		else {
 			msg_err ("cannot commit update transaction to fuzzy backend, "
@@ -478,12 +506,14 @@ rspamd_fuzzy_updates_cb (gboolean success,
 			g_array_append_vals (ctx->updates_pending,
 					cbdata->updates_pending->data,
 					cbdata->updates_pending->len);
-		}
-	}
 
-	if (ctx->worker->wanna_die) {
-		/* Plan exit */
-		ev_break (ctx->event_loop, EVBREAK_ALL);
+			if (cbdata->final) {
+				/* Try one more time */
+				rspamd_fuzzy_process_updates_queue (cbdata->ctx, cbdata->source,
+						cbdata->final);
+
+			}
+		}
 	}
 
 	g_array_free (cbdata->updates_pending, TRUE);
@@ -491,16 +521,17 @@ rspamd_fuzzy_updates_cb (gboolean success,
 	g_free (cbdata);
 }
 
-static void
+static gboolean
 rspamd_fuzzy_process_updates_queue (struct rspamd_fuzzy_storage_ctx *ctx,
-		const gchar *source, gboolean forced)
+		const gchar *source, gboolean final)
 {
 
 	struct rspamd_updates_cbdata *cbdata;
 
-	if ((forced ||ctx->updates_pending->len > 0)) {
+	if (ctx->updates_pending->len > 0) {
 		cbdata = g_malloc (sizeof (*cbdata));
 		cbdata->ctx = ctx;
+		cbdata->final = final;
 		cbdata->updates_pending = ctx->updates_pending;
 		ctx->updates_pending = g_array_sized_new (FALSE, FALSE,
 				sizeof (struct fuzzy_peer_cmd),
@@ -509,7 +540,14 @@ rspamd_fuzzy_process_updates_queue (struct rspamd_fuzzy_storage_ctx *ctx,
 		rspamd_fuzzy_backend_process_updates (ctx->backend,
 				cbdata->updates_pending,
 				source, rspamd_fuzzy_updates_cb, cbdata);
+		return TRUE;
 	}
+	else if (final) {
+		/* No need to sync */
+		ev_break (ctx->event_loop, EVBREAK_ALL);
+	}
+
+	return FALSE;
 }
 
 static void
@@ -862,10 +900,12 @@ rspamd_fuzzy_process_command (struct fuzzy_session *session)
 		if (ip_stat == NULL) {
 			naddr = rspamd_inet_address_copy (session->addr);
 			ip_stat = g_malloc0 (sizeof (*ip_stat));
+			REF_INIT_RETAIN (ip_stat, fuzzy_key_stat_dtor);
 			rspamd_lru_hash_insert (session->key_stat->last_ips,
 					naddr, ip_stat, -1, 0);
 		}
 
+		REF_RETAIN (ip_stat);
 		session->ip_stat = ip_stat;
 	}
 
@@ -1145,6 +1185,11 @@ fuzzy_session_destroy (gpointer d)
 	rspamd_inet_address_free (session->addr);
 	rspamd_explicit_memzero (session->nm, sizeof (session->nm));
 	session->worker->nconns--;
+
+	if (session->ip_stat) {
+		REF_RELEASE (session->ip_stat);
+	}
+
 	g_free (session);
 }
 
@@ -1165,8 +1210,6 @@ accept_fuzzy_socket (EV_P_ ev_io *w, int revents)
 	if (revents == EV_READ) {
 
 		for (;;) {
-			worker->nconns++;
-
 			r = rspamd_inet_address_recvfrom (w->fd,
 					buf,
 					sizeof (buf),
@@ -1195,6 +1238,7 @@ accept_fuzzy_socket (EV_P_ ev_io *w, int revents)
 			session->ctx = worker->ctx;
 			session->time = (guint64) time (NULL);
 			session->addr = addr;
+			worker->nconns++;
 
 			if (rspamd_fuzzy_cmd_from_wire (buf, r, session)) {
 				/* Check shingles count sanity */
@@ -1571,12 +1615,14 @@ fuzzy_parse_keypair (rspamd_mempool_t *pool,
 			return FALSE;
 		}
 
-		key = rspamd_mempool_alloc0 (pool, sizeof (*key));
+		key = g_malloc0 (sizeof (*key));
 		key->key = kp;
-		keystat = rspamd_mempool_alloc0 (pool, sizeof (*keystat));
+		keystat = g_malloc0 (sizeof (*keystat));
+		REF_INIT_RETAIN (keystat, fuzzy_key_stat_dtor);
 		/* Hash of ip -> fuzzy_key_stat */
 		keystat->last_ips = rspamd_lru_hash_new_full (1024,
-				(GDestroyNotify) rspamd_inet_address_free, fuzzy_key_stat_dtor,
+				(GDestroyNotify) rspamd_inet_address_free,
+				fuzzy_key_stat_unref,
 				rspamd_inet_address_hash, rspamd_inet_address_equal);
 		key->stat = keystat;
 		pk = rspamd_keypair_component (kp, RSPAMD_KEYPAIR_COMPONENT_PK,
@@ -1952,7 +1998,7 @@ start_fuzzy (struct rspamd_worker *worker)
 	if (ctx->update_map != NULL) {
 		rspamd_config_radix_from_ucl (worker->srv->cfg, ctx->update_map,
 				"Allow fuzzy updates from specified addresses",
-				&ctx->update_ips, NULL);
+				&ctx->update_ips, NULL, worker);
 	}
 
 	if (ctx->skip_map != NULL) {
@@ -1963,7 +2009,8 @@ start_fuzzy (struct rspamd_worker *worker)
 				rspamd_kv_list_read,
 				rspamd_kv_list_fin,
 				rspamd_kv_list_dtor,
-				(void **)&ctx->skip_hashes)) == NULL) {
+				(void **)&ctx->skip_hashes,
+				worker)) == NULL) {
 			msg_warn_config ("cannot load hashes list from %s",
 					ucl_object_tostring (ctx->skip_map));
 		}
@@ -1975,14 +2022,18 @@ start_fuzzy (struct rspamd_worker *worker)
 	if (ctx->blocked_map != NULL) {
 		rspamd_config_radix_from_ucl (worker->srv->cfg, ctx->blocked_map,
 				"Block fuzzy requests from the specific IPs",
-				&ctx->blocked_ips, NULL);
+				&ctx->blocked_ips,
+				NULL,
+				worker);
 	}
 
 	/* Create radix trees */
 	if (ctx->ratelimit_whitelist_map != NULL) {
 		rspamd_config_radix_from_ucl (worker->srv->cfg, ctx->ratelimit_whitelist_map,
 				"Skip ratelimits from specific ip addresses/networks",
-				&ctx->ratelimit_whitelist, NULL);
+				&ctx->ratelimit_whitelist,
+				NULL,
+				worker);
 	}
 
 	/* Ratelimits */
@@ -1996,7 +2047,8 @@ start_fuzzy (struct rspamd_worker *worker)
 	ctx->resolver = rspamd_dns_resolver_init (worker->srv->logger,
 			ctx->event_loop,
 			worker->srv->cfg);
-	rspamd_map_watch (worker->srv->cfg, ctx->event_loop, ctx->resolver, worker, 0);
+	rspamd_map_watch (worker->srv->cfg, ctx->event_loop,
+			ctx->resolver, worker, RSPAMD_MAP_WATCH_WORKER);
 
 	/* Get peer pipe */
 	memset (&srv_cmd, 0, sizeof (srv_cmd));
@@ -2020,8 +2072,16 @@ start_fuzzy (struct rspamd_worker *worker)
 	}
 
 	if (worker->index == 0 && ctx->updates_pending->len > 0) {
-		rspamd_fuzzy_process_updates_queue (ctx, local_db_name, FALSE);
-		ev_loop (ctx->event_loop, 0);
+
+		msg_info_config ("start another event loop to sync fuzzy storage");
+
+		if (rspamd_fuzzy_process_updates_queue (ctx, local_db_name, TRUE)) {
+			ev_loop (ctx->event_loop, 0);
+			msg_info_config ("sync cycle is done");
+		}
+		else {
+			msg_info_config ("no need to sync");
+		}
 	}
 
 	rspamd_fuzzy_backend_close (ctx->backend);
@@ -2034,8 +2094,12 @@ start_fuzzy (struct rspamd_worker *worker)
 		rspamd_keypair_cache_destroy (ctx->keypair_cache);
 	}
 
+	if (ctx->ratelimit_buckets) {
+		rspamd_lru_hash_destroy (ctx->ratelimit_buckets);
+	}
+
 	REF_RELEASE (ctx->cfg);
-	rspamd_log_close (worker->srv->logger, TRUE);
+	rspamd_log_close (worker->srv->logger);
 
 	exit (EXIT_SUCCESS);
 }

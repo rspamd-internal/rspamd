@@ -60,7 +60,7 @@ static struct html_tag_def tag_defs[] = {
 	TAG_DEF(Tag_APPLET, "applet", (CM_OBJECT | CM_IMG | CM_INLINE | CM_PARAM)),
 	TAG_DEF(Tag_AREA, "area", (CM_BLOCK | CM_EMPTY | FL_HREF)),
 	TAG_DEF(Tag_B, "b", (CM_INLINE|FL_BLOCK)),
-	TAG_DEF(Tag_BASE, "base", (CM_HEAD | CM_EMPTY | FL_HREF)),
+	TAG_DEF(Tag_BASE, "base", (CM_HEAD | CM_EMPTY)),
 	TAG_DEF(Tag_BASEFONT, "basefont", (CM_INLINE | CM_EMPTY)),
 	TAG_DEF(Tag_BDO, "bdo", (CM_INLINE)),
 	TAG_DEF(Tag_BIG, "big", (CM_INLINE)),
@@ -506,7 +506,7 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 	/* Leftover */
 	if (state == 1 && h > e) {
 		/* Unfinished entity, copy as is */
-		if (end - t > h - e) {
+		if (end - t >= h - e) {
 			memmove (t, e, h - e);
 			t += h - e;
 		}
@@ -815,8 +815,6 @@ rspamd_html_process_tag (rspamd_mempool_t *pool, struct html_content *hc,
 						return TRUE;
 					}
 				}
-
-				parent->content_length += tag->content_length;
 			}
 
 			if (hc->total_tags < max_tags) {
@@ -1513,7 +1511,7 @@ rspamd_html_process_url_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 					orig_len = len;
 					len += hc->base_url->urllen;
 
-					if (hc->base_url->string[hc->base_url->urllen - 1] != '/') {
+					if (hc->base_url->datalen == 0) {
 						need_slash = TRUE;
 						len ++;
 					}
@@ -1801,6 +1799,7 @@ rspamd_html_process_img_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 
 	if (hc->images == NULL) {
 		hc->images = g_ptr_array_sized_new (4);
+		rspamd_mempool_notify_alloc (pool, 4 * sizeof (gpointer) + sizeof (GPtrArray));
 		rspamd_mempool_add_destructor (pool, rspamd_ptr_array_free_hard,
 				hc->images);
 	}
@@ -2325,14 +2324,16 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 				fstr.len = comp->len;
 				rspamd_html_process_color (comp->start, comp->len,
 						&bl->font_color);
-				msg_debug_html ("got color: %xd", bl->font_color.d.val);
+				msg_debug_html ("tag %*s; got color: %xd",
+						tag->name.len, tag->name.start, bl->font_color.d.val);
 				break;
 			case RSPAMD_HTML_COMPONENT_BGCOLOR:
 				fstr.begin = (gchar *) comp->start;
 				fstr.len = comp->len;
 				rspamd_html_process_color (comp->start, comp->len,
 						&bl->background_color);
-				msg_debug_html ("got color: %xd", bl->font_color.d.val);
+				msg_debug_html ("tag %*s; got color: %xd",
+						tag->name.len, tag->name.start, bl->font_color.d.val);
 
 				if (tag->id == Tag_BODY) {
 					/* Set global background color */
@@ -2343,21 +2344,25 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 			case RSPAMD_HTML_COMPONENT_STYLE:
 				bl->style.len = comp->len;
 				bl->style.start = comp->start;
-				msg_debug_html ("got style: %*s", (gint) bl->style.len,
-						bl->style.start);
+				msg_debug_html ("tag: %*s; got style: %*s",
+						tag->name.len, tag->name.start,
+						(gint) bl->style.len, bl->style.start);
 				rspamd_html_process_style (pool, bl, hc, comp->start, comp->len);
 				break;
 			case RSPAMD_HTML_COMPONENT_CLASS:
 				fstr.begin = (gchar *) comp->start;
 				fstr.len = comp->len;
 				bl->html_class = rspamd_mempool_ftokdup (pool, &fstr);
-				msg_debug_html ("got class: %s", bl->html_class);
+				msg_debug_html ("tag: %*s; got class: %s",
+						tag->name.len, tag->name.start, bl->html_class);
 				break;
 			case RSPAMD_HTML_COMPONENT_SIZE:
 				/* Not supported by html5 */
 				/* FIXME maybe support it */
 				bl->font_size = 16;
-				msg_debug_html ("got size: %*s", (gint)comp->len, comp->start);
+				msg_debug_html ("tag %*s; got size: %*s",
+						tag->name.len, tag->name.start,
+						(gint)comp->len, comp->start);
 				break;
 			default:
 				/* NYI */
@@ -2370,6 +2375,7 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 
 	if (hc->blocks == NULL) {
 		hc->blocks = g_ptr_array_sized_new (64);
+		rspamd_mempool_notify_alloc (pool, 64 * sizeof (gpointer) + sizeof (GPtrArray));
 		rspamd_mempool_add_destructor (pool, rspamd_ptr_array_free_hard,
 				hc->blocks);
 	}
@@ -2772,13 +2778,6 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 				p ++;
 			}
 			else {
-				if (content_tag) {
-					if (content_tag->content == NULL) {
-						content_tag->content = c;
-					}
-
-					content_tag->content_length += p - c;
-				}
 				state = tag_begin;
 			}
 			break;
@@ -2796,24 +2795,35 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 						if (need_decode) {
 							goffset old_offset = dest->len;
 
+							if (content_tag) {
+								if (content_tag->content_length == 0) {
+									content_tag->content_offset = old_offset;
+								}
+							}
+
 							g_byte_array_append (dest, c, (p - c));
 
 							len = rspamd_html_decode_entitles_inplace (
 									dest->data + old_offset,
 									p - c);
 							dest->len = dest->len + len - (p - c);
+
+							if (content_tag) {
+								content_tag->content_length += len;
+							}
 						}
 						else {
 							len = p - c;
-							g_byte_array_append (dest, c, len);
-						}
 
-						if (content_tag) {
-							if (content_tag->content == NULL) {
-								content_tag->content = c;
+							if (content_tag) {
+								if (content_tag->content_length == 0) {
+									content_tag->content_offset = dest->len;
+								}
+
+								content_tag->content_length += len;
 							}
 
-							content_tag->content_length += p - c + 1;
+							g_byte_array_append (dest, c, len);
 						}
 					}
 
@@ -2826,6 +2836,20 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 						if (dest->len > 0 &&
 								!g_ascii_isspace (dest->data[dest->len - 1])) {
 							g_byte_array_append (dest, " ", 1);
+							if (content_tag) {
+								if (content_tag->content_length == 0) {
+									/*
+									 * Special case
+									 * we have a space at the beginning but
+									 * we have no set content_offset
+									 * so we need to do it here
+									 */
+									content_tag->content_offset = dest->len;
+								}
+								else {
+									content_tag->content_length++;
+								}
+							}
 						}
 						save_space = FALSE;
 					}
@@ -2837,24 +2861,34 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 					if (need_decode) {
 						goffset old_offset = dest->len;
 
+						if (content_tag) {
+							if (content_tag->content_length == 0) {
+								content_tag->content_offset = dest->len;
+							}
+						}
+
 						g_byte_array_append (dest, c, (p - c));
 						len = rspamd_html_decode_entitles_inplace (
 								dest->data + old_offset,
 								p - c);
 						dest->len = dest->len + len - (p - c);
+
+						if (content_tag) {
+							content_tag->content_length += len;
+						}
 					}
 					else {
 						len = p - c;
-						g_byte_array_append (dest, c, len);
-					}
 
+						if (content_tag) {
+							if (content_tag->content_length == 0) {
+								content_tag->content_offset = dest->len;
+							}
 
-					if (content_tag) {
-						if (content_tag->content == NULL) {
-							content_tag->content = c;
+							content_tag->content_length += len;
 						}
 
-						content_tag->content_length += p - c;
+						g_byte_array_append (dest, c, len);
 					}
 				}
 
@@ -2872,10 +2906,6 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 				c = p;
 				state = content_write;
 				continue;
-			}
-
-			if (content_tag) {
-				content_tag->content_length ++;
 			}
 
 			p ++;
@@ -2947,6 +2977,21 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 				if (cur_tag->id == Tag_BR || cur_tag->id == Tag_HR) {
 					if (dest->len > 0 && dest->data[dest->len - 1] != '\n') {
 						g_byte_array_append (dest, "\r\n", 2);
+
+						if (content_tag) {
+							if (content_tag->content_length == 0) {
+								/*
+								 * Special case
+								 * we have a \r\n at the beginning but
+								 * we have no set content_offset
+								 * so we need to do it here
+								 */
+								content_tag->content_offset = dest->len;
+							}
+							else {
+								content_tag->content_length += 2;
+							}
+						}
 					}
 					save_space = FALSE;
 				}
@@ -2956,6 +3001,21 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 						cur_tag->id == Tag_DIV)) {
 					if (dest->len > 0 && dest->data[dest->len - 1] != '\n') {
 						g_byte_array_append (dest, "\r\n", 2);
+
+						if (content_tag) {
+							if (content_tag->content_length == 0) {
+								/*
+								 * Special case
+								 * we have a \r\n at the beginning but
+								 * we have no set content_offset
+								 * so we need to get it here
+								 */
+								content_tag->content_offset = dest->len;
+							}
+							else {
+								content_tag->content_length += 2;
+							}
+						}
 					}
 					save_space = FALSE;
 				}
@@ -3031,27 +3091,19 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 					}
 				}
 				else if (cur_tag->id == Tag_BASE && !(cur_tag->flags & (FL_CLOSING))) {
-					struct html_tag *prev_tag = NULL;
-
-					if (cur_level && cur_level->parent) {
-						prev_tag = cur_level->parent->data;
-					}
-
 					/*
-					 * Base is allowed only within head tag but we slightly
-					 * relax that
+					 * Base is allowed only within head tag but HTML is retarded
 					 */
-					if (!prev_tag || prev_tag->id == Tag_HEAD ||
-						prev_tag->id == Tag_HTML) {
+					if (hc->base_url == NULL) {
 						url = rspamd_html_process_url_tag (pool, cur_tag, hc);
 
 						if (url != NULL) {
-							if (hc->base_url == NULL) {
-								/* We have a base tag available */
-								hc->base_url = url;
-							}
-
+							msg_debug_html ("got valid base tag");
+							hc->base_url = url;
 							cur_tag->extra = url;
+						}
+						else {
+							msg_debug_html ("got invalid base tag!");
 						}
 					}
 				}
@@ -3112,6 +3164,7 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 	}
 
 	g_queue_free (styles_blocks);
+	hc->parsed = dest;
 
 	return dest;
 }

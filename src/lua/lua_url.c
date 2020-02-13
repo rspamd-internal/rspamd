@@ -23,6 +23,9 @@
  * You can also create `rspamd_url` from any text.
  * @example
 local url = require "rspamd_url"
+local mpool = require "rspamd_mempool"
+
+url.init("/usr/share/rspamd/effective_tld_names.dat")
 local pool = mpool.create()
 local res = url.create(pool, 'Look at: http://user@test.example.com/test?query")
 local t = res:to_table()
@@ -302,13 +305,15 @@ lua_url_tostring (lua_State *L)
 
 	if (url != NULL && url->url != NULL) {
 		if (url->url->protocol == PROTOCOL_MAILTO) {
-			if (url->url->userlen + 1 + url->url->hostlen >= url->url->urllen) {
-				lua_pushlstring (L, url->url->user,
-						url->url->userlen + 1 + url->url->hostlen);
-			}
-			else {
-				lua_pushlstring (L, url->url->string, url->url->urllen);
-			}
+			gchar *tmp = g_malloc (url->url->userlen + 1 +
+								   url->url->hostlen);
+			memcpy (tmp, url->url->user, url->url->userlen);
+			tmp[url->url->userlen] = '@';
+			memcpy (tmp + url->url->userlen + 1, url->url->host,
+					url->url->hostlen);
+
+			lua_pushlstring (L, tmp, url->url->userlen + 1 + url->url->hostlen);
+			g_free (tmp);
 		}
 		else {
 			lua_pushlstring (L, url->url->string, url->url->urllen);
@@ -726,7 +731,7 @@ lua_url_create (lua_State *L)
 	}
 	else {
 		own_pool = TRUE;
-		pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "url");
+		pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "url", 0);
 		text = luaL_checklstring (L, 1, &length);
 	}
 
@@ -755,9 +760,9 @@ lua_url_create (lua_State *L)
 }
 
 /***
- * @function url.create(tld_file)
+ * @function url.init(tld_file)
  * Initialize url library if not initialized yet by Rspamd
- * @param {string} tld_file for url library
+ * @param {string} tld_file path to effective_tld_names.dat file (public suffix list)
  * @return nothing
  */
 static gint
@@ -784,9 +789,7 @@ lua_url_table_inserter (struct rspamd_url *url, gsize start_offset,
 	lua_url = lua_newuserdata (L, sizeof (struct rspamd_lua_url));
 	rspamd_lua_setclass (L, "rspamd{url}", -1);
 	lua_url->url = url;
-	lua_pushinteger (L, n + 1);
-	lua_pushlstring (L, url->string, url->urllen);
-	lua_settable (L, -3);
+	lua_rawseti (L, -2, n + 1);
 
 	return TRUE;
 }
@@ -844,6 +847,7 @@ lua_url_all (lua_State *L)
  * - `unnormalised`: URL has some unicode unnormalities
  * - `zw_spaces`: URL has some zero width spaces
  * - `url_displayed`: URL has some other url-like string in visible part
+ * - `image`: URL is from src attribute of img HTML tag
  * @return {table} URL flags
  */
 #define PUSH_FLAG(fl, name) do { \

@@ -16,9 +16,9 @@
 
 #include "config.h"
 #include "rspamadm.h"
-#include "libutil/http_connection.h"
-#include "libutil/http_private.h"
-#include "libutil/http_router.h"
+#include "libserver/http/http_connection.h"
+#include "libserver/http/http_private.h"
+#include "libserver/http/http_router.h"
 #include "printf.h"
 #include "lua/lua_common.h"
 #include "lua/lua_thread_pool.h"
@@ -431,7 +431,7 @@ rspamadm_lua_message_handler (lua_State *L, gint argc, gchar **argv)
 			rspamd_printf ("cannot open %s: %s\n", argv[i], strerror (errno));
 		}
 		else {
-			task = rspamd_task_new (NULL, rspamd_main->cfg, NULL, NULL, NULL);
+			task = rspamd_task_new (NULL, rspamd_main->cfg, NULL, NULL, NULL, FALSE);
 
 			if (!rspamd_task_load_message (task, NULL, map, len)) {
 				rspamd_printf ("cannot load %s\n", argv[i]);
@@ -610,9 +610,11 @@ static void
 rspamadm_lua_run_repl (lua_State *L, bool is_batch)
 {
 	gchar *input;
+#ifdef WITH_LUA_REPL
 	gboolean is_multiline = FALSE;
 	GString *tb = NULL;
 	gsize i;
+#endif
 
 	for (;;) {
 #ifndef WITH_LUA_REPL
@@ -1004,10 +1006,14 @@ rspamadm_lua (gint argc, gchar **argv, const struct rspamadm_command *cmd)
 	rx_instance = replxx_init ();
 #endif
 	if (!batch) {
+#ifdef WITH_LUA_REPL
 		replxx_set_max_history_size (rx_instance, max_history);
 		replxx_history_load (rx_instance, histfile);
+#endif
 		rspamadm_lua_run_repl (L, false);
+#ifdef WITH_LUA_REPL
 		replxx_history_save (rx_instance, histfile);
+#endif
 	} else {
 		rspamadm_lua_run_repl (L, true);
 	}

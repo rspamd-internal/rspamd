@@ -17,7 +17,7 @@
 #define TASK_H_
 
 #include "config.h"
-#include "http_connection.h"
+#include "libserver/http/http_connection.h"
 #include "async_session.h"
 #include "util.h"
 #include "mem_pool.h"
@@ -225,7 +225,8 @@ struct rspamd_task *rspamd_task_new (struct rspamd_worker *worker,
 									 struct rspamd_config *cfg,
 									 rspamd_mempool_t *pool,
 									 struct rspamd_lang_detector *lang_det,
-									 struct ev_loop *event_loop);
+									 struct ev_loop *event_loop,
+									 gboolean debug_mem);
 
 /**
  * Destroy task object and remove its IO dispatcher if it exists
@@ -373,6 +374,16 @@ gboolean rspamd_task_set_finish_time (struct rspamd_task *task);
  * @return
  */
 const gchar *rspamd_task_stage_name (enum rspamd_task_stage stg);
+
+/*
+ * Called on forced timeout
+ */
+void rspamd_task_timeout (EV_P_ ev_timer *w, int revents);
+
+/*
+ * Called on unexpected IO error (e.g. ECONNRESET)
+ */
+void rspamd_worker_guard_handler (EV_P_ ev_io *w, int revents);
 
 #ifdef  __cplusplus
 }

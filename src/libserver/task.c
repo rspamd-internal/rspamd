@@ -60,17 +60,20 @@ rspamd_task_quark (void)
  * Create new task
  */
 struct rspamd_task *
-rspamd_task_new (struct rspamd_worker *worker, struct rspamd_config *cfg,
+rspamd_task_new (struct rspamd_worker *worker,
+				 struct rspamd_config *cfg,
 				 rspamd_mempool_t *pool,
 				 struct rspamd_lang_detector *lang_det,
-				 struct ev_loop *event_loop)
+				 struct ev_loop *event_loop,
+				 gboolean debug_mem)
 {
 	struct rspamd_task *new_task;
 	rspamd_mempool_t *task_pool;
 	guint flags = 0;
 
 	if (pool == NULL) {
-		task_pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), "task");
+		task_pool = rspamd_mempool_new (rspamd_mempool_suggest_size (),
+				"task", debug_mem ? RSPAMD_MEMPOOL_DEBUG : 0);
 		flags |= RSPAMD_TASK_FLAG_OWN_POOL;
 	}
 	else {
@@ -395,7 +398,7 @@ rspamd_task_load_message (struct rspamd_task *task,
 
 			if (offset > (gulong)st.st_size) {
 				msg_err_task ("invalid offset %ul (%ul available) for shm "
-							  "segment %s", offset, st.st_size, fp);
+							  "segment %s", offset, (gulong)st.st_size, fp);
 				munmap (map, st.st_size);
 				close (fd);
 
@@ -412,7 +415,7 @@ rspamd_task_load_message (struct rspamd_task *task,
 
 			if (shmem_size > (gulong)st.st_size) {
 				msg_err_task ("invalid length %ul (%ul available) for %s "
-							  "segment %s", shmem_size, st.st_size, ft, fp);
+							  "segment %s", shmem_size, (gulong)st.st_size, ft, fp);
 				munmap (map, st.st_size);
 				close (fd);
 
@@ -593,7 +596,7 @@ rspamd_task_load_message (struct rspamd_task *task,
 
 				if (zout.pos == zout.size) {
 					/* We need to extend output buffer */
-					zout.size = zout.size * 1.5 + 1.0;
+					zout.size = zout.size * 2 + 1;
 					zout.dst = g_realloc (zout.dst, zout.size);
 				}
 			}
@@ -722,7 +725,6 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 	case RSPAMD_TASK_STAGE_PRE_FILTERS_EMPTY:
 	case RSPAMD_TASK_STAGE_PRE_FILTERS:
 	case RSPAMD_TASK_STAGE_FILTERS:
-	case RSPAMD_TASK_STAGE_IDEMPOTENT:
 		all_done = rspamd_symcache_process_symbols (task, task->cfg->cache, st);
 		break;
 
@@ -805,6 +807,15 @@ rspamd_task_process (struct rspamd_task *task, guint stages)
 	case RSPAMD_TASK_STAGE_COMPOSITES_POST:
 		/* Second run of composites processing before idempotent filters */
 		rspamd_make_composites (task);
+		break;
+
+	case RSPAMD_TASK_STAGE_IDEMPOTENT:
+		/* Stop task timeout */
+		if (ev_can_stop (&task->timeout_ev)) {
+			ev_timer_stop (task->event_loop, &task->timeout_ev);
+		}
+
+		all_done = rspamd_symcache_process_symbols (task, task->cfg->cache, st);
 		break;
 
 	case RSPAMD_TASK_STAGE_DONE:
@@ -1126,7 +1137,8 @@ rspamd_task_log_metric_res (struct rspamd_task *task,
 						j = 0;
 
 						DL_FOREACH (sym->opts_head, opt) {
-							rspamd_printf_fstring (&symbuf, "%s;", opt->option);
+							rspamd_printf_fstring (&symbuf, "%*s;",
+									(gint)opt->optlen, opt->option);
 
 							if (j >= max_log_elts) {
 								rspamd_printf_fstring (&symbuf, "...;");
@@ -1148,6 +1160,7 @@ rspamd_task_log_metric_res (struct rspamd_task *task,
 			rspamd_mempool_add_destructor (task->task_pool,
 					(rspamd_mempool_destruct_t)rspamd_fstring_free,
 					symbuf);
+			rspamd_mempool_notify_alloc (task->task_pool, symbuf->len);
 			res.begin = symbuf->str;
 			res.len = symbuf->len;
 			break;
@@ -1193,6 +1206,7 @@ rspamd_task_log_metric_res (struct rspamd_task *task,
 			rspamd_mempool_add_destructor (task->task_pool,
 					(rspamd_mempool_destruct_t) rspamd_fstring_free,
 					symbuf);
+			rspamd_mempool_notify_alloc (task->task_pool, symbuf->len);
 			res.begin = symbuf->str;
 			res.len = symbuf->len;
 			break;
@@ -1537,6 +1551,18 @@ rspamd_task_log_variable (struct rspamd_task *task,
 			var.len = sizeof (undef) - 1;
 		}
 		break;
+	case RSPAMD_LOG_MEMPOOL_SIZE:
+		var.len = rspamd_snprintf (numbuf, sizeof (numbuf),
+				"%Hz",
+				rspamd_mempool_get_used_size (task->task_pool));
+		var.begin = numbuf;
+		break;
+	case RSPAMD_LOG_MEMPOOL_WASTE:
+		var.len = rspamd_snprintf (numbuf, sizeof (numbuf),
+				"%Hz",
+				rspamd_mempool_get_wasted_size (task->task_pool));
+		var.begin = numbuf;
+		break;
 	default:
 		var = rspamd_task_log_metric_res (task, lf);
 		break;
@@ -1832,4 +1858,125 @@ rspamd_task_stage_name (enum rspamd_task_stage stg)
 	}
 
 	return ret;
+}
+
+void
+rspamd_task_timeout (EV_P_ ev_timer *w, int revents)
+{
+	struct rspamd_task *task = (struct rspamd_task *)w->data;
+
+	if (!(task->processed_stages & RSPAMD_TASK_STAGE_FILTERS)) {
+		ev_now_update_if_cheap (task->event_loop);
+		msg_info_task ("processing of task time out: %.1fs spent; %.1fs limit; "
+					   "forced processing",
+				ev_now (task->event_loop) - task->task_timestamp,
+				w->repeat);
+
+		if (task->cfg->soft_reject_on_timeout) {
+			struct rspamd_action *action, *soft_reject;
+
+			action = rspamd_check_action_metric (task);
+
+			if (action->action_type != METRIC_ACTION_REJECT) {
+				soft_reject = rspamd_config_get_action_by_type (task->cfg,
+						METRIC_ACTION_SOFT_REJECT);
+				rspamd_add_passthrough_result (task,
+						soft_reject,
+						0,
+						NAN,
+						"timeout processing message",
+						"task timeout",
+						0);
+
+				ucl_object_replace_key (task->messages,
+						ucl_object_fromstring_common ("timeout processing message",
+								0, UCL_STRING_RAW),
+						"smtp_message", 0,
+						false);
+			}
+		}
+
+		ev_timer_again (EV_A_ w);
+		task->processed_stages |= RSPAMD_TASK_STAGE_FILTERS;
+		rspamd_session_cleanup (task->s);
+		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
+		rspamd_session_pending (task->s);
+	}
+	else {
+		/* Postprocessing timeout */
+		msg_info_task ("post-processing of task time out: %.1f second spent; forced processing",
+				ev_now (task->event_loop) - task->task_timestamp);
+
+		if (task->cfg->soft_reject_on_timeout) {
+			struct rspamd_action *action, *soft_reject;
+
+			action = rspamd_check_action_metric (task);
+
+			if (action->action_type != METRIC_ACTION_REJECT) {
+				soft_reject = rspamd_config_get_action_by_type (task->cfg,
+						METRIC_ACTION_SOFT_REJECT);
+				rspamd_add_passthrough_result (task,
+						soft_reject,
+						0,
+						NAN,
+						"timeout post-processing message",
+						"task timeout",
+						0);
+
+				ucl_object_replace_key (task->messages,
+						ucl_object_fromstring_common ("timeout post-processing message",
+								0, UCL_STRING_RAW),
+						"smtp_message", 0,
+						false);
+			}
+		}
+
+		ev_timer_stop (EV_A_ w);
+		task->processed_stages |= RSPAMD_TASK_STAGE_DONE;
+		rspamd_session_cleanup (task->s);
+		rspamd_task_process (task, RSPAMD_TASK_PROCESS_ALL);
+		rspamd_session_pending (task->s);
+	}
+}
+
+void
+rspamd_worker_guard_handler (EV_P_ ev_io *w, int revents)
+{
+	struct rspamd_task *task = (struct rspamd_task *)w->data;
+	gchar fake_buf[1024];
+	gssize r;
+
+	r = read (w->fd, fake_buf, sizeof (fake_buf));
+
+	if (r > 0) {
+		msg_warn_task ("received extra data after task is loaded, ignoring");
+	}
+	else {
+		if (r == 0) {
+			/*
+			 * Poor man approach, that might break things in case of
+			 * shutdown (SHUT_WR) but sockets are so bad that there's no
+			 * reliable way to distinguish between shutdown(SHUT_WR) and
+			 * close.
+			 */
+			if (task->cmd != CMD_CHECK_V2 && task->cfg->enable_shutdown_workaround) {
+				msg_info_task ("workaround for shutdown enabled, please update "
+							   "your client, this support might be removed in future");
+				shutdown (w->fd, SHUT_RD);
+				ev_io_stop (task->event_loop, &task->guard_ev);
+			}
+			else {
+				msg_err_task ("the peer has closed connection unexpectedly");
+				rspamd_session_destroy (task->s);
+			}
+		}
+		else if (errno != EAGAIN) {
+			msg_err_task ("the peer has closed connection unexpectedly: %s",
+					strerror (errno));
+			rspamd_session_destroy (task->s);
+		}
+		else {
+			return;
+		}
+	}
 }
