@@ -16,14 +16,20 @@
 
 #include "config.h"
 #include "libutil/util.h"
+#include "libutil/hash.h"
 #include "libserver/logger.h"
+#include "libserver/cfg_file.h"
 #include "ssl_util.h"
 #include "unix-std.h"
+#include "cryptobox.h"
+#include "contrib/libottery/ottery.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/conf.h>
+#include <openssl/evp.h>
+#include <openssl/engine.h>
 #include <openssl/x509v3.h>
 
 enum rspamd_ssl_state {
@@ -40,12 +46,18 @@ enum rspamd_ssl_shutdown {
 	ssl_shut_unclean,
 };
 
+struct rspamd_ssl_ctx {
+	SSL_CTX *s;
+	rspamd_lru_hash_t *sessions;
+};
+
 struct rspamd_ssl_connection {
 	gint fd;
 	enum rspamd_ssl_state state;
 	enum rspamd_ssl_shutdown shut;
 	gboolean verify_peer;
 	SSL *ssl;
+	struct rspamd_ssl_ctx *ssl_ctx;
 	gchar *hostname;
 	struct rspamd_io_ev *ev;
 	struct rspamd_io_ev *shut_ev;
@@ -415,6 +427,8 @@ rspamd_tls_set_error (gint retcode, const gchar *stage, GError **err)
 static void
 rspamd_ssl_connection_dtor (struct rspamd_ssl_connection *conn)
 {
+	msg_debug_ssl ("closing SSL connection %p; %d sessions in the cache",
+			conn->ssl, rspamd_lru_hash_size (conn->ssl_ctx->sessions));
 	SSL_free (conn->ssl);
 
 	if (conn->hostname) {
@@ -614,23 +628,24 @@ struct rspamd_ssl_connection *
 rspamd_ssl_connection_new (gpointer ssl_ctx, struct ev_loop *ev_base,
 		gboolean verify_peer, const gchar *log_tag)
 {
-	struct rspamd_ssl_connection *c;
+	struct rspamd_ssl_connection *conn;
+	struct rspamd_ssl_ctx *ctx = (struct rspamd_ssl_ctx *)ssl_ctx;
 
 	g_assert (ssl_ctx != NULL);
-	c = g_malloc0 (sizeof (*c));
-	c->ssl = SSL_new (ssl_ctx);
-	c->event_loop = ev_base;
-	c->verify_peer = verify_peer;
+	conn = g_malloc0 (sizeof (*conn));
+	conn->ssl_ctx = ctx;
+	conn->event_loop = ev_base;
+	conn->verify_peer = verify_peer;
 
 	if (log_tag) {
-		rspamd_strlcpy (c->log_tag, log_tag, sizeof (log_tag));
+		rspamd_strlcpy (conn->log_tag, log_tag, sizeof (log_tag));
 	}
 	else {
-		rspamd_random_hex (c->log_tag, sizeof (log_tag) - 1);
-		c->log_tag[sizeof (log_tag) - 1] = '\0';
+		rspamd_random_hex (conn->log_tag, sizeof (log_tag) - 1);
+		conn->log_tag[sizeof (log_tag) - 1] = '\0';
 	}
 
-	return c;
+	return conn;
 }
 
 
@@ -641,8 +656,25 @@ rspamd_ssl_connect_fd (struct rspamd_ssl_connection *conn, gint fd,
 		gpointer handler_data)
 {
 	gint ret;
+	SSL_SESSION *session = NULL;
 
 	g_assert (conn != NULL);
+
+	conn->ssl = SSL_new (conn->ssl_ctx->s);
+
+	if (hostname) {
+		session = rspamd_lru_hash_lookup (conn->ssl_ctx->sessions, hostname,
+				ev_now (conn->event_loop));
+
+	}
+
+	if (session) {
+		SSL_set_session (conn->ssl, session);
+	}
+
+	SSL_set_app_data (conn->ssl, conn);
+	msg_debug_ssl ("new ssl connection %p; session reused=%s",
+			conn->ssl, SSL_session_reused (conn->ssl) ? "true" : "false");
 
 	if (conn->state != ssl_conn_reset) {
 		return FALSE;
@@ -923,18 +955,36 @@ rspamd_ssl_connection_free (struct rspamd_ssl_connection *conn)
 	}
 }
 
-gpointer
-rspamd_init_ssl_ctx (void)
+static int
+rspamd_ssl_new_client_session (SSL *ssl, SSL_SESSION *sess)
 {
+	struct rspamd_ssl_connection *conn;
+
+	conn = SSL_get_app_data (ssl);
+
+	if (conn->hostname) {
+		rspamd_lru_hash_insert (conn->ssl_ctx->sessions,
+				g_strdup (conn->hostname), SSL_get1_session (ssl),
+				ev_now (conn->event_loop), SSL_CTX_get_timeout (conn->ssl_ctx->s));
+		msg_debug_ssl ("saved new session for %s: %p", conn->hostname, conn);
+	}
+
+	return 0;
+}
+
+static struct rspamd_ssl_ctx *
+rspamd_init_ssl_ctx_common (void)
+{
+	struct rspamd_ssl_ctx *ret;
 	SSL_CTX *ssl_ctx;
 	gint ssl_options;
+	static const guint client_cache_size = 1024;
 
 	rspamd_openssl_maybe_init ();
 
-	ssl_ctx = SSL_CTX_new (SSLv23_method ());
-	SSL_CTX_set_verify (ssl_ctx, SSL_VERIFY_PEER, NULL);
-	SSL_CTX_set_verify_depth (ssl_ctx, 4);
+	ret = g_malloc0 (sizeof (*ret));
 	ssl_options = SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3;
+	ssl_ctx = SSL_CTX_new (SSLv23_method ());
 
 #ifdef SSL_OP_NO_COMPRESSION
 	ssl_options |= SSL_OP_NO_COMPRESSION;
@@ -944,30 +994,121 @@ rspamd_init_ssl_ctx (void)
 
 	SSL_CTX_set_options (ssl_ctx, ssl_options);
 
+#ifdef TLS1_3_VERSION
+	SSL_CTX_set_min_proto_version (ssl_ctx, 0);
+	SSL_CTX_set_max_proto_version (ssl_ctx, TLS1_3_VERSION);
+#endif
+
+#ifdef SSL_SESS_CACHE_CLIENT
+	SSL_CTX_set_session_cache_mode (ssl_ctx, SSL_SESS_CACHE_CLIENT
+											 | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+#endif
+
+	ret->s = ssl_ctx;
+	ret->sessions = rspamd_lru_hash_new_full (client_cache_size,
+			g_free, (GDestroyNotify)SSL_SESSION_free, rspamd_str_hash,
+			rspamd_str_equal);
+	SSL_CTX_set_app_data (ssl_ctx, ret);
+	SSL_CTX_sess_set_new_cb (ssl_ctx, rspamd_ssl_new_client_session);
+
+	return ret;
+}
+
+gpointer
+rspamd_init_ssl_ctx (void)
+{
+	struct rspamd_ssl_ctx *ssl_ctx = rspamd_init_ssl_ctx_common ();
+
+	SSL_CTX_set_verify (ssl_ctx->s, SSL_VERIFY_PEER, NULL);
+	SSL_CTX_set_verify_depth (ssl_ctx->s, 4);
+
 	return ssl_ctx;
 }
 
 gpointer rspamd_init_ssl_ctx_noverify (void)
 {
-	SSL_CTX *ssl_ctx_noverify;
-	gint ssl_options;
+	struct rspamd_ssl_ctx *ssl_ctx_noverify = rspamd_init_ssl_ctx_common ();
 
-	rspamd_openssl_maybe_init ();
-
-	ssl_options = SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3;
-
-#ifdef SSL_OP_NO_COMPRESSION
-	ssl_options |= SSL_OP_NO_COMPRESSION;
-#elif OPENSSL_VERSION_NUMBER >= 0x00908000L
-	sk_SSL_COMP_zero (SSL_COMP_get_compression_methods ());
-#endif
-
-	ssl_ctx_noverify = SSL_CTX_new (SSLv23_method ());
-	SSL_CTX_set_verify (ssl_ctx_noverify, SSL_VERIFY_NONE, NULL);
-	SSL_CTX_set_options (ssl_ctx_noverify, ssl_options);
-#ifdef SSL_SESS_CACHE_BOTH
-	SSL_CTX_set_session_cache_mode (ssl_ctx_noverify, SSL_SESS_CACHE_BOTH);
-#endif
+	SSL_CTX_set_verify (ssl_ctx_noverify->s, SSL_VERIFY_NONE, NULL);
 
 	return ssl_ctx_noverify;
+}
+
+void
+rspamd_openssl_maybe_init (void)
+{
+	static gboolean openssl_initialized = FALSE;
+
+	if (!openssl_initialized) {
+		ERR_load_crypto_strings ();
+		SSL_load_error_strings ();
+
+		OpenSSL_add_all_algorithms ();
+		OpenSSL_add_all_digests ();
+		OpenSSL_add_all_ciphers ();
+
+#if OPENSSL_VERSION_NUMBER >= 0x1000104fL && !defined(LIBRESSL_VERSION_NUMBER)
+		ENGINE_load_builtin_engines ();
+#endif
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		SSL_library_init ();
+#else
+		OPENSSL_init_ssl (0, NULL);
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		OPENSSL_config (NULL);
+#endif
+		if (RAND_status () == 0) {
+			guchar seed[128];
+
+			/* Try to use ottery to seed rand */
+			ottery_rand_bytes (seed, sizeof (seed));
+			RAND_seed (seed, sizeof (seed));
+			rspamd_explicit_memzero (seed, sizeof (seed));
+		}
+
+		openssl_initialized = TRUE;
+	}
+}
+
+void
+rspamd_ssl_ctx_config (struct rspamd_config *cfg, gpointer ssl_ctx)
+{
+	struct rspamd_ssl_ctx *ctx = (struct rspamd_ssl_ctx *)ssl_ctx;
+	static const char default_secure_ciphers[] = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4";
+
+	if (cfg->ssl_ca_path) {
+		if (SSL_CTX_load_verify_locations (ctx->s, cfg->ssl_ca_path,
+				NULL) != 1) {
+			msg_err_config ("cannot load CA certs from %s: %s",
+					cfg->ssl_ca_path,
+					ERR_error_string (ERR_get_error (), NULL));
+		}
+	}
+	else {
+		msg_debug_config ("ssl_ca_path is not set, using default CA path");
+		SSL_CTX_set_default_verify_paths (ctx->s);
+	}
+
+	if (cfg->ssl_ciphers) {
+		if (SSL_CTX_set_cipher_list (ctx->s, cfg->ssl_ciphers) != 1) {
+			msg_err_config (
+					"cannot set ciphers set to %s: %s; fallback to %s",
+					cfg->ssl_ciphers,
+					ERR_error_string (ERR_get_error (), NULL),
+					default_secure_ciphers);
+			/* Default settings */
+			SSL_CTX_set_cipher_list (ctx->s, default_secure_ciphers);
+		}
+	}
+}
+
+void
+rspamd_ssl_ctx_free (gpointer ssl_ctx)
+{
+	struct rspamd_ssl_ctx *ctx = (struct rspamd_ssl_ctx *)ssl_ctx;
+
+	rspamd_lru_hash_destroy (ctx->sessions);
+	SSL_CTX_free (ctx->s);
 }

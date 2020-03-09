@@ -47,6 +47,7 @@ LUA_FUNCTION_DEF (worker, add_control_handler);
 
 const luaL_reg worker_reg[] = {
 		LUA_INTERFACE_DEF (worker, get_name),
+		{"get_type", lua_worker_get_name},
 		LUA_INTERFACE_DEF (worker, get_stat),
 		LUA_INTERFACE_DEF (worker, get_index),
 		LUA_INTERFACE_DEF (worker, get_count),
@@ -757,7 +758,7 @@ lua_worker_spawn_process (lua_State *L)
 	struct rspamd_lua_process_cbdata *cbdata;
 	struct rspamd_abstract_worker_ctx *actx;
 	struct rspamd_srv_command srv_cmd;
-	const gchar *cmdline = NULL, *input = NULL;
+	const gchar *cmdline = NULL, *input = NULL, *proctitle = NULL;
 	gsize inputlen = 0;
 	pid_t pid;
 	GError *err = NULL;
@@ -765,8 +766,8 @@ lua_worker_spawn_process (lua_State *L)
 
 	if (!rspamd_lua_parse_table_arguments (L, 2, &err,
 			RSPAMD_LUA_PARSE_ARGUMENTS_DEFAULT,
-			"func=F;exec=S;stdin=V;*on_complete=F", &func_cbref,
-			&cmdline, &inputlen, &input, &cb_cbref)) {
+			"func=F;exec=S;stdin=V;*on_complete=F;proctitle=S", &func_cbref,
+			&cmdline, &inputlen, &input, &cb_cbref, &proctitle)) {
 		msg_err ("cannot get parameters list: %e", err);
 
 		if (err) {
@@ -834,6 +835,14 @@ lua_worker_spawn_process (lua_State *L)
 		rspamd_socket_blocking (cbdata->sp[1]);
 		g_hash_table_remove_all (w->signal_events);
 		ev_loop_destroy (cbdata->event_loop);
+
+		if (proctitle) {
+			setproctitle ("lua process: %s", proctitle);
+		}
+		else {
+			setproctitle ("lua process: unnamed");
+		}
+
 		cbdata->event_loop = ev_loop_new (EVFLAG_SIGNALFD);
 		rspamd_worker_unblock_signals ();
 		rspamd_lua_execute_lua_subprocess (L, cbdata);

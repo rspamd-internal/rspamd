@@ -758,8 +758,7 @@ rspamd_message_process_html_text_part (struct rspamd_task *task,
 			text_part->html,
 			text_part->utf_raw_content,
 			&text_part->exceptions,
-			MESSAGE_FIELD (task, urls),
-			MESSAGE_FIELD (task, emails));
+			MESSAGE_FIELD (task, urls));
 
 	if (text_part->utf_content->len == 0) {
 		text_part->flags |= RSPAMD_MIME_TEXT_PART_FLAG_EMPTY;
@@ -849,12 +848,6 @@ rspamd_message_process_text_part_maybe (struct rspamd_task *task,
 			rspamd_add_passthrough_result (task, action,
 					RSPAMD_PASSTHROUGH_CRITICAL,
 					score, "Gtube pattern", "GTUBE", 0);
-
-			if (ucl_object_lookup (task->messages, "smtp_message") == NULL) {
-				ucl_object_replace_key (task->messages,
-						ucl_object_fromstring ("Gtube pattern"),
-						"smtp_message", 0, false);
-			}
 		}
 
 		rspamd_task_insert_result (task, GTUBE_SYMBOL, 0, NULL);
@@ -907,7 +900,7 @@ rspamd_message_from_data (struct rspamd_task *task, const guchar *start,
 	part->raw_data.len = len;
 	part->parsed_data.begin = start;
 	part->parsed_data.len = len;
-	part->id = MESSAGE_FIELD (task, parts)->len;
+	part->part_number = MESSAGE_FIELD (task, parts)->len;
 	part->raw_headers = rspamd_message_headers_new ();
 	part->headers_order = NULL;
 
@@ -1054,8 +1047,7 @@ rspamd_message_dtor (struct rspamd_message *msg)
 	g_ptr_array_unref (msg->text_parts);
 	g_ptr_array_unref (msg->parts);
 
-	g_hash_table_unref (msg->urls);
-	g_hash_table_unref (msg->emails);
+	kh_destroy (rspamd_url_hash, msg->urls);
 }
 
 struct rspamd_message*
@@ -1066,10 +1058,7 @@ rspamd_message_new (struct rspamd_task *task)
 	msg = rspamd_mempool_alloc0 (task->task_pool, sizeof (*msg));
 
 	msg->raw_headers = rspamd_message_headers_new ();
-
-	msg->emails = g_hash_table_new (rspamd_email_hash, rspamd_emails_cmp);
-	msg->urls = g_hash_table_new (rspamd_url_hash, rspamd_urls_cmp);
-
+	msg->urls = kh_init (rspamd_url_hash);
 	msg->parts = g_ptr_array_sized_new (4);
 	msg->text_parts = g_ptr_array_sized_new (2);
 	msg->task = task;

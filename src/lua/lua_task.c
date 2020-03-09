@@ -158,7 +158,7 @@ LUA_FUNCTION_DEF (task, insert_result);
  */
 LUA_FUNCTION_DEF (task, adjust_result);
 /***
- * @method task:set_pre_result(action, description)
+ * @method task:set_pre_result(action, [message, [module], [score], [priority], [flags])
  * Sets pre-result for a task. It is used in pre-filters to specify early result
  * of the task scanned. If a pre-filter sets some result, then further processing
  * may be skipped. For selecting action it is possible to use global table
@@ -170,12 +170,16 @@ LUA_FUNCTION_DEF (task, adjust_result);
  * - `greylist`: greylist message
  * - `accept` or `no action`: whitelist message
  * @param {rspamd_action or string} action a numeric or string action value
- * @param {string} description optional description
+ * @param {string} message action message
+ * @param {string} module optional module name
+ * @param {number/nil} score optional explicit score
+ * @param {number/nil} priority optional explicit priority
+ * @param {string/nil} flags optional flags (e.g. 'least' for least action)
 @example
 local function cb(task)
 	local gr = task:get_header('Greylist')
 	if gr and gr == 'greylist' then
-		task:set_pre_result(rspamd_actions['greylist'], 'Greylisting required')
+		task:set_pre_result('soft reject', 'Greylisting required')
 	end
 end
  */
@@ -669,11 +673,12 @@ LUA_FUNCTION_DEF (task, get_symbols_numeric);
 LUA_FUNCTION_DEF (task, get_symbols_tokens);
 
 /***
- * @method task:process_ann_tokens(symbols, ann_tokens, offset)
+ * @method task:process_ann_tokens(symbols, ann_tokens, offset, [min])
  * Processes ann tokens
  * @param {table|string} symbols list of symbols in this profile
  * @param {table|number} ann_tokens list of tokens (including metatokens)
  * @param {integer} offset offset for symbols token (#metatokens)
+ * @param {number} min minimum value for symbols found (e.g. for 0 score symbols)
  * @return nothing
  */
 LUA_FUNCTION_DEF (task, process_ann_tokens);
@@ -2077,18 +2082,10 @@ lua_task_set_pre_result (lua_State * L)
 
 		if (lua_type (L, 3) == LUA_TSTRING) {
 			message = lua_tostring (L, 3);
-
-			if (lua_type (L, 7) != LUA_TSTRING) {
-				/* Keep compatibility here :( */
-
-				ucl_object_replace_key (task->messages,
-						ucl_object_fromstring_common (message, 0, UCL_STRING_RAW),
-						"smtp_message", 0,
-						false);
-			}
 		}
 		else {
 			message = "unknown reason";
+			flags |= RSPAMD_PASSTHROUGH_NO_SMTP_MESSAGE;
 		}
 
 		if (lua_type (L, 4) == LUA_TSTRING) {
@@ -2111,6 +2108,9 @@ lua_task_set_pre_result (lua_State * L)
 
 			if (strstr (fl_str, "least") != NULL) {
 				flags |= RSPAMD_PASSTHROUGH_LEAST;
+			}
+			else if (strstr (fl_str, "no_smtp_message") != NULL) {
+				flags |= RSPAMD_PASSTHROUGH_NO_SMTP_MESSAGE;
 			}
 		}
 
@@ -2249,6 +2249,7 @@ lua_task_get_urls (lua_State * L)
 	static const gint default_mask = PROTOCOL_HTTP|PROTOCOL_HTTPS|
 			PROTOCOL_FILE|PROTOCOL_FTP;
 	const gchar *cache_name = "emails+urls";
+	struct rspamd_url *u;
 	gboolean need_images = FALSE;
 	gsize sz, max_urls = 0;
 
@@ -2336,8 +2337,7 @@ lua_task_get_urls (lua_State * L)
 				cache_name = "emails+urls";
 			}
 
-			sz = g_hash_table_size (MESSAGE_FIELD (task, urls)) +
-					g_hash_table_size (MESSAGE_FIELD (task, emails));
+			sz = kh_size (MESSAGE_FIELD (task, urls));
 
 			sz = lua_task_urls_adjust_skip_prob (task, &cb, sz, max_urls);
 
@@ -2345,20 +2345,17 @@ lua_task_get_urls (lua_State * L)
 				/* Can use cached version */
 				if (!lua_task_get_cached (L, task, cache_name)) {
 					lua_createtable (L, sz, 0);
-					g_hash_table_foreach (MESSAGE_FIELD (task, urls),
-							lua_tree_url_callback, &cb);
-					g_hash_table_foreach (MESSAGE_FIELD (task, emails),
-							lua_tree_url_callback, &cb);
-
+					kh_foreach_key (MESSAGE_FIELD (task, urls), u, {
+						lua_tree_url_callback (u, u, &cb);
+					});
 					lua_task_set_cached (L, task, cache_name, -1);
 				}
 			}
 			else {
 				lua_createtable (L, sz, 0);
-				g_hash_table_foreach (MESSAGE_FIELD (task, urls),
-						lua_tree_url_callback, &cb);
-				g_hash_table_foreach (MESSAGE_FIELD (task, emails),
-						lua_tree_url_callback, &cb);
+				kh_foreach_key (MESSAGE_FIELD (task, urls), u, {
+					lua_tree_url_callback (u, u, &cb);
+				});
 			}
 
 		}
@@ -2370,21 +2367,27 @@ lua_task_get_urls (lua_State * L)
 				cache_name = "urls";
 			}
 
-			sz = g_hash_table_size (MESSAGE_FIELD (task, urls));
+			sz = kh_size (MESSAGE_FIELD (task, urls));
 			sz = lua_task_urls_adjust_skip_prob (task, &cb, sz, max_urls);
 
 			if (protocols_mask == (default_mask)) {
 				if (!lua_task_get_cached (L, task, cache_name)) {
 					lua_createtable (L, sz, 0);
-					g_hash_table_foreach (MESSAGE_FIELD (task, urls),
-							lua_tree_url_callback, &cb);
+					kh_foreach_key (MESSAGE_FIELD (task, urls), u, {
+						if (!(u->protocol & PROTOCOL_MAILTO)) {
+							lua_tree_url_callback (u, u, &cb);
+						}
+					});
 					lua_task_set_cached (L, task, cache_name, -1);
 				}
 			}
 			else {
 				lua_createtable (L, sz, 0);
-				g_hash_table_foreach (MESSAGE_FIELD (task, urls),
-						lua_tree_url_callback, &cb);
+				kh_foreach_key (MESSAGE_FIELD (task, urls), u, {
+					if (!(u->protocol & PROTOCOL_MAILTO)) {
+						lua_tree_url_callback (u, u, &cb);
+					}
+				});
 			}
 		}
 	}
@@ -2409,13 +2412,8 @@ lua_task_has_urls (lua_State * L)
 				need_emails = lua_toboolean (L, 2);
 			}
 
-			if (g_hash_table_size (MESSAGE_FIELD (task, urls)) > 0) {
-				sz += g_hash_table_size (MESSAGE_FIELD (task, urls));
-				ret = TRUE;
-			}
-
-			if (need_emails && g_hash_table_size (MESSAGE_FIELD (task, emails)) > 0) {
-				sz += g_hash_table_size (MESSAGE_FIELD (task, emails));
+			if (kh_size (MESSAGE_FIELD (task, urls)) > 0) {
+				sz += kh_size (MESSAGE_FIELD (task, urls));
 				ret = TRUE;
 			}
 		}
@@ -2438,15 +2436,7 @@ lua_task_inject_url (lua_State * L)
 	struct rspamd_lua_url *url = lua_check_url (L, 2);
 
 	if (task && task->message && url && url->url) {
-		struct rspamd_url *existing;
-
-		if ((existing = g_hash_table_lookup (MESSAGE_FIELD (task, urls),
-				url->url)) == NULL) {
-			g_hash_table_insert (MESSAGE_FIELD (task, urls), url->url, url->url);
-		}
-		else {
-			existing->count ++;
-		}
+		rspamd_url_set_add_or_increase (MESSAGE_FIELD (task, urls), url->url);
 	}
 	else {
 		return luaL_error (L, "invalid arguments");
@@ -2538,16 +2528,21 @@ lua_task_get_emails (lua_State * L)
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
 	struct lua_tree_cb_data cb;
+	struct rspamd_url *u;
 
 	if (task) {
 		if (task->message) {
-			lua_createtable (L, g_hash_table_size (MESSAGE_FIELD (task, emails)), 0);
+			lua_createtable (L, kh_size (MESSAGE_FIELD (task, urls)), 0);
 			memset (&cb, 0, sizeof (cb));
 			cb.i = 1;
 			cb.L = L;
 			cb.mask = PROTOCOL_MAILTO;
-			g_hash_table_foreach (MESSAGE_FIELD (task, emails),
-					lua_tree_url_callback, &cb);
+
+			kh_foreach_key (MESSAGE_FIELD (task, urls), u, {
+				if ((u->protocol & PROTOCOL_MAILTO)) {
+					lua_tree_url_callback (u, u, &cb);
+				}
+			});
 		}
 		else {
 			lua_newtable (L);
@@ -3729,7 +3724,7 @@ lua_task_get_from (lua_State *L)
 			break;
 		}
 
-		if (addrs) {
+		if (addrs && addrs->len > 0) {
 			lua_push_emails_address_list (L, addrs, what & ~RSPAMD_ADDRESS_MASK);
 		}
 		else if (addr) {
@@ -4761,9 +4756,13 @@ lua_task_process_ann_tokens (lua_State *L)
 	LUA_TRACE_POINT;
 	struct rspamd_task *task = lua_check_task (L, 1);
 	gint offset = luaL_checkinteger (L, 4);
+	gdouble min_score = 0.0;
 
 	if (task && lua_istable (L, 2) && lua_istable (L, 3)) {
 		guint symlen = rspamd_lua_table_size (L, 2);
+		if (lua_isnumber (L, 5)) {
+			min_score = lua_tonumber (L, 5);
+		}
 
 		for (guint i = 1; i <= symlen; i ++, offset ++) {
 			const gchar *sym;
@@ -4775,11 +4774,14 @@ lua_task_process_ann_tokens (lua_State *L)
 			sres = rspamd_task_find_symbol_result (task, sym);
 
 			if (sres && !(sres->flags & RSPAMD_SYMBOL_RESULT_IGNORED)) {
-				if (!isnan (sres->score) && !isinf (sres->score) &&
-					!(rspamd_symcache_item_flags (sres->sym->cache_item) &
-					  SYMBOL_TYPE_NOSTAT)) {
 
-					lua_pushnumber (L, fabs (tanh (sres->score)));
+				if (!isnan (sres->score) && !isinf (sres->score) &&
+						(!sres->sym ||
+							!(rspamd_symcache_item_flags (sres->sym->cache_item) & SYMBOL_TYPE_NOSTAT))) {
+					gdouble norm_score = fabs (tanh (sres->score));
+
+
+					lua_pushnumber (L, MAX (min_score , norm_score));
 					lua_rawseti (L, 3, offset + 1);
 				}
 			}
@@ -5849,7 +5851,7 @@ lua_task_get_metric_result (lua_State *L)
 		lua_pushnumber (L, metric_res->score);
 		lua_settable (L, -3);
 
-		action = rspamd_check_action_metric (task);
+		action = rspamd_check_action_metric (task, NULL);
 
 		if (action) {
 			lua_pushstring (L, "action");
@@ -5920,7 +5922,7 @@ lua_task_get_metric_action (lua_State *L)
 	struct rspamd_action *action;
 
 	if (task) {
-		action = rspamd_check_action_metric (task);
+		action = rspamd_check_action_metric (task, NULL);
 		lua_pushstring (L, action->name);
 	}
 	else {
@@ -6382,7 +6384,7 @@ lua_lookup_words_array (lua_State *L,
 		case RSPAMD_LUA_MAP_SET:
 		case RSPAMD_LUA_MAP_HASH:
 			/* We know that tok->normalized is zero terminated in fact */
-			if (rspamd_match_hash_map (map->data.hash, key)) {
+			if (rspamd_match_hash_map (map->data.hash, key, keylen)) {
 				matched = TRUE;
 			}
 			break;

@@ -342,9 +342,10 @@ guint
 rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 {
 	goffset l, rep_len;
-	gchar *t = s, *h = s, *e = s, *end_ptr;
+	gchar *t = s, *h = s, *e = s, *end_ptr, old_c;
 	const gchar *end;
 	const gchar *entity;
+	gboolean seen_hash = FALSE, seen_digit_only = FALSE, seen_hex = FALSE;
 	gint state = 0, base;
 	UChar32 uc;
 	khiter_t k;
@@ -364,6 +365,9 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 		case 0:
 			if (*h == '&') {
 				state = 1;
+				seen_hash = FALSE;
+				seen_hex = FALSE;
+				seen_digit_only = FALSE;
 				e = h;
 				h++;
 				continue;
@@ -376,15 +380,17 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 			break;
 		case 1:
 			if (*h == ';' && h > e) {
+decode_entity:
 				/* Determine base */
 				/* First find in entities table */
+				old_c = *h;
 				*h = '\0';
 				entity = e + 1;
 				uc = 0;
 
 				if (*entity != '#') {
 					k = kh_get (entity_by_name, html_entity_by_name, entity);
-					*h = ';';
+					*h = old_c;
 
 					if (k != kh_end (html_entity_by_name)) {
 						if (kh_val (html_entity_by_name, k)) {
@@ -429,7 +435,7 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 
 					if (end_ptr != NULL && *end_ptr != '\0') {
 						/* Skip undecoded */
-						*h = ';';
+						*h = old_c;
 
 						if (end - t > h - e + 1) {
 							memmove (t, e, h - e + 1);
@@ -438,7 +444,7 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 					}
 					else {
 						/* Search for a replacement */
-						*h = ';';
+						*h = old_c;
 						k = kh_get (entity_by_number, html_entity_by_number, uc);
 
 						if (k != kh_end (html_entity_by_number)) {
@@ -480,6 +486,11 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 								t += h - e + 1;
 							}
 						}
+
+						if (end - t > 0 && old_c != ';') {
+							/* Fuck email clients, fuck them */
+							*t++ = old_c;
+						}
 					}
 				}
 
@@ -495,6 +506,27 @@ rspamd_html_decode_entitles_inplace (gchar *s, gsize len)
 				}
 
 				e = h;
+			}
+			else if (*h == '#') {
+				seen_hash = TRUE;
+
+				if (h + 1 < end && h[1] == 'x') {
+					seen_hex = TRUE;
+					/* Skip one more character */
+					h ++;
+				}
+			}
+			else if (g_ascii_isdigit (*h) || (seen_hex && g_ascii_isxdigit (*h))) {
+				seen_digit_only = TRUE;
+			}
+			else {
+				if (seen_digit_only && seen_hash && h > e) {
+					/* We have seen some digits, so we can try to decode, eh */
+					/* Fuck retarded email clients... */
+					goto decode_entity;
+				}
+
+				seen_digit_only = FALSE;
 			}
 
 			h++;
@@ -626,14 +658,14 @@ rspamd_html_url_is_phished (rspamd_mempool_t *pool,
 
 		if (rc == URI_ERRNO_OK) {
 			disp_tok.len = text_url->hostlen;
-			disp_tok.begin = text_url->host;
+			disp_tok.begin = rspamd_url_host_unsafe (text_url);
 #if U_ICU_VERSION_MAJOR_NUM >= 46
-			if (rspamd_substring_search_caseless (text_url->host,
+			if (rspamd_substring_search_caseless (rspamd_url_host_unsafe (text_url),
 					text_url->hostlen, "xn--", 4) != -1) {
 				idn_hbuf = rspamd_mempool_alloc (pool, text_url->hostlen * 2 + 1);
 				/* We need to convert it to the normal value first */
 				disp_tok.len = uidna_nameToUnicodeUTF8 (udn,
-						text_url->host, text_url->hostlen,
+						rspamd_url_host_unsafe (text_url), text_url->hostlen,
 						idn_hbuf, text_url->hostlen * 2 + 1, &uinfo, &uc_err);
 
 				if (uc_err != U_ZERO_ERROR) {
@@ -647,14 +679,14 @@ rspamd_html_url_is_phished (rspamd_mempool_t *pool,
 			}
 #endif
 			href_tok.len = href_url->hostlen;
-			href_tok.begin = href_url->host;
+			href_tok.begin = rspamd_url_host_unsafe (href_url);
 #if U_ICU_VERSION_MAJOR_NUM >= 46
-			if (rspamd_substring_search_caseless (href_url->host,
+			if (rspamd_substring_search_caseless (rspamd_url_host_unsafe (href_url),
 					href_url->hostlen, "xn--", 4) != -1) {
 				idn_hbuf = rspamd_mempool_alloc (pool, href_url->hostlen * 2 + 1);
 				/* We need to convert it to the normal value first */
 				href_tok.len = uidna_nameToUnicodeUTF8 (udn,
-						href_url->host, href_url->hostlen,
+						rspamd_url_host_unsafe (href_url), href_url->hostlen,
 						idn_hbuf, href_url->hostlen * 2 + 1, &uinfo, &uc_err);
 
 				if (uc_err != U_ZERO_ERROR) {
@@ -672,14 +704,14 @@ rspamd_html_url_is_phished (rspamd_mempool_t *pool,
 
 				/* Apply the same logic for TLD */
 				disp_tok.len = text_url->tldlen;
-				disp_tok.begin = text_url->tld;
+				disp_tok.begin = rspamd_url_tld_unsafe (text_url);
 #if U_ICU_VERSION_MAJOR_NUM >= 46
-				if (rspamd_substring_search_caseless (text_url->tld,
+				if (rspamd_substring_search_caseless (rspamd_url_tld_unsafe (text_url),
 						text_url->tldlen, "xn--", 4) != -1) {
 					idn_hbuf = rspamd_mempool_alloc (pool, text_url->tldlen * 2 + 1);
 					/* We need to convert it to the normal value first */
 					disp_tok.len = uidna_nameToUnicodeUTF8 (udn,
-							text_url->tld, text_url->tldlen,
+							rspamd_url_tld_unsafe (text_url), text_url->tldlen,
 							idn_hbuf, text_url->tldlen * 2 + 1, &uinfo, &uc_err);
 
 					if (uc_err != U_ZERO_ERROR) {
@@ -693,14 +725,14 @@ rspamd_html_url_is_phished (rspamd_mempool_t *pool,
 				}
 #endif
 				href_tok.len = href_url->tldlen;
-				href_tok.begin = href_url->tld;
+				href_tok.begin = rspamd_url_tld_unsafe (href_url);
 #if U_ICU_VERSION_MAJOR_NUM >= 46
-				if (rspamd_substring_search_caseless (href_url->tld,
+				if (rspamd_substring_search_caseless (rspamd_url_tld_unsafe (href_url),
 						href_url->tldlen, "xn--", 4) != -1) {
 					idn_hbuf = rspamd_mempool_alloc (pool, href_url->tldlen * 2 + 1);
 					/* We need to convert it to the normal value first */
 					href_tok.len = uidna_nameToUnicodeUTF8 (udn,
-							href_url->tld, href_url->tldlen,
+							rspamd_url_tld_unsafe (href_url), href_url->tldlen,
 							idn_hbuf, href_url->tldlen * 2 + 1, &uinfo, &uc_err);
 
 					if (uc_err != U_ZERO_ERROR) {
@@ -1115,9 +1147,35 @@ rspamd_html_parse_tag_content (rspamd_mempool_t *pool,
 			state = parse_equal;
 		}
 		else if (!g_ascii_isspace (*in)) {
-			hc->flags |= RSPAMD_HTML_FLAG_BAD_ELEMENTS;
-			tag->flags |= FL_BROKEN;
-			state = ignore_bad_tag;
+			/*
+			 * HTML defines that crap could still be restored and
+			 * calculated somehow... So we have to follow this stupid behaviour
+			 */
+			/*
+			 * TODO: estimate what insane things do email clients in each case
+			 */
+			if (*in == '>') {
+				/*
+				 * Attribtute name followed by end of tag
+				 * Should be okay (empty attribute). The rest is handled outside
+				 * this automata.
+				 */
+
+			}
+			else if (*in == '"' || *in == '\'') {
+				/* Attribute followed by quote... Missing '=' ? Dunno, need to test */
+				hc->flags |= RSPAMD_HTML_FLAG_BAD_ELEMENTS;
+				tag->flags |= FL_BROKEN;
+				state = ignore_bad_tag;
+			}
+			else {
+				/*
+				 * Just start another attribute ignoring an empty attributes for
+				 * now. We don't use them in fact...
+				 */
+				state = parse_attr_name;
+				*savep = in;
+			}
 		}
 		break;
 
@@ -1269,6 +1327,11 @@ rspamd_html_parse_tag_content (rspamd_mempool_t *pool,
 		}
 		else if (*in == '/' && *(in + 1) == '>') {
 			tag->flags |= FL_CLOSED;
+		}
+		else {
+			/* No space, proceed immediately to the attribute name */
+			state = parse_attr_name;
+			*savep = in;
 		}
 		break;
 
@@ -1531,7 +1594,7 @@ rspamd_html_process_url_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 					buf = rspamd_mempool_alloc (pool, len + 1);
 					rspamd_snprintf (buf, len + 1, "%*s://%*s/%*s",
 							hc->base_url->protocollen, hc->base_url->string,
-							hc->base_url->hostlen, hc->base_url->host,
+							hc->base_url->hostlen, rspamd_url_host_unsafe (hc->base_url),
 							(gint)orig_len, start);
 					start = buf;
 				}
@@ -1554,10 +1617,9 @@ rspamd_html_process_url_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 
 static void
 rspamd_process_html_url (rspamd_mempool_t *pool, struct rspamd_url *url,
-		GHashTable *tbl_urls, GHashTable *tbl_emails)
+						 khash_t (rspamd_url_hash) *url_set)
 {
-	GHashTable *target_tbl;
-	struct rspamd_url *query_url, *existing;
+	struct rspamd_url *query_url;
 	gchar *url_str;
 	gint rc;
 	gboolean prefix_added;
@@ -1568,7 +1630,7 @@ rspamd_process_html_url (rspamd_mempool_t *pool, struct rspamd_url *url,
 
 	if (url->querylen > 0) {
 
-		if (rspamd_url_find (pool, url->query, url->querylen, &url_str,
+		if (rspamd_url_find (pool, rspamd_url_query_unsafe (url), url->querylen, &url_str,
 				RSPAMD_URL_FIND_ALL,
 				NULL, &prefix_added)) {
 			query_url = rspamd_mempool_alloc0 (pool,
@@ -1583,14 +1645,7 @@ rspamd_process_html_url (rspamd_mempool_t *pool, struct rspamd_url *url,
 			if (rc == URI_ERRNO_OK &&
 					query_url->hostlen > 0) {
 				msg_debug_html ("found url %s in query of url"
-						" %*s", url_str, url->querylen, url->query);
-
-				if (query_url->protocol == PROTOCOL_MAILTO) {
-					target_tbl = tbl_emails;
-				}
-				else {
-					target_tbl = tbl_urls;
-				}
+						" %*s", url_str, url->querylen, rspamd_url_query_unsafe (url));
 
 				if (prefix_added) {
 					query_url->flags |= RSPAMD_URL_FLAG_SCHEMALESS;
@@ -1608,15 +1663,7 @@ rspamd_process_html_url (rspamd_mempool_t *pool, struct rspamd_url *url,
 					query_url->flags |= RSPAMD_URL_FLAG_OBSCURED;
 				}
 
-				if ((existing = g_hash_table_lookup (target_tbl,
-						query_url)) == NULL) {
-					g_hash_table_insert (target_tbl,
-							query_url,
-							query_url);
-				}
-				else {
-					existing->count ++;
-				}
+				rspamd_url_set_add_or_increase (url_set, query_url);
 			}
 		}
 	}
@@ -1676,7 +1723,7 @@ rspamd_html_process_data_image (rspamd_mempool_t *pool,
 
 static void
 rspamd_html_process_img_tag (rspamd_mempool_t *pool, struct html_tag *tag,
-		struct html_content *hc, GHashTable *urls)
+		struct html_content *hc, khash_t (rspamd_url_hash) *url_set)
 {
 	struct html_tag_component *comp;
 	struct html_image *img;
@@ -1721,17 +1768,8 @@ rspamd_html_process_img_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 								img->src, fstr.len, NULL);
 
 						if (img->url) {
-							struct rspamd_url *turl = g_hash_table_lookup (urls,
-									img->url);
-
 							img->url->flags |= RSPAMD_URL_FLAG_IMAGE;
-
-							if (turl == NULL) {
-								g_hash_table_insert (urls, img->url, img->url);
-							}
-							else {
-								turl->count++;
-							}
+							rspamd_url_set_add_or_increase (url_set, img->url);
 						}
 					}
 				}
@@ -2386,10 +2424,11 @@ rspamd_html_process_block_tag (rspamd_mempool_t *pool, struct html_tag *tag,
 
 static void
 rspamd_html_check_displayed_url (rspamd_mempool_t *pool,
-		GList **exceptions, GHashTable *urls, GHashTable *emails,
-		GByteArray *dest, GHashTable *target_tbl,
-		gint href_offset,
-		struct rspamd_url *url)
+								 GList **exceptions,
+								 khash_t (rspamd_url_hash) *url_set,
+								 GByteArray *dest,
+								 gint href_offset,
+								 struct rspamd_url *url)
 {
 	struct rspamd_url *displayed_url = NULL;
 	struct rspamd_url *turl;
@@ -2414,6 +2453,7 @@ rspamd_html_check_displayed_url (rspamd_mempool_t *pool,
 	if (url_found) {
 		url->flags |= RSPAMD_URL_FLAG_DISPLAY_URL;
 	}
+
 	if (exceptions && url_found) {
 		ex = rspamd_mempool_alloc (pool,
 				sizeof (*ex));
@@ -2426,39 +2466,27 @@ rspamd_html_check_displayed_url (rspamd_mempool_t *pool,
 				ex);
 	}
 
-	if (displayed_url) {
-		if (displayed_url->protocol ==
-				PROTOCOL_MAILTO) {
-			target_tbl = emails;
+	if (displayed_url && url_set) {
+		turl = rspamd_url_set_add_or_return (url_set,
+				displayed_url);
+
+		if (turl != NULL) {
+			/* Here, we assume the following:
+			 * if we have a URL in the text part which
+			 * is the same as displayed URL in the
+			 * HTML part, we assume that it is also
+			 * hint only.
+			 */
+			if (turl->flags &
+				RSPAMD_URL_FLAG_FROM_TEXT) {
+				turl->flags |= RSPAMD_URL_FLAG_HTML_DISPLAYED;
+				turl->flags &= ~RSPAMD_URL_FLAG_FROM_TEXT;
+			}
+
+			turl->count ++;
 		}
 		else {
-			target_tbl = urls;
-		}
-
-		if (target_tbl != NULL) {
-			turl = g_hash_table_lookup (target_tbl,
-					displayed_url);
-
-			if (turl != NULL) {
-				/* Here, we assume the following:
-				 * if we have a URL in the text part which
-				 * is the same as displayed URL in the
-				 * HTML part, we assume that it is also
-				 * hint only.
-				 */
-				if (turl->flags &
-						RSPAMD_URL_FLAG_FROM_TEXT) {
-					turl->flags |= RSPAMD_URL_FLAG_HTML_DISPLAYED;
-					turl->flags &= ~RSPAMD_URL_FLAG_FROM_TEXT;
-				}
-
-				turl->count ++;
-			}
-			else {
-				g_hash_table_insert (target_tbl,
-						displayed_url,
-						displayed_url);
-			}
+			/* Already inserted by `rspamd_url_set_add_or_return` */
 		}
 	}
 }
@@ -2562,20 +2590,22 @@ rspamd_html_propagate_style (struct html_content *hc,
 }
 
 GByteArray*
-rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
-		GByteArray *in, GList **exceptions, GHashTable *urls,  GHashTable *emails)
+rspamd_html_process_part_full (rspamd_mempool_t *pool,
+							   struct html_content *hc,
+							   GByteArray *in,
+							   GList **exceptions,
+							   khash_t (rspamd_url_hash) *url_set)
 {
 	const guchar *p, *c, *end, *savep = NULL;
 	guchar t;
 	gboolean closing = FALSE, need_decode = FALSE, save_space = FALSE,
 			balanced;
 	GByteArray *dest;
-	GHashTable *target_tbl;
 	guint obrace = 0, ebrace = 0;
 	GNode *cur_level = NULL;
 	gint substate = 0, len, href_offset = -1;
 	struct html_tag *cur_tag = NULL, *content_tag = NULL;
-	struct rspamd_url *url = NULL, *turl;
+	struct rspamd_url *url = NULL;
 	GQueue *styles_blocks;
 
 	enum {
@@ -3026,28 +3056,9 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 
 						if (url != NULL) {
 
-							if (url->protocol == PROTOCOL_MAILTO) {
-								target_tbl = emails;
-							}
-							else {
-								target_tbl = urls;
-							}
-
-							if (target_tbl != NULL) {
-								turl = g_hash_table_lookup (target_tbl, url);
-
-								if (turl == NULL) {
-									g_hash_table_insert (target_tbl, url, url);
-								}
-								else {
-									turl->count ++;
-									url = NULL;
-								}
-
-								if (turl == NULL && url != NULL) {
-									rspamd_process_html_url (pool,
-											url,
-											urls, emails);
+							if (url_set != NULL) {
+								if (!rspamd_url_set_add_or_increase (url_set, url)) {
+									rspamd_process_html_url (pool, url, url_set);
 								}
 							}
 
@@ -3068,8 +3079,8 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 								prev_url = prev_tag->extra;
 
 								rspamd_html_check_displayed_url (pool,
-										exceptions, urls, emails,
-										dest, target_tbl, href_offset,
+										exceptions, url_set,
+										dest, href_offset,
 										prev_url);
 							}
 						}
@@ -3079,8 +3090,8 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 							/* Insert exception */
 							if (url != NULL && (gint) dest->len > href_offset) {
 								rspamd_html_check_displayed_url (pool,
-										exceptions, urls, emails,
-										dest, target_tbl, href_offset,
+										exceptions, url_set,
+										dest, href_offset,
 										url);
 
 							}
@@ -3109,7 +3120,7 @@ rspamd_html_process_part_full (rspamd_mempool_t *pool, struct html_content *hc,
 				}
 
 				if (cur_tag->id == Tag_IMG && !(cur_tag->flags & FL_CLOSING)) {
-					rspamd_html_process_img_tag (pool, cur_tag, hc, urls);
+					rspamd_html_process_img_tag (pool, cur_tag, hc, url_set);
 				}
 				else if (cur_tag->flags & FL_BLOCK) {
 					struct html_block *bl;
@@ -3174,5 +3185,5 @@ rspamd_html_process_part (rspamd_mempool_t *pool,
 		struct html_content *hc,
 		GByteArray *in)
 {
-	return rspamd_html_process_part_full (pool, hc, in, NULL, NULL, NULL);
+	return rspamd_html_process_part_full (pool, hc, in, NULL, NULL);
 }

@@ -36,6 +36,7 @@
 #include "libutil/hash.h"
 #include "libserver/maps/map_private.h"
 #include "contrib/uthash/utlist.h"
+#include "lua/lua_common.h"
 #include "unix-std.h"
 
 #include <math.h>
@@ -180,6 +181,8 @@ struct rspamd_fuzzy_storage_ctx {
 	struct rspamd_worker *worker;
 	const ucl_object_t *skip_map;
 	struct rspamd_hash_map_helper *skip_hashes;
+	gint lua_pre_handler_cbref;
+	gint lua_post_handler_cbref;
 	guchar cookie[COOKIE_SIZE];
 };
 
@@ -444,9 +447,6 @@ rspamd_fuzzy_stat_callback (EV_P_ ev_timer *w, int revents)
 static void
 fuzzy_update_version_callback (guint64 ver, void *ud)
 {
-	msg_info ("updated fuzzy storage from %s: version: %d",
-			(const char *)ud, (gint)ver);
-	g_free (ud);
 }
 
 static void
@@ -467,14 +467,17 @@ rspamd_fuzzy_updates_cb (gboolean success,
 	if (success) {
 		rspamd_fuzzy_backend_count (ctx->backend, fuzzy_count_callback, ctx);
 
-		msg_info ("successfully updated fuzzy storage: %d updates in queue; "
+		msg_info ("successfully updated fuzzy storage %s: %d updates in queue; "
 				  "%d pending currently; "
-				  "%d added, %d deleted, %d extended, %d duplicates",
+				  "%d added; %d deleted; %d extended; %d duplicates",
+				ctx->worker->cf->bind_conf ?
+					 ctx->worker->cf->bind_conf->bind_line :
+					 "unknown",
 				cbdata->updates_pending->len,
 				ctx->updates_pending->len,
 				nadded, ndeleted, nextended, nignored);
 		rspamd_fuzzy_backend_version (ctx->backend, source,
-				fuzzy_update_version_callback, g_strdup (source));
+				fuzzy_update_version_callback, NULL);
 		ctx->updates_failed = 0;
 
 		if (cbdata->final || ctx->worker->state != rspamd_worker_state_running) {
@@ -484,8 +487,11 @@ rspamd_fuzzy_updates_cb (gboolean success,
 	}
 	else {
 		if (++ctx->updates_failed > ctx->updates_maxfail) {
-			msg_err ("cannot commit update transaction to fuzzy backend, discard "
+			msg_err ("cannot commit update transaction to fuzzy backend %s, discard "
 					 "%ud updates after %d retries",
+					ctx->worker->cf->bind_conf ?
+						ctx->worker->cf->bind_conf->bind_line :
+						"unknown",
 					cbdata->updates_pending->len,
 					ctx->updates_maxfail);
 			ctx->updates_failed = 0;
@@ -496,9 +502,12 @@ rspamd_fuzzy_updates_cb (gboolean success,
 			}
 		}
 		else {
-			msg_err ("cannot commit update transaction to fuzzy backend, "
+			msg_err ("cannot commit update transaction to fuzzy backend %s; "
 					 "%ud updates are still left; %ud currently pending;"
 					 " %d updates left",
+					ctx->worker->cf->bind_conf ?
+						ctx->worker->cf->bind_conf->bind_line :
+						"unknown",
 					cbdata->updates_pending->len,
 					ctx->updates_pending->len,
 					ctx->updates_maxfail - ctx->updates_failed);
@@ -511,7 +520,6 @@ rspamd_fuzzy_updates_cb (gboolean success,
 				/* Try one more time */
 				rspamd_fuzzy_process_updates_queue (cbdata->ctx, cbdata->source,
 						cbdata->final);
-
 			}
 		}
 	}
@@ -778,6 +786,76 @@ rspamd_fuzzy_check_callback (struct rspamd_fuzzy_reply *result, void *ud)
 		break;
 	}
 
+	if (session->ctx->lua_pre_handler_cbref != -1) {
+		/* Start lua post handler */
+		lua_State *L = session->ctx->cfg->lua_state;
+		gint err_idx, ret;
+
+		lua_pushcfunction (L, &rspamd_lua_traceback);
+		err_idx = lua_gettop (L);
+		/* Preallocate stack (small opt) */
+		lua_checkstack (L, err_idx + 9);
+		/* function */
+		lua_rawgeti (L, LUA_REGISTRYINDEX, session->ctx->lua_post_handler_cbref);
+		/* client IP */
+		rspamd_lua_ip_push (L, session->addr);
+		/* client command */
+		lua_pushinteger (L, cmd->cmd);
+		/* command value (push as rspamd_text) */
+		(void)lua_new_text (L, result->digest, sizeof (result->digest), FALSE);
+		/* is shingle */
+		lua_pushboolean (L, is_shingle);
+		/* result value */
+		lua_pushinteger (L, result->v1.value);
+		/* result probability */
+		lua_pushnumber (L, result->v1.prob);
+		/* result flag */
+		lua_pushinteger (L, result->v1.flag);
+		/* result timestamp */
+		lua_pushinteger (L, result->ts);
+		/* TODO: add additional data maybe (encryption, pubkey, etc) */
+
+		if ((ret = lua_pcall (L, 8, LUA_MULTRET, err_idx)) != 0) {
+			msg_err ("call to lua_post_handler lua "
+					 "script failed (%d): %s", ret, lua_tostring (L, -1));
+		}
+		else {
+			/* Return values order:
+			 * the first reply will be on err_idx + 1
+			 * if it is true, then we need to read the former ones:
+			 * 2-nd will be reply code
+			 * 3-rd will be probability (or 0.0 if missing)
+			 * 4-th value is flag (or default flag if missing)
+			 */
+			ret = lua_toboolean (L, err_idx + 1);
+
+			if (ret) {
+				/* Artificial reply */
+				result->v1.value = lua_tointeger (L, err_idx + 2);
+
+				if (lua_isnumber (L, err_idx + 3)) {
+					result->v1.prob = lua_tonumber (L, err_idx + 3);
+				}
+				else {
+					result->v1.prob = 0.0f;
+				}
+
+				if (lua_isnumber (L, err_idx + 4)) {
+					result->v1.flag = lua_tointeger (L, err_idx + 4);
+				}
+
+				lua_settop (L, 0);
+				rspamd_fuzzy_make_reply (cmd, result, session, encrypted, is_shingle);
+				REF_RELEASE (session);
+
+				return;
+			}
+		}
+
+		lua_settop (L, 0);
+	}
+
+
 	rspamd_fuzzy_make_reply (cmd, result, session, encrypted, is_shingle);
 
 	/* Refresh hash if found with strong confidence */
@@ -878,6 +956,62 @@ rspamd_fuzzy_process_command (struct fuzzy_session *session)
 	result.v1.flag = cmd->flag;
 	result.v1.tag = cmd->tag;
 
+	if (session->ctx->lua_pre_handler_cbref != -1) {
+		/* Start lua pre handler */
+		lua_State *L = session->ctx->cfg->lua_state;
+		gint err_idx, ret;
+
+		lua_pushcfunction (L, &rspamd_lua_traceback);
+		err_idx = lua_gettop (L);
+		/* Preallocate stack (small opt) */
+		lua_checkstack (L, err_idx + 5);
+		/* function */
+		lua_rawgeti (L, LUA_REGISTRYINDEX, session->ctx->lua_pre_handler_cbref);
+		/* client IP */
+		rspamd_lua_ip_push (L, session->addr);
+		/* client command */
+		lua_pushinteger (L, cmd->cmd);
+		/* command value (push as rspamd_text) */
+		(void)lua_new_text (L, cmd->digest, sizeof (cmd->digest), FALSE);
+		/* is shingle */
+		lua_pushboolean (L, is_shingle);
+		/* TODO: add additional data maybe (encryption, pubkey, etc) */
+
+		if ((ret = lua_pcall (L, 4,LUA_MULTRET, err_idx)) != 0) {
+			msg_err ("call to lua_pre_handler lua "
+						  "script failed (%d): %s", ret, lua_tostring (L, -1));
+		}
+		else {
+			/* Return values order:
+			 * the first reply will be on err_idx + 1
+			 * if it is true, then we need to read the former ones:
+			 * 2-nd will be reply code
+			 * 3-rd will be probability (or 0.0 if missing)
+			 */
+			ret = lua_toboolean (L, err_idx + 1);
+
+			if (ret) {
+				/* Artificial reply */
+				result.v1.value = lua_tointeger (L, err_idx + 2);
+
+				if (lua_isnumber (L, err_idx + 3)) {
+					result.v1.prob = lua_tonumber (L, err_idx + 3);
+				}
+				else {
+					result.v1.prob = 0.0f;
+				}
+
+				lua_settop (L, 0);
+				rspamd_fuzzy_make_reply (cmd, &result, session, encrypted, is_shingle);
+
+				return;
+			}
+		}
+
+		lua_settop (L, 0);
+	}
+
+
 	if (G_UNLIKELY (cmd == NULL || up_len == 0)) {
 		result.v1.value = 500;
 		result.v1.prob = 0.0f;
@@ -936,7 +1070,8 @@ rspamd_fuzzy_process_command (struct fuzzy_session *session)
 					hexbuf, sizeof (hexbuf) - 1);
 				hexbuf[sizeof (hexbuf) - 1] = '\0';
 
-				if (rspamd_match_hash_map (session->ctx->skip_hashes, hexbuf)) {
+				if (rspamd_match_hash_map (session->ctx->skip_hashes,
+						hexbuf, sizeof (hexbuf) - 1)) {
 					result.v1.value = 401;
 					result.v1.prob = 0.0f;
 
@@ -1490,6 +1625,56 @@ rspamd_fuzzy_stat_to_ucl (struct rspamd_fuzzy_storage_ctx *ctx, gboolean ip_stat
 	return obj;
 }
 
+static int
+lua_fuzzy_add_pre_handler (lua_State *L)
+{
+	struct rspamd_worker *wrk = *(struct rspamd_worker **)
+			rspamd_lua_check_udata (L, 1, "rspamd{worker}");
+	struct rspamd_fuzzy_storage_ctx *ctx;
+
+	if (wrk && lua_isfunction (L, 2)) {
+		ctx = (struct rspamd_fuzzy_storage_ctx *)wrk->ctx;
+
+		if (ctx->lua_pre_handler_cbref != -1) {
+			/* Should not happen */
+			luaL_unref (L, LUA_REGISTRYINDEX, ctx->lua_pre_handler_cbref);
+		}
+
+		lua_pushvalue (L, 2);
+		ctx->lua_pre_handler_cbref = luaL_ref (L, LUA_REGISTRYINDEX);
+	}
+	else {
+		return luaL_error (L, "invalid arguments, worker + function are expected");
+	}
+
+	return 0;
+}
+
+static int
+lua_fuzzy_add_post_handler (lua_State *L)
+{
+	struct rspamd_worker *wrk = *(struct rspamd_worker **)
+			rspamd_lua_check_udata (L, 1, "rspamd{worker}");
+	struct rspamd_fuzzy_storage_ctx *ctx;
+
+	if (wrk && lua_isfunction (L, 2)) {
+		ctx = (struct rspamd_fuzzy_storage_ctx *)wrk->ctx;
+
+		if (ctx->lua_post_handler_cbref != -1) {
+			/* Should not happen */
+			luaL_unref (L, LUA_REGISTRYINDEX, ctx->lua_post_handler_cbref);
+		}
+
+		lua_pushvalue (L, 2);
+		ctx->lua_post_handler_cbref = luaL_ref (L, LUA_REGISTRYINDEX);
+	}
+	else {
+		return luaL_error (L, "invalid arguments, worker + function are expected");
+	}
+
+	return 0;
+}
+
 static gboolean
 rspamd_fuzzy_storage_stat (struct rspamd_main *rspamd_main,
 		struct rspamd_worker *worker, gint fd,
@@ -1670,6 +1855,8 @@ init_fuzzy (struct rspamd_config *cfg)
 	ctx->magic = rspamd_fuzzy_storage_magic;
 	ctx->sync_timeout = DEFAULT_SYNC_TIMEOUT;
 	ctx->keypair_cache_size = DEFAULT_KEYPAIR_CACHE_SIZE;
+	ctx->lua_pre_handler_cbref = -1;
+	ctx->lua_post_handler_cbref = -1;
 	ctx->keys = g_hash_table_new_full (fuzzy_kp_hash, fuzzy_kp_equal,
 			NULL, fuzzy_key_dtor);
 	rspamd_mempool_add_destructor (cfg->cfg_pool,
@@ -2010,7 +2197,7 @@ start_fuzzy (struct rspamd_worker *worker)
 				rspamd_kv_list_fin,
 				rspamd_kv_list_dtor,
 				(void **)&ctx->skip_hashes,
-				worker)) == NULL) {
+				worker, RSPAMD_MAP_DEFAULT)) == NULL) {
 			msg_warn_config ("cannot load hashes list from %s",
 					ucl_object_tostring (ctx->skip_map));
 		}
@@ -2061,6 +2248,20 @@ start_fuzzy (struct rspamd_worker *worker)
 	rspamd_srv_send_command (worker, ctx->event_loop, &srv_cmd, -1,
 			fuzzy_peer_rep, ctx);
 
+	luaL_Reg fuzzy_lua_reg = {
+			.name = "add_fuzzy_pre_handler",
+			.func = lua_fuzzy_add_pre_handler,
+	};
+	rspamd_lua_add_metamethod (ctx->cfg->lua_state, "rspamd{worker}", &fuzzy_lua_reg);
+	fuzzy_lua_reg = (luaL_Reg){
+			.name = "add_fuzzy_post_handler",
+			.func = lua_fuzzy_add_post_handler,
+	};
+	rspamd_lua_add_metamethod (ctx->cfg->lua_state, "rspamd{worker}", &fuzzy_lua_reg);
+
+	rspamd_lua_run_postloads (ctx->cfg->lua_state, ctx->cfg, ctx->event_loop,
+			worker);
+
 	ev_loop (ctx->event_loop, 0);
 	rspamd_worker_block_signals ();
 
@@ -2096,6 +2297,14 @@ start_fuzzy (struct rspamd_worker *worker)
 
 	if (ctx->ratelimit_buckets) {
 		rspamd_lru_hash_destroy (ctx->ratelimit_buckets);
+	}
+
+	if (ctx->lua_pre_handler_cbref != -1) {
+		luaL_unref (ctx->cfg->lua_state, LUA_REGISTRYINDEX, ctx->lua_pre_handler_cbref);
+	}
+
+	if (ctx->lua_post_handler_cbref != -1) {
+		luaL_unref (ctx->cfg->lua_state, LUA_REGISTRYINDEX, ctx->lua_post_handler_cbref);
 	}
 
 	REF_RELEASE (ctx->cfg);

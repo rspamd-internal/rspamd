@@ -497,13 +497,26 @@ rspamd_http_normalize_path_inplace (gchar *path, guint len, guint *nlen)
 			}
 		}
 		break;
+	case st_got_dot:
+		if (slash) {
+			/* /. -> must be / */
+			*o++ = '/';
+		}
+		else {
+			if (o > path) {
+				*o++ = '.';
+			}
+		}
+		break;
 	case st_got_slash:
 		*o++ = '/';
 		break;
 	default:
+#if 0
 		if (o > path + 1 && *(o - 1) == '/') {
 			o --;
 		}
+#endif
 		break;
 	}
 

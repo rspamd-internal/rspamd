@@ -124,6 +124,7 @@ enum rspamd_lua_map_type {
 	RSPAMD_LUA_MAP_REGEXP,
 	RSPAMD_LUA_MAP_REGEXP_MULTIPLE,
 	RSPAMD_LUA_MAP_CALLBACK,
+	RSPAMD_LUA_MAP_CDB,
 	RSPAMD_LUA_MAP_UNKNOWN,
 };
 
@@ -136,6 +137,7 @@ struct rspamd_lua_map {
 		struct rspamd_radix_map_helper *radix;
 		struct rspamd_hash_map_helper *hash;
 		struct rspamd_regexp_map_helper *re_map;
+		struct rspamd_cdb_map_helper *cdb_map;
 		struct lua_map_callback_data *cbdata;
 	} data;
 };
@@ -158,6 +160,15 @@ void rspamd_lua_new_class (lua_State *L,
  * Set class name for object at @param objidx position
  */
 void rspamd_lua_setclass (lua_State *L, const gchar *classname, gint objidx);
+
+/**
+ * Adds a new field to the class (metatable) identified by `classname`
+ * @param L
+ * @param classname
+ * @param meth
+ */
+void rspamd_lua_add_metamethod (lua_State *L, const gchar *classname,
+		luaL_Reg *meth);
 
 /**
  * Set index of table to value (like t['index'] = value)
@@ -201,7 +212,7 @@ rspamd_plugins_table_push_elt (lua_State *L, const gchar *field_name,
  * Load and initialize lua plugins
  */
 gboolean
-rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load);
+rspamd_init_lua_filters (struct rspamd_config *cfg, bool force_load, bool strict);
 
 /**
  * Initialize new locked lua_State structure

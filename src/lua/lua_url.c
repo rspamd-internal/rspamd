@@ -158,8 +158,8 @@ lua_url_get_host (lua_State *L)
 	LUA_TRACE_POINT;
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
-	if (url != NULL) {
-		lua_pushlstring (L, url->url->host, url->url->hostlen);
+	if (url != NULL && url->url && url->url->hostlen > 0) {
+		lua_pushlstring (L, rspamd_url_host (url->url), url->url->hostlen);
 	}
 	else {
 		lua_pushnil (L);
@@ -198,8 +198,8 @@ lua_url_get_user (lua_State *L)
 	LUA_TRACE_POINT;
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
-	if (url != NULL && url->url->user != NULL) {
-		lua_pushlstring (L, url->url->user, url->url->userlen);
+	if (url != NULL && rspamd_url_user (url->url) != NULL) {
+		lua_pushlstring (L, rspamd_url_user (url->url), url->url->userlen);
 	}
 	else {
 		lua_pushnil (L);
@@ -220,7 +220,7 @@ lua_url_get_path (lua_State *L)
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
 	if (url != NULL && url->url->datalen > 0) {
-		lua_pushlstring (L, url->url->data, url->url->datalen);
+		lua_pushlstring (L, rspamd_url_data_unsafe (url->url), url->url->datalen);
 	}
 	else {
 		lua_pushnil (L);
@@ -241,7 +241,7 @@ lua_url_get_query (lua_State *L)
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
 	if (url != NULL && url->url->querylen > 0) {
-		lua_pushlstring (L, url->url->query, url->url->querylen);
+		lua_pushlstring (L, rspamd_url_query_unsafe (url->url), url->url->querylen);
 	}
 	else {
 		lua_pushnil (L);
@@ -262,7 +262,7 @@ lua_url_get_fragment (lua_State *L)
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
 	if (url != NULL && url->url->fragmentlen > 0) {
-		lua_pushlstring (L, url->url->fragment, url->url->fragmentlen);
+		lua_pushlstring (L, rspamd_url_fragment_unsafe (url->url), url->url->fragmentlen);
 	}
 	else {
 		lua_pushnil (L);
@@ -307,9 +307,12 @@ lua_url_tostring (lua_State *L)
 		if (url->url->protocol == PROTOCOL_MAILTO) {
 			gchar *tmp = g_malloc (url->url->userlen + 1 +
 								   url->url->hostlen);
-			memcpy (tmp, url->url->user, url->url->userlen);
+			if (url->url->userlen) {
+				memcpy (tmp, url->url->string + url->url->usershift, url->url->userlen);
+			}
+
 			tmp[url->url->userlen] = '@';
-			memcpy (tmp + url->url->userlen + 1, url->url->host,
+			memcpy (tmp + url->url->userlen + 1, rspamd_url_host_unsafe (url->url),
 					url->url->hostlen);
 
 			lua_pushlstring (L, tmp, url->url->userlen + 1 + url->url->hostlen);
@@ -557,7 +560,7 @@ lua_url_get_tld (lua_State *L)
 	struct rspamd_lua_url *url = lua_check_url (L, 1);
 
 	if (url != NULL && url->url->tldlen > 0) {
-		lua_pushlstring (L, url->url->tld, url->url->tldlen);
+		lua_pushlstring (L, rspamd_url_tld_unsafe (url->url), url->url->tldlen);
 	}
 	else {
 		lua_pushnil (L);
@@ -657,7 +660,7 @@ lua_url_to_table (lua_State *L)
 
 		if (u->hostlen > 0) {
 			lua_pushstring (L, "host");
-			lua_pushlstring (L, u->host, u->hostlen);
+			lua_pushlstring (L, rspamd_url_host_unsafe (u), u->hostlen);
 			lua_settable (L, -3);
 		}
 
@@ -669,31 +672,31 @@ lua_url_to_table (lua_State *L)
 
 		if (u->tldlen > 0) {
 			lua_pushstring (L, "tld");
-			lua_pushlstring (L, u->tld, u->tldlen);
+			lua_pushlstring (L, rspamd_url_tld_unsafe (u), u->tldlen);
 			lua_settable (L, -3);
 		}
 
 		if (u->userlen > 0) {
 			lua_pushstring (L, "user");
-			lua_pushlstring (L, u->user, u->userlen);
+			lua_pushlstring (L, rspamd_url_user (u), u->userlen);
 			lua_settable (L, -3);
 		}
 
 		if (u->datalen > 0) {
 			lua_pushstring (L, "path");
-			lua_pushlstring (L, u->data, u->datalen);
+			lua_pushlstring (L, rspamd_url_data_unsafe (u), u->datalen);
 			lua_settable (L, -3);
 		}
 
 		if (u->querylen > 0) {
 			lua_pushstring (L, "query");
-			lua_pushlstring (L, u->query, u->querylen);
+			lua_pushlstring (L, rspamd_url_query_unsafe (u), u->querylen);
 			lua_settable (L, -3);
 		}
 
 		if (u->fragmentlen > 0) {
 			lua_pushstring (L, "fragment");
-			lua_pushlstring (L, u->fragment, u->fragmentlen);
+			lua_pushlstring (L, rspamd_url_fragment_unsafe (u), u->fragmentlen);
 			lua_settable (L, -3);
 		}
 

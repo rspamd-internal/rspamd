@@ -46,7 +46,6 @@
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/conf.h>
-#include <openssl/engine.h>
 #endif
 #ifdef HAVE_LOCALE_H
 #include <locale.h>
@@ -99,7 +98,7 @@ rspamd_parse_bind_line (struct rspamd_config *cfg,
 	const gchar *str)
 {
 	struct rspamd_worker_bind_conf *cnf;
-	gchar *err;
+	const gchar *fdname;
 	gboolean ret = TRUE;
 
 	if (str == NULL) {
@@ -113,11 +112,13 @@ rspamd_parse_bind_line (struct rspamd_config *cfg,
 
 	if (g_ascii_strncasecmp (str, "systemd:", sizeof ("systemd:") - 1) == 0) {
 		/* The actual socket will be passed by systemd environment */
+		fdname = str + sizeof ("systemd:") - 1;
 		cnf->is_systemd = TRUE;
-		cnf->cnt = strtoul (str + sizeof ("systemd:") - 1, &err, 10);
-		cnf->addrs = g_ptr_array_new ();
+		cnf->addrs = g_ptr_array_new_full (1, g_free);
 
-		if (err == NULL || *err == '\0') {
+		if (fdname[0]) {
+			g_ptr_array_add (cnf->addrs, g_strdup (fdname));
+			cnf->cnt = cnf->addrs->len;
 			cnf->name = g_strdup (str);
 			LL_PREPEND (cf->bind_conf, cnf);
 		}
@@ -128,7 +129,7 @@ rspamd_parse_bind_line (struct rspamd_config *cfg,
 	}
 	else {
 		if (rspamd_parse_host_port_priority (str, &cnf->addrs,
-				NULL, &cnf->name, DEFAULT_BIND_PORT, NULL) == RSPAMD_PARSE_ADDR_FAIL) {
+				NULL, &cnf->name, DEFAULT_BIND_PORT, TRUE, NULL) == RSPAMD_PARSE_ADDR_FAIL) {
 			msg_err_config ("cannot parse bind line: %s", str);
 			ret = FALSE;
 		}
@@ -1181,7 +1182,7 @@ rspamd_include_map_handler (const guchar *data, gsize len,
 			   rspamd_ucl_fin_cb,
 			   rspamd_ucl_dtor_cb,
 			   (void **)pcbdata,
-			   NULL) != NULL;
+			   NULL, RSPAMD_MAP_DEFAULT) != NULL;
 }
 
 /*
@@ -1531,7 +1532,7 @@ rspamd_check_worker (struct rspamd_config *cfg, worker_t *wrk)
 }
 
 gboolean
-rspamd_init_filters (struct rspamd_config *cfg, bool reconfig)
+rspamd_init_filters (struct rspamd_config *cfg, bool reconfig, bool strict)
 {
 	GList *cur;
 	module_t *mod, **pmod;
@@ -1582,8 +1583,12 @@ rspamd_init_filters (struct rspamd_config *cfg, bool reconfig)
 			}
 			else {
 				if (!mod->module_config_func (cfg)) {
-					msg_info_config ("config of %s failed!", mod->name);
+					msg_err_config ("config of %s failed", mod->name);
 					ret = FALSE;
+
+					if (strict) {
+						return FALSE;
+					}
 				}
 			}
 		}
@@ -1595,7 +1600,7 @@ rspamd_init_filters (struct rspamd_config *cfg, bool reconfig)
 		cur = g_list_next (cur);
 	}
 
-	ret = rspamd_init_lua_filters (cfg, 0) && ret;
+	ret = rspamd_init_lua_filters (cfg, 0, strict) && ret;
 
 	return ret;
 }
@@ -2241,7 +2246,7 @@ rspamd_config_radix_from_ucl (struct rspamd_config *cfg,
 						rspamd_radix_fin,
 						rspamd_radix_dtor,
 						(void **)target,
-						worker) == NULL) {
+						worker, RSPAMD_MAP_DEFAULT) == NULL) {
 					g_set_error (err,
 							g_quark_from_static_string ("rspamd-config"),
 							EINVAL, "bad map definition %s for %s", str,
@@ -2268,7 +2273,7 @@ rspamd_config_radix_from_ucl (struct rspamd_config *cfg,
 					rspamd_radix_fin,
 					rspamd_radix_dtor,
 					(void **)target,
-					worker) == NULL) {
+					worker, RSPAMD_MAP_DEFAULT) == NULL) {
 				g_set_error (err,
 						g_quark_from_static_string ("rspamd-config"),
 						EINVAL, "bad map object for %s", ucl_object_key (obj));
@@ -2639,44 +2644,6 @@ rspamd_config_ev_backend_to_string (int ev_backend, gboolean *effective)
 #undef SET_EFFECTIVE
 }
 
-void
-rspamd_openssl_maybe_init (void)
-{
-	static gboolean openssl_initialized = FALSE;
-
-	if (!openssl_initialized) {
-		ERR_load_crypto_strings ();
-		SSL_load_error_strings ();
-
-		OpenSSL_add_all_algorithms ();
-		OpenSSL_add_all_digests ();
-		OpenSSL_add_all_ciphers ();
-
-#if OPENSSL_VERSION_NUMBER >= 0x1000104fL && !defined(LIBRESSL_VERSION_NUMBER)
-		ENGINE_load_builtin_engines ();
-#endif
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
-		SSL_library_init ();
-#else
-		OPENSSL_init_ssl (0, NULL);
-#endif
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
-		OPENSSL_config (NULL);
-#endif
-		if (RAND_status () == 0) {
-			guchar seed[128];
-
-			/* Try to use ottery to seed rand */
-			ottery_rand_bytes (seed, sizeof (seed));
-			RAND_seed (seed, sizeof (seed));
-			rspamd_explicit_memzero (seed, sizeof (seed));
-		}
-
-		openssl_initialized = TRUE;
-	}
-}
-
 struct rspamd_external_libs_ctx *
 rspamd_init_libs (void)
 {
@@ -2792,7 +2759,6 @@ gboolean
 rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
 					struct rspamd_config *cfg)
 {
-	static const char secure_ciphers[] = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4";
 	size_t r;
 	gboolean ret = TRUE;
 
@@ -2867,30 +2833,8 @@ rspamd_config_libs (struct rspamd_external_libs_ctx *ctx,
 #endif
 		}
 
-		if (cfg->ssl_ca_path) {
-			if (SSL_CTX_load_verify_locations (ctx->ssl_ctx, cfg->ssl_ca_path,
-					NULL) != 1) {
-				msg_err_config ("cannot load CA certs from %s: %s",
-						cfg->ssl_ca_path,
-						ERR_error_string (ERR_get_error (), NULL));
-			}
-		}
-		else {
-			msg_debug_config ("ssl_ca_path is not set, using default CA path");
-			SSL_CTX_set_default_verify_paths (ctx->ssl_ctx);
-		}
-
-		if (cfg->ssl_ciphers) {
-			if (SSL_CTX_set_cipher_list (ctx->ssl_ctx, cfg->ssl_ciphers) != 1) {
-				msg_err_config (
-						"cannot set ciphers set to %s: %s; fallback to %s",
-						cfg->ssl_ciphers,
-						ERR_error_string (ERR_get_error (), NULL),
-						secure_ciphers);
-				/* Default settings */
-				SSL_CTX_set_cipher_list (ctx->ssl_ctx, secure_ciphers);
-			}
-		}
+		rspamd_ssl_ctx_config (cfg, ctx->ssl_ctx);
+		rspamd_ssl_ctx_config (cfg, ctx->ssl_ctx_noverify);
 
 		/* Init decompression */
 		ctx->in_zstream = ZSTD_createDStream ();
@@ -2979,8 +2923,8 @@ rspamd_deinit_libs (struct rspamd_external_libs_ctx *ctx)
 #ifdef HAVE_OPENSSL
 		EVP_cleanup ();
 		ERR_free_strings ();
-		SSL_CTX_free (ctx->ssl_ctx);
-		SSL_CTX_free (ctx->ssl_ctx_noverify);
+		rspamd_ssl_ctx_free (ctx->ssl_ctx);
+		rspamd_ssl_ctx_free (ctx->ssl_ctx_noverify);
 #endif
 		rspamd_inet_library_destroy ();
 		rspamd_free_zstd_dictionary (ctx->in_dict);

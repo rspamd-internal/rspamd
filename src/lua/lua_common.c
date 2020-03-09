@@ -197,6 +197,24 @@ rspamd_lua_setclass (lua_State * L, const gchar *classname, gint objidx)
 	lua_setmetatable (L, objidx);
 }
 
+void
+rspamd_lua_add_metamethod (lua_State *L, const gchar *classname,
+								luaL_Reg *meth)
+{
+	khiter_t k;
+
+	k = kh_get (lua_class_set, lua_classes, classname);
+
+	g_assert (k != kh_end (lua_classes));
+	/* get metatable identified by pointer */
+	lua_rawgetp (L, LUA_REGISTRYINDEX,
+			RSPAMD_LIGHTUSERDATA_MASK (kh_key (lua_classes, k)));
+
+	lua_pushcfunction (L, meth->func);
+	lua_setfield (L, -2, meth->name);
+	lua_pop (L, 1); /* remove metatable */
+}
+
 /* assume that table is at the top */
 void
 rspamd_lua_table_set (lua_State * L, const gchar *index, const gchar *value)
@@ -1075,7 +1093,7 @@ rspamd_plugins_table_push_elt (lua_State *L, const gchar *field_name,
 }
 
 gboolean
-rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
+rspamd_init_lua_filters (struct rspamd_config *cfg, bool force_load, bool strict)
 {
 	struct rspamd_config **pcfg;
 	GList *cur;
@@ -1119,6 +1137,10 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 				rspamd_plugins_table_push_elt (L, "disabled_failed",
 						module->name);
 
+				if (strict) {
+					return FALSE;
+				}
+
 				cur = g_list_next (cur);
 				continue;
 			}
@@ -1143,6 +1165,10 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 				munmap (data, fsize);
 				g_free (lua_fname);
 
+				if (strict) {
+					return FALSE;
+				}
+
 				cur = g_list_next (cur);
 				continue;
 			}
@@ -1158,6 +1184,10 @@ rspamd_init_lua_filters (struct rspamd_config *cfg, gboolean force_load)
 				lua_settop (L, err_idx - 1);
 				rspamd_plugins_table_push_elt (L, "disabled_failed",
 						module->name);
+
+				if (strict) {
+					return FALSE;
+				}
 
 				cur = g_list_next (cur);
 				continue;

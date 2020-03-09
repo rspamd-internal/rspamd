@@ -13,6 +13,7 @@
 #include "libcryptobox/cryptobox.h"
 #include "libmime/mime_headers.h"
 #include "libmime/content_type.h"
+#include "libserver/url.h"
 #include "libutil/ref.h"
 #include "libutil/str_util.h"
 
@@ -97,7 +98,7 @@ struct rspamd_mime_part {
 	enum rspamd_cte cte;
 	guint flags;
 	enum rspamd_mime_part_type part_type;
-	guint id;
+	guint part_number;
 
 	union {
 		struct rspamd_mime_multipart *mp;
@@ -175,8 +176,7 @@ struct rspamd_message {
 	GPtrArray *text_parts;			/**< list of text parts								*/
 	struct rspamd_message_raw_headers_content raw_headers_content;
 	struct rspamd_received_header *received;	/**< list of received headers						*/
-	GHashTable *urls;							/**< list of parsed urls							*/
-	GHashTable *emails;							/**< list of parsed emails							*/
+	khash_t (rspamd_url_hash) *urls;
 	struct rspamd_mime_headers_table *raw_headers;	/**< list of raw headers						*/
 	struct rspamd_mime_header *headers_order;	/**< order of raw headers							*/
 	struct rspamd_task *task;

@@ -91,8 +91,8 @@ rspamd_log_syslog_log (const gchar *module, const gchar *id,
 		}
 	}
 
-	syslog (syslog_level, "<%.*s>; %s; %s: %*.s",
-			LOG_ID, id != NULL ? id : "",
+	syslog (syslog_level, "<%.*s>; %s; %s: %.*s",
+			RSPAMD_LOG_ID_LEN, id != NULL ? id : "",
 			module != NULL ? module : "",
 			function != NULL ? function : "",
 			(gint)mlen, message);
