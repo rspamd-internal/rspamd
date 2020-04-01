@@ -466,6 +466,7 @@ rspamd_worker_init_signals (struct rspamd_worker *worker,
 			rspamd_worker_usr2_handler, NULL);
 }
 
+
 struct ev_loop *
 rspamd_prepare_worker (struct rspamd_worker *worker, const char *name,
 					   rspamd_accept_handler hdl)
@@ -478,8 +479,7 @@ rspamd_prepare_worker (struct rspamd_worker *worker, const char *name,
 	worker->signal_events = g_hash_table_new_full (g_direct_hash, g_direct_equal,
 			NULL, rspamd_sigh_free);
 
-	event_loop = ev_loop_new (rspamd_config_ev_backend_get (worker->srv->cfg) |
-			EVFLAG_SIGNALFD);
+	event_loop = ev_loop_new (rspamd_config_ev_backend_get (worker->srv->cfg));
 
 	worker->srv->event_loop = event_loop;
 
@@ -979,6 +979,8 @@ rspamd_fork_worker (struct rspamd_main *rspamd_main,
 	wrk->pid = fork ();
 	wrk->cores_throttled = rspamd_main->cores_throttling;
 	wrk->term_handler = term_handler;
+	wrk->control_events_pending = g_hash_table_new_full (g_direct_hash, g_direct_equal,
+			NULL, rspamd_pending_control_free);
 
 	switch (wrk->pid) {
 	case 0:
@@ -1589,13 +1591,15 @@ rspamd_worker_hyperscan_ready (struct rspamd_main *rspamd_main,
 	memset (&rep, 0, sizeof (rep));
 	rep.type = RSPAMD_CONTROL_HYPERSCAN_LOADED;
 
-	if (!rspamd_re_cache_is_hs_loaded (cache) || cmd->cmd.hs_loaded.forced) {
+	if (rspamd_re_cache_is_hs_loaded (cache) != RSPAMD_HYPERSCAN_LOADED_FULL ||
+		cmd->cmd.hs_loaded.forced) {
+
 		msg_info ("loading hyperscan expressions after receiving compilation "
 				  "notice: %s",
-				(!rspamd_re_cache_is_hs_loaded (cache)) ?
+				(rspamd_re_cache_is_hs_loaded (cache) != RSPAMD_HYPERSCAN_LOADED_FULL) ?
 				"new db" : "forced update");
 		rep.reply.hs_loaded.status = rspamd_re_cache_load_hyperscan (
-				worker->srv->cfg->re_cache, cmd->cmd.hs_loaded.cache_dir);
+				worker->srv->cfg->re_cache, cmd->cmd.hs_loaded.cache_dir, false);
 	}
 
 	if (write (fd, &rep, sizeof (rep)) != sizeof (rep)) {

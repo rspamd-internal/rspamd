@@ -124,7 +124,7 @@ struct rspamd_re_cache {
 	gchar hash[rspamd_cryptobox_HASHBYTES + 1];
 	lua_State *L;
 #ifdef WITH_HYPERSCAN
-	gboolean hyperscan_loaded;
+	enum rspamd_hyperscan_status hyperscan_loaded;
 	gboolean disable_hyperscan;
 	gboolean vectorized_hyperscan;
 	hs_platform_info_t plt;
@@ -241,14 +241,14 @@ rspamd_re_cache_new (void)
 	cache->re = g_ptr_array_new_full (256, rspamd_re_cache_elt_dtor);
 	cache->selectors = kh_init (lua_selectors_hash);
 #ifdef WITH_HYPERSCAN
-	cache->hyperscan_loaded = FALSE;
+	cache->hyperscan_loaded = RSPAMD_HYPERSCAN_UNKNOWN;
 #endif
 	REF_INIT_RETAIN (cache, rspamd_re_cache_destroy);
 
 	return cache;
 }
 
-gboolean
+enum rspamd_hyperscan_status
 rspamd_re_cache_is_hs_loaded (struct rspamd_re_cache *cache)
 {
 	g_assert (cache != NULL);
@@ -256,7 +256,7 @@ rspamd_re_cache_is_hs_loaded (struct rspamd_re_cache *cache)
 #ifdef WITH_HYPERSCAN
 	return cache->hyperscan_loaded;
 #else
-	return FALSE;
+	return RSPAMD_HYPERSCAN_UNSUPPORTED;
 #endif
 }
 
@@ -2364,15 +2364,15 @@ rspamd_re_cache_is_valid_hyperscan_file (struct rspamd_re_cache *cache,
 }
 
 
-gboolean
+enum rspamd_hyperscan_status
 rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
-		const char *cache_dir)
+		const char *cache_dir, bool try_load)
 {
 	g_assert (cache != NULL);
 	g_assert (cache_dir != NULL);
 
 #ifndef WITH_HYPERSCAN
-	return FALSE;
+	return RSPAMD_HYPERSCAN_UNSUPPORTED;
 #else
 	gchar path[PATH_MAX];
 	gint fd, i, n, *hs_ids = NULL, *hs_flags = NULL, total = 0, ret;
@@ -2382,7 +2382,7 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 	struct rspamd_re_class *re_class;
 	struct rspamd_re_cache_elt *elt;
 	struct stat st;
-	gboolean has_valid = FALSE;
+	gboolean has_valid = FALSE, all_valid = FALSE;
 
 	g_hash_table_iter_init (&it, cache->re_classes);
 
@@ -2391,7 +2391,7 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 		rspamd_snprintf (path, sizeof (path), "%s%c%s.hs", cache_dir,
 				G_DIR_SEPARATOR, re_class->hash);
 
-		if (rspamd_re_cache_is_valid_hyperscan_file (cache, path, FALSE, FALSE)) {
+		if (rspamd_re_cache_is_valid_hyperscan_file (cache, path, try_load, FALSE)) {
 			msg_debug_re_cache ("load hyperscan database from '%s'",
 					re_class->hash);
 
@@ -2404,8 +2404,15 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 			map = mmap (NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 
 			if (map == MAP_FAILED) {
-				msg_err_re_cache ("cannot mmap %s: %s", path, strerror (errno));
+				if (!try_load) {
+					msg_err_re_cache ("cannot mmap %s: %s", path, strerror (errno));
+				}
+				else {
+					msg_debug_re_cache ("cannot mmap %s: %s", path, strerror (errno));
+				}
+
 				close (fd);
+				all_valid = FALSE;
 				continue;
 			}
 
@@ -2419,9 +2426,17 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 							RSPAMD_HS_MAGIC_LEN + /* header */
 							sizeof (cache->plt) > (gsize)st.st_size) {
 				/* Some wrong amount of regexps */
-				msg_err_re_cache ("bad number of expressions in %s: %d",
-						path, n);
+				if (!try_load) {
+					msg_err_re_cache ("bad number of expressions in %s: %d",
+							path, n);
+				}
+				else {
+					msg_debug_re_cache ("bad number of expressions in %s: %d",
+							path, n);
+				}
+
 				munmap (map, st.st_size);
+				all_valid = FALSE;
 				continue;
 			}
 
@@ -2455,7 +2470,12 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 
 			if ((ret = hs_deserialize_database (p, end - p, &re_class->hs_db))
 					!= HS_SUCCESS) {
-				msg_err_re_cache ("bad hs database in %s: %d", path, ret);
+				if (!try_load) {
+					msg_err_re_cache ("bad hs database in %s: %d", path, ret);
+				}
+				else {
+					msg_debug_re_cache ("bad hs database in %s: %d", path, ret);
+				}
 				munmap (map, st.st_size);
 				g_free (hs_ids);
 				g_free (hs_flags);
@@ -2463,6 +2483,7 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 				re_class->hs_ids = NULL;
 				re_class->hs_scratch = NULL;
 				re_class->hs_db = NULL;
+				all_valid = FALSE;
 
 				continue;
 			}
@@ -2491,24 +2512,44 @@ rspamd_re_cache_load_hyperscan (struct rspamd_re_cache *cache,
 			re_class->hs_ids = hs_ids;
 			g_free (hs_flags);
 			re_class->nhs = n;
-			has_valid = TRUE;
+
+			if (!has_valid) {
+				has_valid = TRUE;
+				all_valid = TRUE;
+			}
 		}
 		else {
-			msg_err_re_cache ("invalid hyperscan hash file '%s'",
-					path);
+			if (!try_load) {
+				msg_err_re_cache ("invalid hyperscan hash file '%s'",
+						path);
+			}
+			else {
+				msg_debug_re_cache ("invalid hyperscan hash file '%s'",
+						path);
+			}
+			all_valid = FALSE;
 			continue;
 		}
 	}
 
 	if (has_valid) {
-		msg_info_re_cache ("hyperscan database of %d regexps has been loaded", total);
+		if (all_valid) {
+			msg_info_re_cache ("full hyperscan database of %d regexps has been loaded", total);
+			cache->hyperscan_loaded = RSPAMD_HYPERSCAN_LOADED_FULL;
+		}
+		else {
+			msg_info_re_cache ("partial hyperscan database of %d regexps has been loaded", total);
+			cache->hyperscan_loaded = RSPAMD_HYPERSCAN_LOADED_PARTIAL;
+		}
 	}
 	else {
 		msg_info_re_cache ("hyperscan database has NOT been loaded; no valid expressions");
+		cache->hyperscan_loaded = RSPAMD_HYPERSCAN_LOAD_ERROR;
 	}
-	cache->hyperscan_loaded = has_valid;
 
-	return has_valid;
+
+
+	return cache->hyperscan_loaded;
 #endif
 }
 

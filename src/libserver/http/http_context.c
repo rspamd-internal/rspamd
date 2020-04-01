@@ -53,8 +53,9 @@ rspamd_http_keepalive_queue_cleanup (GQueue *conns)
 		struct rspamd_http_keepalive_cbdata *cbd;
 
 		cbd = (struct rspamd_http_keepalive_cbdata *)cur->data;
-		rspamd_http_connection_unref (cbd->conn);
+		/* unref call closes fd, so we need to remove ev watcher first! */
 		rspamd_ev_watcher_stop (cbd->ctx->event_loop, &cbd->ev);
+		rspamd_http_connection_unref (cbd->conn);
 		g_free (cbd);
 
 		cur = cur->next;
@@ -414,11 +415,31 @@ rspamd_http_context_check_keepalive (struct rspamd_http_context *ctx,
 		if (g_queue_get_length (conns) > 0) {
 			struct rspamd_http_keepalive_cbdata *cbd;
 			struct rspamd_http_connection *conn;
+			gint err;
+			socklen_t len = sizeof (gint);
 
 			cbd = g_queue_pop_head (conns);
 			rspamd_ev_watcher_stop (ctx->event_loop, &cbd->ev);
 			conn = cbd->conn;
 			g_free (cbd);
+
+			if (getsockopt (conn->fd, SOL_SOCKET, SO_ERROR, (void *) &err, &len) == -1) {
+				err = errno;
+			}
+
+			if (err != 0) {
+				rspamd_http_connection_unref (conn);
+
+				msg_debug_http_context ("invalid reused keepalive element %s (%s); "
+							"%s error; "
+							"%d connections queued",
+						rspamd_inet_address_to_string_pretty (phk->addr),
+						phk->host,
+						g_strerror (err),
+						conns->length);
+
+				return NULL;
+			}
 
 			msg_debug_http_context ("reused keepalive element %s (%s), %d connections queued",
 					rspamd_inet_address_to_string_pretty (phk->addr),
@@ -491,8 +512,9 @@ rspamd_http_keepalive_handler (gint fd, short what, gpointer ud)
 			rspamd_inet_address_to_string_pretty (cbdata->conn->keepalive_hash_key->addr),
 			cbdata->conn->keepalive_hash_key->host,
 			cbdata->queue->length);
-	rspamd_http_connection_unref (cbdata->conn);
+	/* unref call closes fd, so we need to remove ev watcher first! */
 	rspamd_ev_watcher_stop (cbdata->ctx->event_loop, &cbdata->ev);
+	rspamd_http_connection_unref (cbdata->conn);
 	g_free (cbdata);
 }
 
@@ -566,8 +588,10 @@ rspamd_http_context_push_keepalive (struct rspamd_http_context *ctx,
 	cbdata = g_malloc0 (sizeof (*cbdata));
 
 	cbdata->conn = rspamd_http_connection_ref (conn);
-	g_queue_push_tail (&conn->keepalive_hash_key->conns, cbdata);
-	cbdata->link = conn->keepalive_hash_key->conns.tail;
+	/* Use stack like approach to that would easy reading */
+	g_queue_push_head (&conn->keepalive_hash_key->conns, cbdata);
+	cbdata->link = conn->keepalive_hash_key->conns.head;
+
 	cbdata->queue = &conn->keepalive_hash_key->conns;
 	cbdata->ctx = ctx;
 	conn->finished = FALSE;

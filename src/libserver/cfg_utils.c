@@ -888,6 +888,11 @@ rspamd_config_post_load (struct rspamd_config *cfg,
 
 		/* Init re cache */
 		rspamd_re_cache_init (cfg->re_cache, cfg);
+
+		/* Try load Hypersan */
+		rspamd_re_cache_load_hyperscan (cfg->re_cache,
+				cfg->hs_cache_dir ? cfg->hs_cache_dir :  RSPAMD_DBDIR "/",
+				true);
 	}
 
 	if (opts & RSPAMD_CONFIG_INIT_LIBS) {
@@ -1625,6 +1630,7 @@ rspamd_config_new_symbol (struct rspamd_config *cfg, const gchar *symbol,
 		score = 0.0;
 		/* Also set priority to 0 to allow override by anything */
 		sym_def->priority = 0;
+		flags |= RSPAMD_SYMBOL_FLAG_UNSCORED;
 	}
 	else {
 		sym_def->priority = priority;
@@ -1725,7 +1731,8 @@ rspamd_config_add_symbol (struct rspamd_config *cfg,
 			}
 		}
 
-		if (sym_def->priority > priority) {
+		if (sym_def->priority > priority &&
+			(isnan(score) || !(sym_def->flags & RSPAMD_SYMBOL_FLAG_UNSCORED))) {
 			msg_debug_config ("symbol %s has been already registered with "
 					"priority %ud, do not override (new priority: %ud)",
 					symbol,
@@ -1759,6 +1766,7 @@ rspamd_config_add_symbol (struct rspamd_config *cfg,
 				*sym_def->weight_ptr = score;
 				sym_def->score = score;
 				sym_def->priority = priority;
+				sym_def->flags &= ~RSPAMD_SYMBOL_FLAG_UNSCORED;
 			}
 
 			sym_def->flags = flags;
@@ -2571,12 +2579,13 @@ rspamd_config_register_settings_id (struct rspamd_config *cfg,
 int
 rspamd_config_ev_backend_get (struct rspamd_config *cfg)
 {
+#define AUTO_BACKEND (ev_supported_backends () & ~EVBACKEND_IOURING)
 	if (cfg == NULL || cfg->events_backend == NULL) {
-		return ev_supported_backends ();
+		return AUTO_BACKEND;
 	}
 
 	if (strcmp (cfg->events_backend, "auto") == 0) {
-		return ev_supported_backends ();
+		return AUTO_BACKEND;
 	}
 	else if (strcmp (cfg->events_backend, "epoll") == 0) {
 		if (ev_supported_backends () & EVBACKEND_EPOLL) {
@@ -2585,7 +2594,17 @@ rspamd_config_ev_backend_get (struct rspamd_config *cfg)
 		else {
 			msg_warn_config ("unsupported events_backend: %s; defaulting to auto",
 					cfg->events_backend);
-			return ev_supported_backends ();
+			return AUTO_BACKEND;
+		}
+	}
+	else if (strcmp (cfg->events_backend, "iouring") == 0) {
+		if (ev_supported_backends () & EVBACKEND_IOURING) {
+			return EVBACKEND_IOURING;
+		}
+		else {
+			msg_warn_config ("unsupported events_backend: %s; defaulting to auto",
+					cfg->events_backend);
+			return AUTO_BACKEND;
 		}
 	}
 	else if (strcmp (cfg->events_backend, "kqueue") == 0) {
@@ -2595,7 +2614,7 @@ rspamd_config_ev_backend_get (struct rspamd_config *cfg)
 		else {
 			msg_warn_config ("unsupported events_backend: %s; defaulting to auto",
 					cfg->events_backend);
-			return ev_supported_backends ();
+			return AUTO_BACKEND;
 		}
 	}
 	else if (strcmp (cfg->events_backend, "poll") == 0) {
@@ -2609,7 +2628,7 @@ rspamd_config_ev_backend_get (struct rspamd_config *cfg)
 				cfg->events_backend);
 	}
 
-	return EVBACKEND_ALL;
+	return AUTO_BACKEND;
 }
 
 const gchar *
@@ -2622,6 +2641,21 @@ rspamd_config_ev_backend_to_string (int ev_backend, gboolean *effective)
 		return "auto";
 	}
 
+	if (ev_backend & EVBACKEND_IOURING) {
+		SET_EFFECTIVE (TRUE);
+		return "epoll+io_uring";
+	}
+	if (ev_backend & EVBACKEND_LINUXAIO) {
+		SET_EFFECTIVE (TRUE);
+		return "epoll+aio";
+	}if (ev_backend & EVBACKEND_IOURING) {
+		SET_EFFECTIVE (TRUE);
+		return "epoll+io_uring";
+	}
+	if (ev_backend & EVBACKEND_LINUXAIO) {
+		SET_EFFECTIVE (TRUE);
+		return "epoll+aio";
+	}
 	if (ev_backend & EVBACKEND_EPOLL) {
 		SET_EFFECTIVE (TRUE);
 		return "epoll";

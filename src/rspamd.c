@@ -706,8 +706,13 @@ spawn_workers (struct rspamd_main *rspamd_main, struct ev_loop *ev_base)
 					spawn_worker_type (rspamd_main, ev_base, cf);
 				}
 				else {
-					msg_err_main ("cannot create listen socket for %s at %s",
-							g_quark_to_string (cf->type), cf->bind_conf->name);
+					if (cf->bind_conf == NULL) {
+						msg_err_main ("cannot create listen socket for %s",
+								g_quark_to_string (cf->type));
+					} else {
+						msg_err_main ("cannot create listen socket for %s at %s",
+								g_quark_to_string (cf->type), cf->bind_conf->name);
+					}
 
 					rspamd_hard_terminate (rspamd_main);
 					g_assert_not_reached ();
@@ -764,6 +769,7 @@ kill_old_workers (gpointer key, gpointer value, gpointer unused)
 		w->state = rspamd_worker_state_terminating;
 		kill (w->pid, SIGUSR2);
 		ev_io_stop (rspamd_main->event_loop, &w->srv_ev);
+		g_hash_table_remove_all (w->control_events_pending);
 		msg_info_main ("send signal to worker %P", w->pid);
 	}
 	else {
@@ -1018,7 +1024,8 @@ rspamd_term_handler (struct ev_loop *loop, ev_signal *w, int revents)
 		rspamd_main->wanna_die = TRUE;
 		shutdown_ts = MAX (SOFT_SHUTDOWN_TIME,
 				rspamd_main->cfg->task_timeout * 2.0);
-		msg_info_main ("catch termination signal, waiting for children for %.2f seconds",
+		msg_info_main ("catch termination signal, waiting for %d children for %.2f seconds",
+				(gint)g_hash_table_size (rspamd_main->workers),
 				valgrind_mode ? shutdown_ts * 10 : shutdown_ts);
 		/* Stop srv events to avoid false notifications */
 		g_hash_table_foreach (rspamd_main->workers, stop_srv_ev, rspamd_main);
@@ -1136,6 +1143,8 @@ rspamd_cld_handler (EV_P_ ev_child *w, struct rspamd_main *rspamd_main,
 
 	/* Remove dead child form children list */
 	g_hash_table_remove (rspamd_main->workers, GSIZE_TO_POINTER (wrk->pid));
+	g_hash_table_remove_all (wrk->control_events_pending);
+
 	if (wrk->srv_pipe[0] != -1) {
 		/* Ugly workaround */
 		if (wrk->tmp_data) {
@@ -1176,6 +1185,7 @@ rspamd_cld_handler (EV_P_ ev_child *w, struct rspamd_main *rspamd_main,
 	}
 
 	REF_RELEASE (wrk->cf);
+	g_hash_table_unref (wrk->control_events_pending);
 	g_free (wrk);
 }
 
@@ -1443,8 +1453,7 @@ main (gint argc, gchar **argv, gchar **env)
 	rspamd_main->workers = g_hash_table_new (g_direct_hash, g_direct_equal);
 
 	/* Init event base */
-	event_loop = ev_default_loop (EVFLAG_SIGNALFD|
-			rspamd_config_ev_backend_get (rspamd_main->cfg));
+	event_loop = ev_default_loop (rspamd_config_ev_backend_get (rspamd_main->cfg));
 	rspamd_main->event_loop = event_loop;
 
 	if (event_loop) {
