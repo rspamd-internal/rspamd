@@ -282,7 +282,12 @@ end
 
 local function gen_rbl_callback(rule)
   local function is_whitelisted(task, req, req_str, whitelist, what)
-    if rule.ignore_whitelist then return false end
+    if rule.ignore_whitelist then
+      lua_util.debugm(N, task,
+          'ignore whitelisting checks to %s by %s: ignore whitelist is being set',
+          req_str, rule.symbol)
+      return false
+    end
 
     if rule.whitelist then
       if rule.whitelist:get_key(req) then
@@ -296,12 +301,18 @@ local function gen_rbl_callback(rule)
 
     -- Maybe whitelisted by some other rbl rule
     if whitelist then
-      local wl_what = whitelist[req_str]
-      if wl_what then
+      local wl = whitelist[req_str]
+      if wl then
         lua_util.debugm(N, task,
-            'whitelisted %s on %s by %s rbl rule (%s checked)',
-            req_str, wl_what, what)
-        return wl_what == what
+            'whitelisted request to %s by %s (%s) rbl rule (%s checked type, %s whitelist type)',
+            req_str, wl.type, wl.symbol, what, wl.type)
+        if wl.type == what then
+          -- This was decided to be a bad idea as in case of whitelisting a request to blacklist
+          -- is not even sent
+          --task:adjust_result(wl.symbol, 0.0 / 0.0, rule.symbol)
+
+          return true
+        end
       end
     end
 
@@ -419,6 +430,8 @@ local function gen_rbl_callback(rule)
 
     add_dns_request(task, helo, true, false, requests_table,
         'helo', whitelist)
+
+    return true
   end
 
   local function check_dkim(task, requests_table, whitelist)
@@ -496,9 +509,21 @@ local function gen_rbl_callback(rule)
       ignore_ip = rule.no_ip,
       need_images = rule.images,
       need_emails = false,
+      need_content = rule.content_urls or false,
       esld_limit = esld_lim,
       no_cache = true,
     }
+
+    if not rule.urls then
+      ex_params.flags_mode = 'explicit'
+      ex_params.flags = {}
+      if rule.content_urls then
+        table.insert(ex_params.flags, 'content')
+      end
+      if rule.images then
+        table.insert(ex_params.flags, 'image')
+      end
+    end
 
     local urls = lua_util.extract_specific_urls(ex_params)
 
@@ -562,12 +587,14 @@ local function gen_rbl_callback(rule)
   end
 
   local function check_selector(task, requests_table, whitelist)
-    local res = rule.selector(task)
+    for selector_label, selector in pairs(rule.selectors) do
+      local res = selector(task)
 
-    if res then
-      for _,r in ipairs(res) do
-        add_dns_request(task, r, false, false, requests_table,
-            'sel' .. rule.selector_id, whitelist)
+      if res then
+        for _,r in ipairs(res) do
+          add_dns_request(task, r, false, false, requests_table,
+              selector_label, whitelist)
+        end
       end
     end
 
@@ -576,7 +603,8 @@ local function gen_rbl_callback(rule)
 
   local function check_email_table(task, email_tbl, requests_table, whitelist, what)
     lua_util.remove_email_aliases(email_tbl)
-    email_tbl.addr = email_tbl.addr:lower()
+    email_tbl.domain = email_tbl.domain:lower()
+    email_tbl.user = email_tbl.user:lower()
 
     if rule.emails_domainonly then
       add_dns_request(task, email_tbl.domain, false, false, requests_table,
@@ -700,7 +728,7 @@ local function gen_rbl_callback(rule)
     description[#description + 1] = 'replyto'
   end
 
-  if rule.urls then
+  if rule.urls or rule.content_urls or rule.images then
     pipeline[#pipeline + 1] = check_urls
     description[#description + 1] = 'urls'
   end
@@ -853,26 +881,33 @@ local function add_rbl(key, rbl, global_opts)
   end
 
   if rbl.selector then
-    if known_selectors[rbl.selector] then
-      lua_util.debugm(N, rspamd_config, 'reuse selector id %s',
-          known_selectors[rbl.selector].id)
-      rbl.selector = known_selectors[rbl.selector].selector
-      rbl.selector_id = known_selectors[rbl.selector].id
-    else
-      -- Create a new flattened closure
-      local sel = selectors.create_selector_closure(rspamd_config, rbl.selector, '', true)
 
-      if not sel then
-        rspamd_logger.errx('invalid selector for rbl rule %s: %s', key, rbl.selector)
-        return false
+    rbl.selectors = {}
+    if type(rbl.selector) ~= 'table' then
+      rbl.selector = {['selector'] = rbl.selector}
+    end
+
+    for selector_label, selector in pairs(rbl.selector) do
+      if known_selectors[selector] then
+        lua_util.debugm(N, rspamd_config, 'reuse selector id %s',
+            known_selectors[selector].id)
+        rbl.selectors[selector_label] = known_selectors[selector].selector
+      else
+        -- Create a new flattened closure
+        local sel = selectors.create_selector_closure(rspamd_config, selector, '', true)
+
+        if not sel then
+          rspamd_logger.errx('invalid selector for rbl rule %s: %s', key, selector)
+          return false
+        end
+
+        rbl.selector = sel
+        known_selectors[selector] = {
+          selector = sel,
+          id = #lua_util.keys(known_selectors) + 1,
+        }
+        rbl.selectors[selector_label] = known_selectors[selector].selector
       end
-
-      rbl.selector = sel
-      known_selectors[rbl.selector] = {
-        selector = sel,
-        id = #lua_util.keys(known_selectors) + 1,
-      }
-      rbl.selector_id = known_selectors[rbl.selector].id
     end
 
   end
@@ -939,21 +974,33 @@ local function add_rbl(key, rbl, global_opts)
         rspamd_config:register_symbol{
           type = 'virtual',
           parent = id,
+          group = 'rbl',
+          score = 0,
           name = prefix .. '_' .. rbl.symbol,
         }
       end
-      if not rbl.is_whitelist and rbl.ignore_whitelist == false then
+      if not (rbl.is_whitelist or rbl.ignore_whitelist) then
         table.insert(black_symbols, rbl.symbol .. '_CHECK')
+      else
+        lua_util.debugm(N, rspamd_config, 'rule %s ignores whitelists: rbl.is_whitelist = %s, ' ..
+            'rbl.ignore_whitelist = %s',
+            rbl.symbol, rbl.is_whitelist, rbl.ignore_whitelist)
       end
     else
       id = rspamd_config:register_symbol{
         type = 'callback',
         callback = callback,
         name = rbl.symbol,
+        group = 'rbl',
+        score = 0,
         flags = table.concat(flags_tbl, ',')
       }
-      if not rbl.is_whitelist and rbl.ignore_whitelist == false then
+      if not (rbl.is_whitelist or rbl.ignore_whitelist) then
         table.insert(black_symbols, rbl.symbol)
+      else
+        lua_util.debugm(N, rspamd_config, 'rule %s ignores whitelists: rbl.is_whitelist = %s, ' ..
+            'rbl.ignore_whitelist = %s',
+            rbl.symbol, rbl.is_whitelist, rbl.ignore_whitelist)
       end
     end
 
@@ -969,7 +1016,8 @@ local function add_rbl(key, rbl, global_opts)
 
     -- Failure symbol
     rspamd_config:register_symbol{
-      type = 'virtual,nostat',
+      type = 'virtual',
+      flags = 'nostat',
       name = rbl.symbol .. '_FAIL',
       parent = id,
       score = 0.0,
@@ -984,6 +1032,8 @@ local function add_rbl(key, rbl, global_opts)
             type = 'virtual',
             parent = id,
             name = s,
+            group = 'rbl',
+            score = 0,
           }
         end
         if rbl.is_whitelist then
@@ -1002,7 +1052,7 @@ local function add_rbl(key, rbl, global_opts)
             table.insert(white_symbols, s)
           end
         else
-          if rbl.ignore_whitelist == false then
+          if not rbl.ignore_whitelist then
             table.insert(black_symbols, s)
           end
         end
@@ -1071,9 +1121,6 @@ local default_options = {
   ['default_exclude_private_ips'] = true,
   ['default_exclude_users'] = false,
   ['default_exclude_local'] = true,
-  ['default_is_whitelist'] = false,
-  ['default_ignore_whitelist'] = false,
-  ['default_resolve_ip'] = false,
   ['default_no_ip'] = false,
   ['default_images'] = false,
   ['default_replyto'] = false,
@@ -1110,31 +1157,56 @@ local return_bits_schema = ts.map_of(
 )
 
 local rule_schema_tbl = {
-  enabled = ts.boolean:is_optional(),
+  content_urls = ts.boolean:is_optional(),
+  disable_monitoring = ts.boolean:is_optional(),
   disabled = ts.boolean:is_optional(),
-  rbl = ts.string,
-  selector = ts.string:is_optional(),
-  symbol = ts.string:is_optional(),
-  returncodes = return_codes_schema:is_optional(),
-  return_codes = return_codes_schema:is_optional(),
-  returnbits = return_bits_schema:is_optional(),
-  return_bits = return_bits_schema:is_optional(),
-  whitelist_exception = (
-      ts.array_of(ts.string) + (ts.string / function(s) return {s} end)
-  ):is_optional(),
-  whitelist = lua_maps.map_schema:is_optional(),
-  url_compose_map = lua_maps.map_schema:is_optional(),
-  local_exclude_ip_map = ts.string:is_optional(),
+  dkim = ts.boolean:is_optional(),
+  dkim_domainonly = ts.boolean:is_optional(),
+  dkim_match_from = ts.boolean:is_optional(),
+  emails = ts.boolean:is_optional(),
+  emails_delimiter = ts.string:is_optional(),
+  emails_domainonly = ts.boolean:is_optional(),
+  enabled = ts.boolean:is_optional(),
+  exclude_local = ts.boolean:is_optional(),
+  exclude_private_ips = ts.boolean:is_optional(),
+  exclude_users = ts.boolean:is_optional(),
+  from = ts.boolean:is_optional(),
   hash = ts.one_of{"sha1", "sha256", "sha384", "sha512", "md5", "blake2"}:is_optional(),
   hash_format = ts.one_of{"hex", "base32", "base64"}:is_optional(),
   hash_len = (ts.integer + ts.string / tonumber):is_optional(),
-  monitored_address = ts.string:is_optional(),
-  requests_limit = (ts.integer + ts.string / tonumber):is_optional(),
-  process_script = ts.string:is_optional(),
-  emails_delimiter = ts.string:is_optional(),
+  helo = ts.boolean:is_optional(),
+  ignore_default = ts.boolean:is_optional(), -- alias
   ignore_defaults = ts.boolean:is_optional(),
-  disable_monitoring = ts.boolean:is_optional(),
+  ignore_whitelist = ts.boolean:is_optional(),
+  ignore_whitelists = ts.boolean:is_optional(), -- alias
+  images = ts.boolean:is_optional(),
+  ipv4 = ts.boolean:is_optional(),
+  ipv6 = ts.boolean:is_optional(),
+  is_whitelist = ts.boolean:is_optional(),
+  local_exclude_ip_map = ts.string:is_optional(),
+  monitored_address = ts.string:is_optional(),
+  no_ip = ts.boolean:is_optional(),
+  process_script = ts.string:is_optional(),
+  rbl = ts.string,
+  rdns = ts.boolean:is_optional(),
+  received = ts.boolean:is_optional(),
+  replyto = ts.boolean:is_optional(),
+  requests_limit = (ts.integer + ts.string / tonumber):is_optional(),
+  resolve_ip = ts.boolean:is_optional(),
+  return_bits = return_bits_schema:is_optional(),
+  return_codes = return_codes_schema:is_optional(),
+  returnbits = return_bits_schema:is_optional(),
+  returncodes = return_codes_schema:is_optional(),
+  selector = ts.one_of{ts.string, ts.table}:is_optional(),
+  symbol = ts.string:is_optional(),
   symbols_prefixes = ts.map_of(ts.string, ts.string):is_optional(),
+  unknown = ts.boolean:is_optional(),
+  url_compose_map = lua_maps.map_schema:is_optional(),
+  urls = ts.boolean:is_optional(),
+  whitelist = lua_maps.map_schema:is_optional(),
+  whitelist_exception = (
+      ts.array_of(ts.string) + (ts.string / function(s) return {s} end)
+  ):is_optional(),
 }
 -- Add default boolean flags to the schema
 for def_k,_ in pairs(default_options) do
@@ -1147,6 +1219,13 @@ for key,rbl in pairs(opts.rbls or opts.rules) do
   if type(rbl) ~= 'table' or rbl.disabled == true or rbl.enabled == false then
     rspamd_logger.infox(rspamd_config, 'disable rbl "%s"', key)
   else
+    -- Aliases
+    if type(rbl.ignore_default) == 'boolean' then
+      rbl.ignore_defaults = rbl.ignore_default
+    end
+    if type(rbl.ignore_whitelists) == 'boolean' then
+      rbl.ignore_whitelist = rbl.ignore_whitelists
+    end
     -- Propagate default options from opts to rule
     if not rbl.ignore_defaults then
       for default_opt_key,_ in pairs(default_options) do
@@ -1189,7 +1268,10 @@ local function rbl_callback_white(task)
         lua_util.debugm(N, task,'found whitelist from %s: %s(%s)', w,
             elt, what)
         if elt and what then
-          whitelisted_elements[elt] = what
+          whitelisted_elements[elt] = {
+            type = what,
+            symbol = w,
+          }
         end
       end
     end

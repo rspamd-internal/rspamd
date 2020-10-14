@@ -55,51 +55,70 @@ rspamd_config.R_PARTS_DIFFER = {
 }
 
 -- Date issues
-rspamd_config.MISSING_DATE = {
+local date_id = rspamd_config:register_symbol({
+  name = 'DATE_CB',
+  type = 'callback,mime',
   callback = function(task)
-    local date = task:get_header_raw('Date')
-    if date == nil or date == '' then
-      return true
+    local date_time = task:get_header('Date')
+    if date_time == nil or date_time == '' then
+      task:insert_result('MISSING_DATE', 1.0)
+      return
     end
-    return false
-  end,
+
+    local dm, err = util.parse_smtp_date(date_time)
+    if err then
+      task:insert_result('INVALID_DATE', 1.0)
+      return
+    end
+
+    local dt = task:get_date({format = 'connect', gmt = true})
+    local date_diff = dt - dm
+
+    if date_diff > 86400 then
+      -- Older than a day
+      task:insert_result('DATE_IN_PAST', 1.0, tostring(math.floor(date_diff/3600)))
+    elseif -date_diff > 7200 then
+      -- More than 2 hours in the future
+      task:insert_result('DATE_IN_FUTURE', 1.0, tostring(math.floor(-date_diff/3600)))
+    end
+  end
+})
+
+rspamd_config:register_symbol({
+  name = 'MISSING_DATE',
   score = 1.0,
   description = 'Message date is missing',
   group = 'headers',
-  type = 'mime',
-}
+  type = 'virtual',
+  parent = date_id,
+})
 
-rspamd_config.DATE_IN_FUTURE = {
-  callback = function(task)
-    local dm = task:get_date{format = 'message', gmt = true}
-    local dt = task:get_date{format = 'connect', gmt = true}
-    -- 2 hours
-    if dm > 0 and dm - dt > 7200 then
-      return true
-    end
-    return false
-  end,
+rspamd_config:register_symbol({
+  name = 'INVALID_DATE',
+  score = 1.5,
+  description = 'Malformed date header',
+  group = 'headers',
+  type = 'virtual',
+  parent = date_id,
+})
+
+rspamd_config:register_symbol({
+  name = 'DATE_IN_FUTURE',
   score = 4.0,
   description = 'Message date is in future',
   group = 'headers',
-  type = 'mime',
-}
+  type = 'virtual',
+  parent = date_id,
+})
 
-rspamd_config.DATE_IN_PAST = {
-  callback = function(task)
-    local dm = task:get_date{format = 'message', gmt = true}
-    local dt = task:get_date{format = 'connect', gmt = true}
-    -- A day
-    if dm > 0 and dt - dm > 86400 then
-      return true
-    end
-    return false
-  end,
+rspamd_config:register_symbol({
+  name = 'DATE_IN_PAST',
   score = 1.0,
   description = 'Message date is in past',
   group = 'headers',
-  type = 'mime',
-}
+  type = 'virtual',
+  parent = date_id,
+})
 
 local obscured_id = rspamd_config:register_symbol{
   callback = function(task)
@@ -345,14 +364,14 @@ rspamd_config.HAS_ATTACHMENT = {
 
 -- Requires freemail maps loaded in multimap
 local function freemail_reply_neq_from(task)
-  local frt = task:get_symbol('FREEMAIL_REPLYTO')
-  local ff  = task:get_symbol('FREEMAIL_FROM')
-  if (frt and ff and frt['options'] and ff['options'] and
-      frt['options'][1] ~= ff['options'][1])
-  then
-    return true
+  if not task:has_symbol('FREEMAIL_REPLYTO') or not task:has_symbol('FREEMAIL_FROM') then
+    return false
   end
-  return false
+  local frt = task:get_symbol('FREEMAIL_REPLYTO')
+  local ff = task:get_symbol('FREEMAIL_FROM')
+  local frt_opts = frt[1]['options']
+  local ff_opts = ff[1]['options']
+  return ( frt_opts and ff_opts and frt_opts[1] ~= ff_opts[1] )
 end
 
 rspamd_config:register_symbol({
