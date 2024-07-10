@@ -48,6 +48,7 @@ enum rdns_request_type {
 	RDNS_REQUEST_INVALID = -1,
 	RDNS_REQUEST_A = 1,
 	RDNS_REQUEST_NS = 2,
+	RDNS_REQUEST_CNAME = 5,
 	RDNS_REQUEST_SOA = 6,
 	RDNS_REQUEST_PTR = 12,
 	RDNS_REQUEST_MX = 15,
@@ -101,6 +102,9 @@ union rdns_reply_element_un {
 		uint16_t datalen;
 		uint8_t *data;
 	} tlsa;
+	struct {
+		char *name;
+	} cname;
 };
 
 struct rdns_reply_entry {
@@ -129,13 +133,18 @@ enum dns_rcode {
 	RDNS_RC_NOREC = 13
 };
 
+enum dns_reply_flags {
+	RDNS_AUTH = (1u << 0u),
+	RDNS_TRUNCATED = (1u << 1u)
+};
+
 struct rdns_reply {
 	struct rdns_request *request;
 	struct rdns_resolver *resolver;
 	struct rdns_reply_entry *entries;
 	const char *requested_name;
 	enum dns_rcode code;
-	bool authenticated;
+	uint8_t flags; /* see enum dns_reply_flags */
 };
 
 typedef void (*rdns_periodic_callback)(void *user_data);
@@ -475,7 +484,7 @@ bool rdns_format_dns_name (struct rdns_resolver *resolver,
 
 void rdns_process_read (int fd, void *arg);
 void rdns_process_timer (void *arg);
-void rdns_process_retransmit (int fd, void *arg);
+void rdns_process_write (int fd, void *arg);
 
 #ifdef  __cplusplus
 }

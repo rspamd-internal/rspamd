@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2017, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,39 +24,61 @@ local exports = {}
 local E = {}
 local N = "lua_redis"
 
-local common_schema = ts.shape {
-  timeout = (ts.number + ts.string / lutil.parse_time_interval):is_optional(),
-  db = ts.string:is_optional(),
-  database = ts.string:is_optional(),
-  dbname = ts.string:is_optional(),
-  prefix = ts.string:is_optional(),
-  password = ts.string:is_optional(),
-  expand_keys = ts.boolean:is_optional(),
-  sentinels = (ts.string + ts.array_of(ts.string)):is_optional(),
-  sentinel_watch_time = (ts.number + ts.string / lutil.parse_time_interval):is_optional(),
-  sentinel_masters_pattern = ts.string:is_optional(),
-  sentinel_master_maxerrors = (ts.number + ts.string / tonumber):is_optional(),
+local common_schema = {
+  timeout = (ts.number + ts.string / lutil.parse_time_interval):is_optional():describe("Connection timeout"),
+  db = ts.string:is_optional():describe("Database number"),
+  database = ts.string:is_optional():describe("Database number"),
+  dbname = ts.string:is_optional():describe("Database number"),
+  prefix = ts.string:is_optional():describe("Key prefix"),
+  username = ts.string:is_optional():describe("Username"),
+  password = ts.string:is_optional():describe("Password"),
+  expand_keys = ts.boolean:is_optional():describe("Expand keys"),
+  sentinels = (ts.string + ts.array_of(ts.string)):is_optional():describe("Sentinel servers"),
+  sentinel_watch_time = (ts.number + ts.string / lutil.parse_time_interval):is_optional():describe("Sentinel watch time"),
+  sentinel_masters_pattern = ts.string:is_optional():describe("Sentinel masters pattern"),
+  sentinel_master_maxerrors = (ts.number + ts.string / tonumber):is_optional():describe("Sentinel master max errors"),
+  sentinel_username = ts.string:is_optional():describe("Sentinel username"),
+  sentinel_password = ts.string:is_optional():describe("Sentinel password"),
 }
 
-local config_schema =
-  ts.shape({
-    read_servers = ts.string + ts.array_of(ts.string),
-    write_servers = ts.string + ts.array_of(ts.string),
-  }, {extra_opts = common_schema}) +
-  ts.shape({
-    servers = ts.string + ts.array_of(ts.string),
-  }, {extra_opts = common_schema}) +
-  ts.shape({
-    server = ts.string + ts.array_of(ts.string),
-  }, {extra_opts = common_schema})
+local read_schema = lutil.table_merge({
+  read_servers = ts.string + ts.array_of(ts.string),
+}, common_schema)
 
-exports.config_schema = config_schema
+local write_schema = lutil.table_merge({
+  write_servers = ts.string + ts.array_of(ts.string),
+}, common_schema)
 
+local rw_schema = lutil.table_merge({
+  read_servers = ts.string + ts.array_of(ts.string),
+  write_servers = ts.string + ts.array_of(ts.string),
+}, common_schema)
+
+local servers_schema = lutil.table_merge({
+  servers = ts.string + ts.array_of(ts.string),
+}, common_schema)
+
+local server_schema = lutil.table_merge({
+  server = ts.string + ts.array_of(ts.string),
+}, common_schema)
+
+local enrich_schema = function(external)
+  return ts.one_of {
+    ts.shape(external), -- no specific redis parameters
+    ts.shape(lutil.table_merge(read_schema, external)), -- read_servers specified
+    ts.shape(lutil.table_merge(write_schema, external)), -- write_servers specified
+    ts.shape(lutil.table_merge(rw_schema, external)), -- both read and write servers defined
+    ts.shape(lutil.table_merge(servers_schema, external)), -- just servers for both ops
+    ts.shape(lutil.table_merge(server_schema, external)), -- legacy `server` attribute
+  }
+end
+
+exports.enrich_schema = enrich_schema
 
 local function redis_query_sentinel(ev_base, params, initialised)
   local function flatten_redis_table(tbl)
     local res = {}
-    for i=1,#tbl,2 do
+    for i = 1, #tbl, 2 do
       res[tbl[i]] = tbl[i + 1]
     end
 
@@ -76,12 +98,12 @@ local function redis_query_sentinel(ev_base, params, initialised)
 
       local pending_subrequests = 0
 
-      for _,m in ipairs(result) do
+      for _, m in ipairs(result) do
         local master = flatten_redis_table(m)
 
-        -- Wrap IPv6-adresses in brackets
+        -- Wrap IPv6-addresses in brackets
         if (master.ip:match(":")) then
-          master.ip = "["..master.ip.."]"
+          master.ip = "[" .. master.ip .. "]"
         end
 
         if params.sentinel_masters_pattern then
@@ -101,18 +123,18 @@ local function redis_query_sentinel(ev_base, params, initialised)
       end
 
       -- For each master we need to get a list of slaves
-      for k,v in pairs(masters) do
+      for k, v in pairs(masters) do
         v.slaves = {}
         local function slaves_cb(slave_err, slave_result)
           if not slave_err and type(slave_result) == 'table' then
-            for _,s in ipairs(slave_result) do
+            for _, s in ipairs(slave_result) do
               local slave = flatten_redis_table(s)
               lutil.debugm(N, rspamd_config,
                   'found slave for master %s with ip %s and port %s',
                   v.name, slave.ip, slave.port)
-              -- Wrap IPv6-adresses in brackets
+              -- Wrap IPv6-addresses in brackets
               if (slave.ip:match(":")) then
-                slave.ip = "["..slave.ip.."]"
+                slave.ip = "[" .. slave.ip .. "]"
               end
               v.slaves[#v.slaves + 1] = slave
             end
@@ -130,16 +152,18 @@ local function redis_query_sentinel(ev_base, params, initialised)
           end
         end
 
-        local ret = rspamd_redis.make_request({
+        local ret = rspamd_redis.make_request {
           host = addr:get_addr(),
           timeout = params.timeout,
+          username = params.sentinel_username,
+          password = params.sentinel_password,
           config = rspamd_config,
           ev_base = ev_base,
           cmd = 'SENTINEL',
-          args = {'slaves', k},
+          args = { 'slaves', k },
           no_pool = true,
           callback = slaves_cb
-        })
+        }
 
         if not ret then
           logger.errx(rspamd_config, 'cannot connect sentinel when query slaves at address: %s',
@@ -158,16 +182,18 @@ local function redis_query_sentinel(ev_base, params, initialised)
     end
   end
 
-  local ret = rspamd_redis.make_request({
+  local ret = rspamd_redis.make_request {
     host = addr:get_addr(),
     timeout = params.timeout,
     config = rspamd_config,
     ev_base = ev_base,
+    username = params.sentinel_username,
+    password = params.sentinel_password,
     cmd = 'SENTINEL',
-    args = {'masters'},
+    args = { 'masters' },
     no_pool = true,
     callback = masters_cb,
-  })
+  }
 
   if not ret then
     logger.errx(rspamd_config, 'cannot connect sentinel at address: %s',
@@ -179,7 +205,7 @@ local function redis_query_sentinel(ev_base, params, initialised)
     -- We now form new strings for masters and slaves
     local read_servers_tbl, write_servers_tbl = {}, {}
 
-    for _,master in pairs(masters) do
+    for _, master in pairs(masters) do
       write_servers_tbl[#write_servers_tbl + 1] = string.format(
           '%s:%s', master.ip, master.port
       )
@@ -187,7 +213,7 @@ local function redis_query_sentinel(ev_base, params, initialised)
           '%s:%s', master.ip, master.port
       )
 
-      for _,slave in ipairs(master.slaves) do
+      for _, slave in ipairs(master.slaves) do
         if slave['master-link-status'] == 'ok' then
           read_servers_tbl[#read_servers_tbl + 1] = string.format(
               '%s:%s', slave.ip, slave.port
@@ -276,7 +302,7 @@ local function add_redis_sentinels(params)
 
   rspamd_config:add_on_load(function(_, ev_base, worker)
     local initialised = false
-    if worker:is_scanner() then
+    if worker:is_scanner() or worker:get_type() == 'fuzzy' then
       rspamd_config:add_periodic(ev_base, 0.0, function()
         redis_query_sentinel(ev_base, params, initialised)
         initialised = true
@@ -302,7 +328,7 @@ local function calculate_redis_hash(params)
       h:update(k)
       h:update(tostring(v))
     elseif type(v) == 'table' then
-      for kk,vv in pairs(v) do
+      for kk, vv in pairs(v) do
         rec_hash(kk, vv)
       end
     end
@@ -343,6 +369,9 @@ local function process_redis_opts(options, redis_params)
     elseif options['database'] then
       redis_params['db'] = tostring(options['database'])
     end
+  end
+  if options['username'] and not redis_params['username'] then
+    redis_params['username'] = options['username']
   end
   if options['password'] and not redis_params['password'] then
     redis_params['password'] = options['password']
@@ -408,17 +437,17 @@ local function process_redis_options(options, rspamd_config, result)
   if options['read_servers'] then
     if rspamd_config then
       upstreams_read = upstream_list.create(rspamd_config,
-        options['read_servers'], default_port)
+          options['read_servers'], default_port)
     else
       upstreams_read = upstream_list.create(options['read_servers'],
-        default_port)
+          default_port)
     end
 
     result.read_servers_str = options['read_servers']
   elseif options['servers'] then
     if rspamd_config then
       upstreams_read = upstream_list.create(rspamd_config,
-        options['servers'], default_port)
+          options['servers'], default_port)
     else
       upstreams_read = upstream_list.create(options['servers'], default_port)
     end
@@ -428,7 +457,7 @@ local function process_redis_options(options, rspamd_config, result)
   elseif options['server'] then
     if rspamd_config then
       upstreams_read = upstream_list.create(rspamd_config,
-        options['server'], default_port)
+          options['server'], default_port)
     else
       upstreams_read = upstream_list.create(options['server'], default_port)
     end
@@ -441,10 +470,10 @@ local function process_redis_options(options, rspamd_config, result)
     if options['write_servers'] then
       if rspamd_config then
         upstreams_write = upstream_list.create(rspamd_config,
-                options['write_servers'], default_port)
+            options['write_servers'], default_port)
       else
         upstreams_write = upstream_list.create(options['write_servers'],
-                default_port)
+            default_port)
       end
       result.write_servers_str = options['write_servers']
       read_only = false
@@ -560,12 +589,12 @@ local function rspamd_parse_redis_server(module_name, module_opts, no_fallback)
 
       -- Exclude disabled
       if opts['disabled_modules'] then
-        for _,v in ipairs(opts['disabled_modules']) do
+        for _, v in ipairs(opts['disabled_modules']) do
           if v == module_name then
             logger.infox(rspamd_config, "NOT using default redis server for module %s: it is disabled",
-              module_name)
+                module_name)
 
-              return nil
+            return nil
           end
         end
       end
@@ -579,7 +608,7 @@ local function rspamd_parse_redis_server(module_name, module_opts, no_fallback)
   end
 
   if result.read_servers then
-      return maybe_return_cached(result)
+    return maybe_return_cached(result)
   end
 
   return nil
@@ -612,7 +641,7 @@ local process_cmd = {
   end,
   blpop = function(args)
     local idx_l = {}
-    for i = 1, #args -1 do
+    for i = 1, #args - 1 do
       table.insert(idx_l, i)
     end
     return idx_l
@@ -628,7 +657,7 @@ local process_cmd = {
     return idx_l
   end,
   set = function(args)
-    return {1}
+    return { 1 }
   end,
   mget = function(args)
     local idx_l = {}
@@ -652,9 +681,10 @@ local process_cmd = {
     return idx_l
   end,
   smove = function(args)
-    return {1, 2}
+    return { 1, 2 }
   end,
-  script = function() end
+  script = function()
+  end
 }
 process_cmd.append = process_cmd.set
 process_cmd.auth = process_cmd.script
@@ -828,12 +858,16 @@ local gen_meta = {
   end,
   principal_recipient_domain = function(task)
     local p = task:get_principal_recipient()
-    if not p then return end
+    if not p then
+      return
+    end
     return string.match(p, '.*@(.*)')
   end,
   ip = function(task)
     local i = task:get_ip()
-    if i and i:is_valid() then return i:to_string() end
+    if i and i:is_valid() then
+      return i:to_string()
+    end
   end,
   from = function(task)
     return ((task:get_from('smtp') or E)[1] or E)['addr']
@@ -843,7 +877,9 @@ local gen_meta = {
   end,
   from_domain_or_helo_domain = function(task)
     local d = ((task:get_from('smtp') or E)[1] or E)['domain']
-    if d and #d > 0 then return d end
+    if d and #d > 0 then
+      return d
+    end
     return task:get_helo()
   end,
   mime_from = function(task)
@@ -857,7 +893,9 @@ local gen_meta = {
 local function gen_get_esld(f)
   return function(task)
     local d = f(task)
-    if not d then return end
+    if not d then
+      return
+    end
     return rspamd_util.get_tld(d)
   end
 end
@@ -905,7 +943,7 @@ end
 -- args - table of arguments
 -- extra_opts - table of optional request arguments
 local function rspamd_redis_make_request(task, redis_params, key, is_write,
-    callback, command, args, extra_opts)
+                                         callback, command, args, extra_opts)
   local addr
   local function rspamd_redis_make_request_cb(err, data)
     if err then
@@ -917,8 +955,8 @@ local function rspamd_redis_make_request(task, redis_params, key, is_write,
       callback(err, data, addr)
     end
   end
-  if not task or not redis_params or not callback or not command then
-    return false,nil,nil
+  if not task or not redis_params or not command then
+    return false, nil, nil
   end
 
   local rspamd_redis = require "rspamd_redis"
@@ -960,9 +998,13 @@ local function rspamd_redis_make_request(task, redis_params, key, is_write,
   }
 
   if extra_opts then
-    for k,v in pairs(extra_opts) do
+    for k, v in pairs(extra_opts) do
       options[k] = v
     end
+  end
+
+  if redis_params['username'] then
+    options['username'] = redis_params['username']
   end
 
   if redis_params['password'] then
@@ -977,14 +1019,14 @@ local function rspamd_redis_make_request(task, redis_params, key, is_write,
       ' (host=%s, timeout=%s): cmd: %s', ip_addr,
       options.timeout, options.cmd)
 
-  local ret,conn = rspamd_redis.make_request(options)
+  local ret, conn = rspamd_redis.make_request(options)
 
   if not ret then
     addr:fail()
     logger.warnx(task, "cannot make redis request to: %s", tostring(ip_addr))
   end
 
-  return ret,conn,addr
+  return ret, conn, addr
 end
 
 --[[[
@@ -1003,9 +1045,9 @@ exports.rspamd_redis_make_request = rspamd_redis_make_request
 exports.redis_make_request = rspamd_redis_make_request
 
 local function redis_make_request_taskless(ev_base, cfg, redis_params, key,
-    is_write, callback, command, args, extra_opts)
-  if not ev_base or not redis_params or not callback or not command then
-    return false,nil,nil
+                                           is_write, callback, command, args, extra_opts)
+  if not ev_base or not redis_params or not command then
+    return false, nil, nil
   end
 
   local addr
@@ -1050,11 +1092,14 @@ local function redis_make_request_taskless(ev_base, cfg, redis_params, key,
     args = args
   }
   if extra_opts then
-    for k,v in pairs(extra_opts) do
+    for k, v in pairs(extra_opts) do
       options[k] = v
     end
   end
 
+  if redis_params['username'] then
+    options['username'] = redis_params['username']
+  end
 
   if redis_params['password'] then
     options['password'] = redis_params['password']
@@ -1067,13 +1112,13 @@ local function redis_make_request_taskless(ev_base, cfg, redis_params, key,
   lutil.debugm(N, cfg, 'perform taskless request to redis server' ..
       ' (host=%s, timeout=%s): cmd: %s', options.host:tostring(true),
       options.timeout, options.cmd)
-  local ret,conn = rspamd_redis.make_request(options)
+  local ret, conn = rspamd_redis.make_request(options)
   if not ret then
     logger.errx('cannot execute redis request')
     addr:fail()
   end
 
-  return ret,conn,addr
+  return ret, conn, addr
 end
 
 --[[[
@@ -1094,42 +1139,42 @@ local function script_set_loaded(script)
   end
 
   local wait_table = {}
-  for _,s in ipairs(script.waitq) do
+  for _, s in ipairs(script.waitq) do
     table.insert(wait_table, s)
   end
 
   script.waitq = {}
 
-  for _,s in ipairs(wait_table) do
+  for _, s in ipairs(wait_table) do
     s(script.loaded)
   end
 end
 
 local function prepare_redis_call(script)
-  local function merge_tables(t1, t2)
-    for k,v in pairs(t2) do t1[k] = v end
-  end
-
   local servers = {}
   local options = {}
 
   if script.redis_params.read_servers then
-    merge_tables(servers, script.redis_params.read_servers:all_upstreams())
+    servers = lutil.table_merge(servers, script.redis_params.read_servers:all_upstreams())
   end
   if script.redis_params.write_servers then
-    merge_tables(servers, script.redis_params.write_servers:all_upstreams())
+    servers = lutil.table_merge(servers, script.redis_params.write_servers:all_upstreams())
   end
 
   -- Call load script on each server, set loaded flag
   script.in_flight = #servers
-  for _,s in ipairs(servers) do
+  for _, s in ipairs(servers) do
     local cur_opts = {
       host = s:get_addr(),
       timeout = script.redis_params['timeout'],
       cmd = 'SCRIPT',
-      args = {'LOAD', script.script },
+      args = { 'LOAD', script.script },
       upstream = s
     }
+
+    if script.redis_params['username'] then
+      cur_opts['username'] = script.redis_params['username']
+    end
 
     if script.redis_params['password'] then
       cur_opts['password'] = script.redis_params['password']
@@ -1145,12 +1190,13 @@ local function prepare_redis_call(script)
   return options
 end
 
-local function load_script_task(script, task)
+local function load_script_task(script, task, is_write)
   local rspamd_redis = require "rspamd_redis"
   local opts = prepare_redis_call(script)
 
-  for _,opt in ipairs(opts) do
+  for _, opt in ipairs(opts) do
     opt.task = task
+    opt.is_write = is_write
     opt.callback = function(err, data)
       if err then
         logger.errx(task, 'cannot upload script to %s: %s; registered from: %s:%s',
@@ -1161,9 +1207,9 @@ local function load_script_task(script, task)
       else
         opt.upstream:ok()
         logger.infox(task,
-          "uploaded redis script to %s with id %s, sha: %s",
+            "uploaded redis script to %s %s %s, sha: %s",
             opt.upstream:get_addr():to_string(true),
-            script.id, data)
+            script.filename and "from file" or "with id", script.filename or script.id, data)
         script.sha = data -- We assume that sha is the same on all servers
       end
       script.in_flight = script.in_flight - 1
@@ -1177,7 +1223,7 @@ local function load_script_task(script, task)
 
     if not ret then
       logger.errx('cannot execute redis request to load script on %s',
-        opt.upstream:get_addr())
+          opt.upstream:get_addr())
       script.in_flight = script.in_flight - 1
       opt.upstream:fail()
     end
@@ -1188,25 +1234,28 @@ local function load_script_task(script, task)
   end
 end
 
-local function load_script_taskless(script, cfg, ev_base)
+local function load_script_taskless(script, cfg, ev_base, is_write)
   local rspamd_redis = require "rspamd_redis"
   local opts = prepare_redis_call(script)
 
-  for _,opt in ipairs(opts) do
+  for _, opt in ipairs(opts) do
     opt.config = cfg
     opt.ev_base = ev_base
+    opt.is_write = is_write
     opt.callback = function(err, data)
       if err then
-        logger.errx(cfg, 'cannot upload script to %s: %s; registered from: %s:%s',
+        logger.errx(cfg, 'cannot upload script to %s: %s; registered from: %s:%s, filename: %s',
             opt.upstream:get_addr():to_string(true),
-            err, script.caller.short_src, script.caller.currentline)
+            err, script.caller.short_src, script.caller.currentline, script.filename)
         opt.upstream:fail()
         script.fatal_error = err
       else
         opt.upstream:ok()
         logger.infox(cfg,
-          "uploaded redis script to %s with id %s, sha: %s",
-            opt.upstream:get_addr():to_string(true), script.id, data)
+            "uploaded redis script to %s %s %s, sha: %s",
+            opt.upstream:get_addr():to_string(true),
+            script.filename and "from file" or "with id", script.filename or script.id,
+            data)
         script.sha = data -- We assume that sha is the same on all servers
         script.fatal_error = nil
       end
@@ -1220,7 +1269,7 @@ local function load_script_taskless(script, cfg, ev_base)
 
     if not ret then
       logger.errx('cannot execute redis request to load script on %s',
-        opt.upstream:get_addr())
+          opt.upstream:get_addr())
       script.in_flight = script.in_flight - 1
       opt.upstream:fail()
     end
@@ -1237,8 +1286,11 @@ local function load_redis_script(script, cfg, ev_base, _)
   end
 end
 
-local function add_redis_script(script, redis_params)
-  local caller = debug.getinfo(2)
+local function add_redis_script(script, redis_params, caller_level, maybe_filename)
+  if not caller_level then
+    caller_level = 2
+  end
+  local caller = debug.getinfo(caller_level) or debug.getinfo(caller_level - 1) or E
 
   local new_script = {
     caller = caller,
@@ -1246,7 +1298,8 @@ local function add_redis_script(script, redis_params)
     redis_params = redis_params,
     script = script,
     waitq = {}, -- callbacks pending for script being loaded
-    id = #redis_scripts + 1
+    id = #redis_scripts + 1,
+    filename = maybe_filename,
   }
 
   -- Register on load function
@@ -1269,14 +1322,51 @@ local function add_redis_script(script, redis_params)
 end
 exports.add_redis_script = add_redis_script
 
+-- Loads a Redis script from a file, strips comments, and passes the content to
+-- `add_redis_script` function.
+--
+-- @param filename The name of the file containing the Redis script.
+-- @param redis_params The Redis parameters to use for this script.
+-- @return The ID of the newly added Redis script.
+--
+local function load_redis_script_from_file(filename, redis_params, dir)
+  local lua_util = require "lua_util"
+  local rspamd_logger = require "rspamd_logger"
+
+  if not dir then
+    dir = rspamd_paths.LUALIBDIR
+  end
+  local path = filename
+  if filename:sub(1, 1) ~= package.config:sub(1, 1) then
+    -- Relative path
+    path = lua_util.join_path(dir, "redis_scripts", filename)
+  end
+  -- Read file contents
+  local file = io.open(path, "r")
+  if not file then
+    rspamd_logger.errx("failed to open Redis script file: %s", path)
+    return nil
+  end
+  local script = file:read("*all")
+  if not script then
+    rspamd_logger.errx("failed to load Redis script file: %s", path)
+    return nil
+  end
+  file:close()
+  script = lua_util.strip_lua_comments(script)
+
+  return add_redis_script(script, redis_params, 3, filename)
+end
+
+exports.load_redis_script_from_file = load_redis_script_from_file
+
 local function exec_redis_script(id, params, callback, keys, args)
   local redis_args = {}
 
   if not redis_scripts[id] then
-      logger.errx("cannot find registered script with id %s", id)
+    logger.errx("cannot find registered script with id %s", id)
     return false
   end
-
 
   local script = redis_scripts[id]
 
@@ -1318,7 +1408,7 @@ local function exec_redis_script(id, params, callback, keys, args)
     if #redis_args == 0 then
       table.insert(redis_args, script.sha)
       table.insert(redis_args, tostring(#keys))
-      for _,k in ipairs(keys) do
+      for _, k in ipairs(keys) do
         table.insert(redis_args, k)
       end
 
@@ -1331,13 +1421,13 @@ local function exec_redis_script(id, params, callback, keys, args)
 
     if params.task then
       if not rspamd_redis_make_request(params.task, script.redis_params,
-        params.key, params.is_write, redis_cb, 'EVALSHA', redis_args) then
+          params.key, params.is_write, redis_cb, 'EVALSHA', redis_args) then
         callback('Cannot make redis request', nil)
       end
     else
       if not redis_make_request_taskless(params.ev_base, rspamd_config,
-        script.redis_params,
-        params.key, params.is_write, redis_cb, 'EVALSHA', redis_args) then
+          script.redis_params,
+          params.key, params.is_write, redis_cb, 'EVALSHA', redis_args) then
         callback('Cannot make redis request', nil)
       end
     end
@@ -1358,7 +1448,7 @@ local function exec_redis_script(id, params, callback, keys, args)
           callback('NOSCRIPT', nil)
         end
       end)
-      load_script_task(script, params.task)
+      load_script_task(script, params.task, params.is_write)
     end
   end
 
@@ -1369,7 +1459,7 @@ exports.exec_redis_script = exec_redis_script
 
 local function redis_connect_sync(redis_params, is_write, key, cfg, ev_base)
   if not redis_params then
-    return false,nil
+    return false, nil
   end
 
   local rspamd_redis = require "rspamd_redis"
@@ -1401,46 +1491,69 @@ local function redis_connect_sync(redis_params, is_write, key, cfg, ev_base)
     session = redis_params.session or rspamadm_session
   }
 
-  for k,v in pairs(redis_params) do
+  for k, v in pairs(redis_params) do
     options[k] = v
   end
 
   if not options.config then
     logger.errx('config is not set')
-    return false,nil,addr
+    return false, nil, addr
   end
 
   if not options.ev_base then
     logger.errx('ev_base is not set')
-    return false,nil,addr
+    return false, nil, addr
   end
 
   if not options.session then
     logger.errx('session is not set')
-    return false,nil,addr
+    return false, nil, addr
   end
 
-  local ret,conn = rspamd_redis.connect_sync(options)
+  local ret, conn = rspamd_redis.connect_sync(options)
   if not ret then
-    logger.errx('cannot execute redis request: %s', conn)
+    logger.errx('cannot create redis connection: %s', conn)
     addr:fail()
 
-    return false,nil,addr
+    return false, nil, addr
   end
 
   if conn then
-    if redis_params['password'] then
-      conn:add_cmd('AUTH', {redis_params['password']})
+    local need_exec = false
+    if redis_params['username'] then
+      if redis_params['password'] then
+        conn:add_cmd('AUTH', { redis_params['username'], redis_params['password'] })
+        need_exec = true
+      else
+        logger.warnx('Redis requires a password when username is supplied')
+        return false, nil, addr
+      end
+    elseif redis_params['password'] then
+      conn:add_cmd('AUTH', { redis_params['password'] })
+      need_exec = true
     end
 
     if redis_params['db'] then
-      conn:add_cmd('SELECT', {tostring(redis_params['db'])})
+      conn:add_cmd('SELECT', { tostring(redis_params['db']) })
+      need_exec = true
     elseif redis_params['dbname'] then
-      conn:add_cmd('SELECT', {tostring(redis_params['dbname'])})
+      conn:add_cmd('SELECT', { tostring(redis_params['dbname']) })
+      need_exec = true
+    end
+
+    if need_exec then
+      local exec_ret, res = conn:exec()
+
+      if not exec_ret then
+        logger.errx('cannot prepare redis connection (authentication or db selection failure): %s',
+            res)
+        addr:fail()
+        return false, nil, addr
+      end
     end
   end
 
-  return ret,conn,addr
+  return ret, conn, addr
 end
 
 exports.redis_connect_sync = redis_connect_sync
@@ -1460,12 +1573,12 @@ exports.request = function(redis_params, attrs, req)
 
   if not attrs or not redis_params or not req then
     logger.errx('invalid arguments for redis request')
-    return false,nil,nil
+    return false, nil, nil
   end
 
   if not (attrs.task or (attrs.config and attrs.ev_base)) then
     logger.errx('invalid attributes for redis request')
-    return false,nil,nil
+    return false, nil, nil
   end
 
   local opts = lua_util.shallowcopy(attrs)
@@ -1520,6 +1633,10 @@ exports.request = function(redis_params, attrs, req)
     opts.args = req
   end
 
+  if redis_params.username then
+    opts.username = redis_params.username
+  end
+
   if redis_params.password then
     opts.password = redis_params.password
   end
@@ -1533,16 +1650,16 @@ exports.request = function(redis_params, attrs, req)
       opts.timeout, opts.cmd, opts.args)
 
   if opts.callback then
-    local ret,conn = rspamd_redis.make_request(opts)
+    local ret, conn = rspamd_redis.make_request(opts)
     if not ret then
       logger.errx(log_obj, 'cannot execute redis request')
       addr:fail()
     end
 
-    return ret,conn,addr
+    return ret, conn, addr
   else
     -- Coroutines version
-    local ret,conn = rspamd_redis.connect_sync(opts)
+    local ret, conn = rspamd_redis.connect_sync(opts)
     if not ret then
       logger.errx(log_obj, 'cannot execute redis request')
       addr:fail()
@@ -1550,7 +1667,7 @@ exports.request = function(redis_params, attrs, req)
       conn:add_cmd(opts.cmd, opts.args)
       return conn:exec()
     end
-    return false,nil,addr
+    return false, nil, addr
   end
 end
 
@@ -1567,12 +1684,12 @@ exports.connect = function(redis_params, attrs)
 
   if not attrs or not redis_params then
     logger.errx('invalid arguments for redis connect')
-    return false,nil,nil
+    return false, nil, nil
   end
 
   if not (attrs.task or (attrs.config and attrs.ev_base)) then
     logger.errx('invalid attributes for redis connect')
-    return false,nil,nil
+    return false, nil, nil
   end
 
   local opts = lua_util.shallowcopy(attrs)
@@ -1619,6 +1736,10 @@ exports.connect = function(redis_params, attrs)
   opts.host = addr:get_addr()
   opts.timeout = redis_params.timeout
 
+  if redis_params.username then
+    opts.username = redis_params.username
+  end
+
   if redis_params.password then
     opts.password = redis_params.password
   end
@@ -1628,24 +1749,24 @@ exports.connect = function(redis_params, attrs)
   end
 
   if opts.callback then
-    local ret,conn = rspamd_redis.connect(opts)
+    local ret, conn = rspamd_redis.connect(opts)
     if not ret then
       logger.errx(log_obj, 'cannot execute redis connect')
       addr:fail()
     end
 
-    return ret,conn,addr
+    return ret, conn, addr
   else
     -- Coroutines version
-    local ret,conn = rspamd_redis.connect_sync(opts)
+    local ret, conn = rspamd_redis.connect_sync(opts)
     if not ret then
       logger.errx(log_obj, 'cannot execute redis connect')
       addr:fail()
     else
-      return true,conn,addr
+      return true, conn, addr
     end
 
-    return false,nil,addr
+    return false, nil, addr
   end
 end
 
@@ -1666,7 +1787,7 @@ local function register_prefix(prefix, module, description, optional)
   }
 
   if optional and type(optional) == 'table' then
-    for k,v in pairs(optional) do
+    for k, v in pairs(optional) do
       pr[k] = v
     end
   end
@@ -1686,7 +1807,9 @@ exports.prefixes = function(mname)
   else
     local fun = require "fun"
 
-    return fun.totable(fun.filter(function(_, data) return data.module == mname end,
+    return fun.totable(fun.filter(function(_, data)
+      return data.module == mname
+    end,
         redis_prefixes))
   end
 end

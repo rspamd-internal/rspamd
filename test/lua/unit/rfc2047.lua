@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -44,6 +44,8 @@ context("RFC2047 decoding", function()
       {'v=1; a=rsa-sha256; c=relaxed/relaxed; d=yoni.za.org; s=testdkim1;',
       'v=1; a=rsa-sha256; c=relaxed/relaxed; d=yoni.za.org; s=testdkim1;'},
       {"=?windows-1251?B?xO7q8+zl7fIuc2NyLnV1ZQ==?=", "Документ.scr.uue"},
+      {"=?UTF-8?Q?=20wie=20ist=20es=20Ihnen=20ergangen?.pdf?=", " wie ist es Ihnen ergangen?.pdf"}, -- ? inside
+      {"=?UTF-8?Q?=20wie=20ist=20es=20Ihnen=20ergangen??=", " wie ist es Ihnen ergangen?"}, -- ending ? inside
     }
 
     local pool = ffi.C.rspamd_mempool_new_(4096, "lua", 0, "rfc2047.lua:49")
@@ -52,37 +54,39 @@ context("RFC2047 decoding", function()
       local res = ffi.C.rspamd_mime_header_decode(pool, c[1], #c[1])
       res = ffi.string(res)
       assert_not_nil(res, "cannot decode " .. c[1])
-      assert_equal(res, c[2], res .. " not equal " .. c[2])
+      assert_rspamd_eq({actual = res, expect = c[2]})
 
     end
 
     ffi.C.rspamd_mempool_delete(pool)
   end)
-  test("Fuzz test for rfc2047 tokens", function()
-    local util = require("rspamd_util")
-    local pool = ffi.C.rspamd_mempool_new_(4096, "lua", 0, "rfc2047.lua:63")
-    local str = "Тест Тест Тест Тест Тест"
+  if os.getenv("RSPAMD_LUA_EXPENSIVE_TESTS") then
+    test("Fuzz test for rfc2047 tokens", function()
+      local util = require("rspamd_util")
+      local pool = ffi.C.rspamd_mempool_new_(4096, "lua", 0, "rfc2047.lua:63")
+      local str = "Тест Тест Тест Тест Тест"
 
-    for i = 0,1000 do
-      local r1 = math.random()
-      local r2 = math.random()
-      local sl1 = #str / 2.0 * r1
-      local sl2 = #str / 2.0 * r2
+      for _ = 0,1000 do
+        local r1 = math.random()
+        local r2 = math.random()
+        local sl1 = #str / 2.0 * r1
+        local sl2 = #str / 2.0 * r2
 
-      local s1 = tostring(util.encode_base64(string.sub(str, 1, sl1)))
-      local s2 = tostring(util.encode_base64(string.sub(str, sl1 + 1, sl2)))
-      local s3 = tostring(util.encode_base64(string.sub(str, sl2 + 1)))
+        local s1 = tostring(util.encode_base64(string.sub(str, 1, sl1)))
+        local s2 = tostring(util.encode_base64(string.sub(str, sl1 + 1, sl2)))
+        local s3 = tostring(util.encode_base64(string.sub(str, sl2 + 1)))
 
-      if #s1 > 0 and #s2 > 0 and #s3 > 0 then
-        local s = string.format('=?UTF-8?B?%s?= =?UTF-8?B?%s?= =?UTF-8?B?%s?=',
-          s1, s2, s3)
-        local res = ffi.C.rspamd_mime_header_decode(pool, s, #s)
-        res = ffi.string(res)
-        assert_not_nil(res, "cannot decode " .. s)
-        assert_equal(res, str, res .. " not equal " .. str .. " on " .. tostring(i) .. " iteration")
+        if #s1 > 0 and #s2 > 0 and #s3 > 0 then
+          local s = string.format('=?UTF-8?B?%s?= =?UTF-8?B?%s?= =?UTF-8?B?%s?=',
+              s1, s2, s3)
+          local res = ffi.C.rspamd_mime_header_decode(pool, s, #s)
+          res = ffi.string(res)
+          assert_not_nil(res, "cannot decode " .. s)
+          assert_rspamd_eq({actual = res, expect = str})
+        end
       end
-    end
 
-    ffi.C.rspamd_mempool_delete(pool)
-  end)
+      ffi.C.rspamd_mempool_delete(pool)
+    end)
+  end
 end)

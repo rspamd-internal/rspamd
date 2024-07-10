@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2020, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,14 +21,16 @@ local rspamd_util = require "rspamd_util"
 local rspamd_rsa_privkey = require "rspamd_rsa_privkey"
 local rspamd_rsa = require "rspamd_rsa"
 local fun = require "fun"
-local auth_results = require "lua_auth_results"
+local lua_auth_results = require "lua_auth_results"
 local hash = require "rspamd_cryptobox_hash"
+local lua_mime = require "lua_mime"
 
 if confighelp then
   return
 end
 
 local N = 'arc'
+local AR_TRUSTED_CACHE_KEY = 'arc_trusted_aar'
 
 if not rspamd_plugins.dkim then
   rspamd_logger.errx(rspamd_config, "cannot enable arc plugin: dkim is disabled")
@@ -53,22 +55,6 @@ local arc_symbols = {
   reject = 'ARC_REJECT',
 }
 
-local symbols = {
-  spf_allow_symbol = 'R_SPF_ALLOW',
-  spf_deny_symbol = 'R_SPF_FAIL',
-  spf_softfail_symbol = 'R_SPF_SOFTFAIL',
-  spf_neutral_symbol = 'R_SPF_NEUTRAL',
-  spf_tempfail_symbol = 'R_SPF_DNSFAIL',
-  spf_permfail_symbol = 'R_SPF_PERMFAIL',
-  spf_na_symbol = 'R_SPF_NA',
-
-  dkim_allow_symbol = 'R_DKIM_ALLOW',
-  dkim_deny_symbol = 'R_DKIM_REJECT',
-  dkim_tempfail_symbol = 'R_DKIM_TEMPFAIL',
-  dkim_na_symbol = 'R_DKIM_NA',
-  dkim_permfail_symbol = 'R_DKIM_PERMFAIL',
-}
-
 local settings = {
   allow_envfrom_empty = true,
   allow_hdrfrom_mismatch = false,
@@ -89,35 +75,72 @@ local settings = {
   key_prefix = 'arc_keys', -- default hash name
   reuse_auth_results = false, -- Reuse the existing authentication results
   whitelisted_signers_map = nil, -- Trusted signers domains
+  adjust_dmarc = true, -- Adjust DMARC rejected policy for trusted forwarders
   allowed_ids = nil, -- Allowed settings id
   forbidden_ids = nil, -- Banned settings id
 }
 
 -- To match normal AR
-local ar_settings = auth_results.default_settings
+local ar_settings = lua_auth_results.default_settings
 
-local function parse_arc_header(hdr, target)
+local function parse_arc_header(hdr, target, is_aar)
   -- Split elements by ';' and trim spaces
   local arr = fun.totable(fun.map(
-    function(val)
-      return fun.totable(fun.map(lua_util.rspamd_str_trim,
-        fun.filter(function(v) return v and #v > 0 end,
-          lua_util.rspamd_str_split(val.decoded, ';'))))
-    end, hdr
+      function(val)
+        return fun.totable(fun.map(lua_util.rspamd_str_trim,
+            fun.filter(function(v)
+              return v and #v > 0
+            end,
+                lua_util.rspamd_str_split(val.decoded, ';')
+            )
+        ))
+      end, hdr
   ))
 
+  -- v[1] is the key and v[2] is the value
+  local function fill_arc_header_table(v, t)
+    if v[1] and v[2] then
+      local key = lua_util.rspamd_str_trim(v[1])
+      local value = lua_util.rspamd_str_trim(v[2])
+      t[key] = value
+    end
+  end
+
   -- Now we have two tables in format:
-  -- [sigs] -> [{sig1_elts}, {sig2_elts}...]
-  for i,elts in ipairs(arr) do
-    if not target[i] then target[i] = {} end
-    -- Split by kv pair, like k=v
-    fun.each(function(v)
-      if v[1] and v[2] then
-        target[i][v[1]] = v[2]
+  -- [arc_header] -> [{arc_header1_elts}, {arc_header2_elts}...]
+  for i, elts in ipairs(arr) do
+    if not target[i] then
+      target[i] = {}
+    end
+    if not is_aar then
+      -- For normal ARC headers we split by kv pair, like k=v
+      fun.each(function(v)
+        fill_arc_header_table(v, target[i])
+      end,
+          fun.map(function(elt)
+            return lua_util.rspamd_str_split(elt, '=')
+          end, elts)
+      )
+    else
+      -- For AAR we check special case of i=%d and pass everything else to
+      -- AAR specific parser
+      for _, elt in ipairs(elts) do
+        if string.match(elt, "%s*i%s*=%s*%d+%s*") then
+          local pair = lua_util.rspamd_str_split(elt, '=')
+          fill_arc_header_table(pair, target[i])
+        else
+          -- Normal element
+          local ar_elt = lua_auth_results.parse_ar_element(elt)
+
+          if ar_elt then
+            if not target[i].ar then
+              target[i].ar = {}
+            end
+            table.insert(target[i].ar, ar_elt)
+          end
+        end
       end
-    end, fun.map(function(elt)
-      return lua_util.rspamd_str_split(elt, '=')
-    end, elts))
+    end
     target[i].header = hdr[i].decoded
     target[i].raw_header = hdr[i].value
   end
@@ -130,26 +153,26 @@ end
 
 local function arc_validate_seals(task, seals, sigs, seal_headers, sig_headers)
   local fail_reason
-  for i = 1,#seals do
+  for i = 1, #seals do
     if (sigs[i].i or 0) ~= i then
       fail_reason = string.format('bad i for signature: %d, expected %d; d=%s',
           sigs[i].i, i, sigs[i].d)
       rspamd_logger.infox(task, fail_reason)
       task:insert_result(arc_symbols['invalid'], 1.0, fail_reason)
-      return false,fail_reason
+      return false, fail_reason
     end
     if (seals[i].i or 0) ~= i then
       fail_reason = string.format('bad i for seal: %d, expected %d; d=%s',
           seals[i].i, i, seals[i].d)
       rspamd_logger.infox(task, fail_reason)
-      task:insert_result(arc_symbols['invalid'], 1.0,fail_reason)
-      return false,fail_reason
+      task:insert_result(arc_symbols['invalid'], 1.0, fail_reason)
+      return false, fail_reason
     end
 
     if not seals[i].cv then
       fail_reason = string.format('no cv on i=%d', i)
       task:insert_result(arc_symbols['invalid'], 1.0, fail_reason)
-      return false,fail_reason
+      return false, fail_reason
     end
 
     if i == 1 then
@@ -157,23 +180,24 @@ local function arc_validate_seals(task, seals, sigs, seal_headers, sig_headers)
       if seals[i].cv ~= 'none' then
         fail_reason = 'cv is not "none" for i=1'
         task:insert_result(arc_symbols['invalid'], 1.0, fail_reason)
-        return false,fail_reason
+        return false, fail_reason
       end
     else
       if seals[i].cv ~= 'pass' then
-        fail_reason = string.format('cv is %s on i=%d',  seals[i].cv, i)
+        fail_reason = string.format('cv is %s on i=%d', seals[i].cv, i)
         task:insert_result(arc_symbols['reject'], 1.0, fail_reason)
-        return true,fail_reason
+        return true, fail_reason
       end
     end
   end
 
-  return true,nil
+  return true, nil
 end
 
 local function arc_callback(task)
   local arc_sig_headers = task:get_header_full('ARC-Message-Signature')
   local arc_seal_headers = task:get_header_full('ARC-Seal')
+  local arc_ar_headers = task:get_header_full('ARC-Authentication-Results')
 
   if not arc_sig_headers or not arc_seal_headers then
     task:insert_result(arc_symbols['na'], 1.0)
@@ -191,14 +215,18 @@ local function arc_callback(task)
   local cbdata = {
     seals = {},
     sigs = {},
-    checked = 0,
+    ars = {},
     res = 'success',
     errors = {},
     allowed_by_trusted = false
   }
 
-  parse_arc_header(arc_seal_headers, cbdata.seals)
-  parse_arc_header(arc_sig_headers, cbdata.sigs)
+  parse_arc_header(arc_seal_headers, cbdata.seals, false)
+  parse_arc_header(arc_sig_headers, cbdata.sigs, false)
+
+  if arc_ar_headers then
+    parse_arc_header(arc_ar_headers, cbdata.ars, true)
+  end
 
   -- Fix i type
   fun.each(function(hdr)
@@ -220,7 +248,7 @@ local function arc_callback(task)
   lua_util.debugm(N, task, 'got %s arc sections', #cbdata.seals)
 
   -- Now check sanity of what we have
-  local valid,validation_error = arc_validate_seals(task, cbdata.seals, cbdata.sigs,
+  local valid, validation_error = arc_validate_seals(task, cbdata.seals, cbdata.sigs,
       arc_seal_headers, arc_sig_headers)
   if not valid then
     task:cache_set('arc-failure', validation_error)
@@ -229,17 +257,17 @@ local function arc_callback(task)
 
   task:cache_set('arc-sigs', cbdata.sigs)
   task:cache_set('arc-seals', cbdata.seals)
+  task:cache_set('arc-authres', cbdata.ars)
 
   if validation_error then
     -- ARC rejection but no strong failure for signing
     return
   end
 
-  local function gen_arc_seal_cb(sig)
-    return function (_, res, err, domain)
-      cbdata.checked = cbdata.checked + 1
+  local function gen_arc_seal_cb(index, sig)
+    return function(_, res, err, domain)
       lua_util.debugm(N, task, 'checked arc seal: %s(%s), %s processed',
-          res, err, cbdata.checked)
+          res, err, index)
 
       if not res then
         cbdata.res = 'fail'
@@ -251,15 +279,44 @@ local function arc_callback(task)
       if settings.whitelisted_signers_map and cbdata.res == 'success' then
         if settings.whitelisted_signers_map:get_key(sig.d) then
           -- Whitelisted signer has been found in a valid chain
-          task:insert_result(arc_symbols.trusted_allow, 1.0,
-              string.format('%s:s=%s:i=%d', domain, sig.s, cbdata.checked))
+          local mult = 1.0
+          local cur_aar = cbdata.ars[index]
+          if not cur_aar then
+            rspamd_logger.warnx(task, "cannot find Arc-Authentication-Results for trusted " ..
+                "forwarder %s on i=%s", domain, cbdata.index)
+          else
+            task:cache_set(AR_TRUSTED_CACHE_KEY, cur_aar)
+            local seen_dmarc
+            for _, ar in ipairs(cur_aar.ar) do
+              if ar.dmarc then
+                local dmarc_fwd = ar.dmarc
+                seen_dmarc = true
+                if dmarc_fwd == 'reject' or dmarc_fwd == 'fail' or dmarc_fwd == 'quarantine' then
+                  lua_util.debugm(N, "found rejected dmarc on forwarding")
+                  mult = 0.0
+                elseif dmarc_fwd == 'pass' then
+                  mult = 1.0
+                end
+              elseif ar.spf then
+                local spf_fwd = ar.spf
+                if spf_fwd == 'reject' or spf_fwd == 'fail' or spf_fwd == 'quarantine' then
+                  lua_util.debugm(N, "found rejected spf on forwarding")
+                  if not seen_dmarc then
+                    mult = mult * 0.5
+                  end
+                end
+              end
+            end
+          end
+          task:insert_result(arc_symbols.trusted_allow, mult,
+              string.format('%s:s=%s:i=%d', domain, sig.s, index))
         end
       end
 
-      if cbdata.checked == #arc_sig_headers then
+      if index == #arc_sig_headers then
         if cbdata.res == 'success' then
           local arc_allow_result = string.format('%s:s=%s:i=%d',
-              domain, sig.s, cbdata.checked)
+              domain, sig.s, index)
           task:insert_result(arc_symbols.allow, 1.0, arc_allow_result)
           task:cache_set('arc-allow', arc_allow_result)
         else
@@ -272,8 +329,8 @@ local function arc_callback(task)
   end
 
   local function arc_signature_cb(_, res, err, domain)
-    lua_util.debugm(N, task, 'checked arc signature %s: %s(%s), %s processed',
-      domain, res, err, cbdata.checked)
+    lua_util.debugm(N, task, 'checked arc signature %s: %s(%s)',
+        domain, res, err)
 
     if not res then
       cbdata.res = 'fail'
@@ -283,23 +340,20 @@ local function arc_callback(task)
     end
     if cbdata.res == 'success' then
       -- Verify seals
-      cbdata.checked = 0
-      fun.each(
-        function(sig)
-          local ret, lerr = dkim_verify(task, sig.header, gen_arc_seal_cb(sig), 'arc-seal')
-          if not ret then
-            cbdata.res = 'fail'
-            table.insert(cbdata.errors, string.format('seal:%s:s=%s:i=%s:%s',
-                sig.d or '', sig.s or '', sig.i or '', lerr))
-            cbdata.checked = cbdata.checked + 1
-            lua_util.debugm(N, task, 'checked arc seal %s: %s(%s), %s processed',
-              sig.d, ret, lerr, cbdata.checked)
-          end
-        end, cbdata.seals)
+      for i, sig in ipairs(cbdata.seals) do
+        local ret, lerr = dkim_verify(task, sig.header, gen_arc_seal_cb(i, sig), 'arc-seal')
+        if not ret then
+          cbdata.res = 'fail'
+          table.insert(cbdata.errors, string.format('seal:%s:s=%s:i=%s:%s',
+              sig.d or '', sig.s or '', sig.i or '', lerr))
+          lua_util.debugm(N, task, 'checked arc seal %s: %s(%s), %s processed',
+              sig.d, ret, lerr, i)
+        end
+      end
     else
       task:insert_result(arc_symbols['reject'], 1.0,
-        rspamd_logger.slog('signature check failed: %s, %s', cbdata.res,
-          cbdata.errors))
+          rspamd_logger.slog('signature check failed: %s, %s', cbdata.res,
+              cbdata.errors))
     end
   end
 
@@ -347,21 +401,21 @@ local function arc_callback(task)
 
   local processed = 0
   local sig = cbdata.sigs[#cbdata.sigs] -- last AMS
-  local ret,err = dkim_verify(task, sig.header, arc_signature_cb, 'arc-sign')
+  local ret, err = dkim_verify(task, sig.header, arc_signature_cb, 'arc-sign')
 
   if not ret then
     cbdata.res = 'fail'
     table.insert(cbdata.errors, string.format('sig:%s:%s', sig.d or '', err))
   else
     processed = processed + 1
-    lua_util.debugm(N, task, 'processed arc signature %s[%s]: %s(%s), %s processed',
-      sig.d, sig.i, ret, err, cbdata.checked)
+    lua_util.debugm(N, task, 'processed arc signature %s[%s]: %s(%s), %s total',
+        sig.d, sig.i, ret, err, #cbdata.seals)
   end
 
   if processed == 0 then
     task:insert_result(arc_symbols['reject'], 1.0,
-      rspamd_logger.slog('cannot verify %s of %s signatures: %s',
-        #arc_sig_headers - processed, #arc_sig_headers, cbdata.errors))
+        rspamd_logger.slog('cannot verify %s of %s signatures: %s',
+            #arc_sig_headers - processed, #arc_sig_headers, cbdata.errors))
   end
 end
 
@@ -371,20 +425,25 @@ if not opts or type(opts) ~= 'table' then
 end
 
 if opts['symbols'] then
-  for k,_ in pairs(arc_symbols) do
+  for k, _ in pairs(arc_symbols) do
     if opts['symbols'][k] then
       arc_symbols[k] = opts['symbols'][k]
     end
   end
 end
 
-
 local id = rspamd_config:register_symbol({
-  name = 'ARC_CALLBACK',
+  name = 'ARC_CHECK',
   type = 'callback',
   group = 'policies',
-  groups = {'arc'},
-  callback = arc_callback
+  groups = { 'arc' },
+  callback = arc_callback,
+  augmentations = { lua_util.dns_timeout_augmentation(rspamd_config) },
+})
+rspamd_config:register_symbol({
+  name = 'ARC_CALLBACK', -- compatibility symbol
+  type = 'virtual,skip',
+  parent = id,
 })
 
 rspamd_config:register_symbol({
@@ -393,7 +452,7 @@ rspamd_config:register_symbol({
   type = 'virtual',
   score = -1.0,
   group = 'policies',
-  groups = {'arc'},
+  groups = { 'arc' },
 })
 rspamd_config:register_symbol({
   name = arc_symbols['reject'],
@@ -401,7 +460,7 @@ rspamd_config:register_symbol({
   type = 'virtual',
   score = 2.0,
   group = 'policies',
-  groups = {'arc'},
+  groups = { 'arc' },
 })
 rspamd_config:register_symbol({
   name = arc_symbols['invalid'],
@@ -409,7 +468,7 @@ rspamd_config:register_symbol({
   type = 'virtual',
   score = 1.0,
   group = 'policies',
-  groups = {'arc'},
+  groups = { 'arc' },
 })
 rspamd_config:register_symbol({
   name = arc_symbols['dnsfail'],
@@ -417,7 +476,7 @@ rspamd_config:register_symbol({
   type = 'virtual',
   score = 0.0,
   group = 'policies',
-  groups = {'arc'},
+  groups = { 'arc' },
 })
 rspamd_config:register_symbol({
   name = arc_symbols['na'],
@@ -425,34 +484,16 @@ rspamd_config:register_symbol({
   type = 'virtual',
   score = 0.0,
   group = 'policies',
-  groups = {'arc'},
+  groups = { 'arc' },
 })
 
-if settings.whitelisted_signers_map then
-  local lua_maps = require "lua_maps"
-  settings.whitelisted_signers_map = lua_maps.map_add_from_ucl(settings.whitelisted_signers_map,
-      'set',
-      'ARC trusted signers domains')
-  if settings.whitelisted_signers_map then
-    arc_symbols.trusted_allow = arc_symbols.trusted_allow or 'ARC_ALLOW_TRUSTED'
-    rspamd_config:register_symbol({
-      name = arc_symbols.trusted_allow,
-      parent = id,
-      type = 'virtual',
-      score = -2.0,
-      group = 'policies',
-      groups = {'arc'},
-    })
-  end
-end
-
-rspamd_config:register_dependency('ARC_CALLBACK', symbols['spf_allow_symbol'])
-rspamd_config:register_dependency('ARC_CALLBACK', symbols['dkim_allow_symbol'])
+rspamd_config:register_dependency('ARC_CHECK', 'SPF_CHECK')
+rspamd_config:register_dependency('ARC_CHECK', 'DKIM_CHECK')
 
 local function arc_sign_seal(task, params, header)
   local arc_sigs = task:cache_get('arc-sigs')
   local arc_seals = task:cache_get('arc-seals')
-  local arc_auth_results = task:get_header_full('ARC-Authentication-Results') or {}
+  local arc_auth_results = task:cache_get('arc-authres')
   local cur_auth_results
   local privkey
 
@@ -480,10 +521,10 @@ local function arc_sign_seal(task, params, header)
       cur_auth_results = ar_header
     else
       rspamd_logger.debugm(N, task, 'cannot reuse authentication results, header is missing')
-      cur_auth_results = auth_results.gen_auth_results(task, ar_settings) or ''
+      cur_auth_results = lua_auth_results.gen_auth_results(task, ar_settings) or ''
     end
   else
-    cur_auth_results = auth_results.gen_auth_results(task, ar_settings) or ''
+    cur_auth_results = lua_auth_results.gen_auth_results(task, ar_settings) or ''
   end
 
   local sha_ctx = hash.create_specific('sha256')
@@ -492,16 +533,18 @@ local function arc_sign_seal(task, params, header)
   local cur_idx = 1
   if arc_seals then
     cur_idx = #arc_seals + 1
-    for i = (cur_idx - 1), 1, (-1) do
+    -- We use the cached version per each ARC-* header field individually, already sorted by instance
+    -- value in ascending order
+    for i = 1, #arc_seals, 1 do
       if arc_auth_results[i] then
         local s = dkim_canonicalize('ARC-Authentication-Results',
-          arc_auth_results[i].value)
+            arc_auth_results[i].raw_header)
         sha_ctx:update(s)
         lua_util.debugm(N, task, 'update signature with header: %s', s)
       end
       if arc_sigs[i] then
         local s = dkim_canonicalize('ARC-Message-Signature',
-          arc_sigs[i].raw_header)
+            arc_sigs[i].raw_header)
         sha_ctx:update(s)
         lua_util.debugm(N, task, 'update signature with header: %s', s)
       end
@@ -514,8 +557,8 @@ local function arc_sign_seal(task, params, header)
   end
 
   header = lua_util.fold_header(task,
-    'ARC-Message-Signature',
-    header)
+      'ARC-Message-Signature',
+      header)
 
   cur_auth_results = string.format('i=%d; %s', cur_idx, cur_auth_results)
   cur_auth_results = lua_util.fold_header(task,
@@ -523,7 +566,7 @@ local function arc_sign_seal(task, params, header)
       cur_auth_results, ';')
 
   local s = dkim_canonicalize('ARC-Authentication-Results',
-    cur_auth_results)
+      cur_auth_results)
   sha_ctx:update(s)
   lua_util.debugm(N, task, 'update signature with header: %s', s)
   s = dkim_canonicalize('ARC-Message-Signature', header)
@@ -548,15 +591,17 @@ local function arc_sign_seal(task, params, header)
 
   local sig = rspamd_rsa.sign_memory(privkey, sha_ctx:bin())
   cur_arc_seal = string.format('%s%s', cur_arc_seal,
-    sig:base64(70, nl_type))
+      sig:base64(70, nl_type))
 
-  task:set_milter_reply({
-    add_headers = {
-      ['ARC-Authentication-Results'] = {order = 1, value = cur_auth_results},
-      ['ARC-Message-Signature'] = {order = 1, value = header},
-      ['ARC-Seal'] = {order = 1, value = lua_util.fold_header(task,
-        'ARC-Seal', cur_arc_seal) }
-    }
+  lua_mime.modify_headers(task, {
+    add = {
+      ['ARC-Authentication-Results'] = { order = 1, value = cur_auth_results },
+      ['ARC-Message-Signature'] = { order = 1, value = header },
+      ['ARC-Seal'] = { order = 1, value = lua_util.fold_header(task,
+          'ARC-Seal', cur_arc_seal) }
+    },
+    -- RFC requires a strict order for these headers to be inserted
+    order = { 'ARC-Authentication-Results', 'ARC-Message-Signature', 'ARC-Seal' },
   })
   task:insert_result(settings.sign_symbol, 1.0,
       string.format('%s:s=%s:i=%d', params.domain, params.selector, cur_idx))
@@ -691,7 +736,7 @@ local function arc_signing_cb(task)
             selector = cur_selector.selector
           })
 
-          local exists,err = rspamd_util.file_exists(cur_selector.key)
+          local exists, err = rspamd_util.file_exists(cur_selector.key)
           if not exists then
             if err and err == 'No such file or directory' then
               lua_util.debugm(N, task, 'cannot read key from %s: %s', cur_selector.key, err)
@@ -733,7 +778,7 @@ if settings.use_redis then
   redis_params = rspamd_parse_redis_server('arc')
 
   if not redis_params then
-    rspamd_logger.errx(rspamd_config, 'no servers are specified, '..
+    rspamd_logger.errx(rspamd_config, 'no servers are specified, ' ..
         'but module is configured to load keys from redis, disable arc signing')
     return
   end
@@ -744,7 +789,8 @@ end
 local sym_reg_tbl = {
   name = settings['sign_symbol'],
   callback = arc_signing_cb,
-  groups = {"policies", "arc"},
+  groups = { "policies", "arc" },
+  flags = 'ignore_passthrough',
   score = 0.0,
 }
 if type(settings.allowed_ids) == 'table' then
@@ -754,7 +800,54 @@ if type(settings.forbidden_ids) == 'table' then
   sym_reg_tbl.forbidden_ids = settings.forbidden_ids
 end
 
+if settings.whitelisted_signers_map then
+  arc_symbols.trusted_allow = arc_symbols.trusted_allow or 'ARC_ALLOW_TRUSTED'
+  rspamd_config:register_symbol({
+    name = arc_symbols.trusted_allow,
+    parent = id,
+    type = 'virtual',
+    score = -2.0,
+    group = 'policies',
+    groups = { 'arc' },
+  })
+end
+
 rspamd_config:register_symbol(sym_reg_tbl)
 
 -- Do not sign unless checked
-rspamd_config:register_dependency(settings['sign_symbol'], 'ARC_CALLBACK')
+rspamd_config:register_dependency(settings['sign_symbol'], 'ARC_CHECK')
+-- We need to check dmarc before signing as we have to produce valid AAR header
+-- see #3613
+rspamd_config:register_dependency(settings['sign_symbol'], 'DMARC_CHECK')
+
+if settings.adjust_dmarc and settings.whitelisted_signers_map then
+  local function arc_dmarc_adjust_cb(task)
+    local trusted_arc_ar = task:cache_get(AR_TRUSTED_CACHE_KEY)
+    local sym_to_adjust
+    if task:has_symbol(ar_settings.dmarc_symbols.reject) then
+      sym_to_adjust = ar_settings.dmarc_symbols.reject
+    elseif task:has_symbol(ar_settings.dmarc_symbols.quarantine) then
+      sym_to_adjust = ar_settings.dmarc_symbols.quarantine
+    end
+    if sym_to_adjust and trusted_arc_ar and trusted_arc_ar.ar then
+      for _, ar in ipairs(trusted_arc_ar.ar) do
+        if ar.dmarc then
+          local dmarc_fwd = ar.dmarc
+          if dmarc_fwd == 'pass' then
+            rspamd_logger.infox(task, "adjust dmarc reject score as trusted forwarder "
+                .. "proved DMARC validity for %s", ar['header.from'])
+            task:adjust_result(sym_to_adjust, 0.1,
+                'ARC trusted')
+          end
+        end
+      end
+    end
+  end
+  rspamd_config:register_symbol({
+    name = 'ARC_DMARC_ADJUSTMENT',
+    callback = arc_dmarc_adjust_cb,
+    type = 'callback',
+  })
+  rspamd_config:register_dependency('ARC_DMARC_ADJUSTMENT', 'DMARC_CHECK')
+  rspamd_config:register_dependency('ARC_DMARC_ADJUSTMENT', 'ARC_CHECK')
+end

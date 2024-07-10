@@ -3,7 +3,13 @@ local rspamd_regexp = require 'rspamd_regexp'
 local util = require 'rspamd_util'
 
 reconf['HAS_PHPMAILER_SIG'] = {
-  re = "X-Mailer=/^PHPMailer/Hi || Content-Type=/boundary=\"b[123]_/Hi",
+  -- PHPMailer 6.0.0 and older used hex hash in boundary:
+  -- boundary="b1_2a45d5e29f78d3408e318878b049f474"
+  -- Since 6.0.1 it uses base64 (without =+/):
+  -- boundary="b1_uBN0UPD3n6RU04VPxI54tENiDgaCGoh15l9s73oFnlM"
+  -- boundary="b1_Ez5tmpb4bSqknyUZ1B1hIvLAfR1MlspDEKGioCOXc"
+  -- https://github.com/PHPMailer/PHPMailer/blob/v6.4.0/src/PHPMailer.php#L2660
+  re = [[X-Mailer=/^PHPMailer /H || Content-Type=/boundary="b1_[0-9a-zA-Z]+"/H]],
   description = "PHPMailer signature",
   group = "compromised_hosts"
 }
@@ -38,10 +44,12 @@ reconf['HAS_X_SOURCE'] = {
 
 -- X-Authenticated-Sender: accord.host-care.com: sales@cortaflex.si
 rspamd_config.HAS_X_AS = {
-  callback = function (task)
+  callback = function(task)
     local xas = task:get_header('X-Authenticated-Sender')
-    if not xas then return false end
-    local _,_,auth = xas:find('[^:]+:%s(.+)$')
+    if not xas then
+      return false
+    end
+    local _, _, auth = xas:find('[^:]+:%s(.+)$')
     if auth then
       -- TODO: see if we can parse an e-mail address from auth
       --       and see if it matches the from address or not
@@ -57,10 +65,12 @@ rspamd_config.HAS_X_AS = {
 
 -- X-Get-Message-Sender-Via: accord.host-care.com: authenticated_id: sales@cortaflex.si
 rspamd_config.HAS_X_GMSV = {
-  callback = function (task)
+  callback = function(task)
     local xgmsv = task:get_header('X-Get-Message-Sender-Via')
-    if not xgmsv then return false end
-    local _,_,auth = xgmsv:find('authenticated_id: (.+)$')
+    if not xgmsv then
+      return false
+    end
+    local _, _, auth = xgmsv:find('authenticated_id: (.+)$')
     if auth then
       -- TODO: see if we can parse an e-mail address from auth
       --       and see if it matches the from address or not.
@@ -86,7 +96,7 @@ reconf['HAS_X_ANTIABUSE'] = {
 }
 
 reconf['X_PHP_EVAL'] = {
-  re = "X-PHP-Script=/eval\\(\\)\\'d/Hi || X-PHP-Originating-Script=/eval\\(\\)\\'d/Hi",
+  re = [[X-PHP-Script=/eval\(\)'d code/H || X-PHP-Originating-Script=/eval\(\)'d code/H]],
   description = "Message sent using eval'd PHP",
   score = 4.0,
   group = "compromised_hosts"
@@ -140,21 +150,21 @@ reconf['HIDDEN_SOURCE_OBJ'] = {
   group = "compromised_hosts"
 }
 
-local hidden_uri_re = rspamd_regexp.create_cached('/(?!\\/\\.well[-_]known\\/)(?:^\\.[A-Za-z0-9]|\\/'..
+local hidden_uri_re = rspamd_regexp.create_cached('/(?!\\/\\.well[-_]known\\/)(?:^\\.[A-Za-z0-9]|\\/' ..
     '\\.[A-Za-z0-9]|\\/\\.\\.\\/)/i')
 rspamd_config.URI_HIDDEN_PATH = {
-  callback = function (task)
+  callback = function(task)
     local urls = task:get_urls(false)
     if (urls) then
-        for _, url in ipairs(urls) do
-            if (not (url:is_subject() and url:is_html_displayed())) then
-                local path = url:get_path()
-                if (hidden_uri_re:match(path)) then
-                    -- TODO: need url:is_schemeless() to improve this
-                    return true, 1.0, url:get_text()
-                end
-            end
+      for _, url in ipairs(urls) do
+        if (not (url:is_subject() and url:is_html_displayed())) then
+          local path = url:get_path()
+          if (hidden_uri_re:match(path)) then
+            -- TODO: need url:is_schemeless() to improve this
+            return true, 1.0, url:get_text()
+          end
         end
+      end
     end
   end,
   description = 'Message contains URI with a hidden path',
@@ -170,19 +180,23 @@ reconf['MID_RHS_WWW'] = {
 }
 
 rspamd_config.FROM_SERVICE_ACCT = {
-  callback = function (task)
+  callback = function(task)
     local re = rspamd_regexp.create_cached('/^(?:www-data|anonymous|ftp|apache|nobody|guest|nginx|web|www)@/i');
     -- From
     local from = task:get_from(2)
     if (from and from[1]) then
-      if (re:match(from[1].addr)) then return true end
+      if (re:match(from[1].addr)) then
+        return true
+      end
     end
     -- Sender
     local sender = task:get_header('Sender')
     if sender then
       local s = util.parse_mail_address(sender, task:get_mempool())
       if (s and s[1]) then
-        if (re:match(s[1].addr)) then return true end
+        if (re:match(s[1].addr)) then
+          return true
+        end
       end
     end
     -- Reply-To
@@ -190,7 +204,9 @@ rspamd_config.FROM_SERVICE_ACCT = {
     if replyto then
       local rt = util.parse_mail_address(replyto, task:get_mempool())
       if (rt and rt[1]) then
-        if (re:match(rt[1].addr)) then return true end
+        if (re:match(rt[1].addr)) then
+          return true
+        end
       end
     end
   end,
@@ -205,4 +221,3 @@ reconf['WWW_DOT_DOMAIN'] = {
   score = 0.5,
   group = "compromised_hosts"
 }
-

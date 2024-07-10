@@ -1,6 +1,6 @@
 --[[
 Copyright (c) 2016, Andrew Lewis <nerf@judo.za.org>
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,9 +26,11 @@ local lua_util = require "lua_util"
 local rspamd_http = require "rspamd_http"
 local rspamd_util = require "rspamd_util"
 local rspamd_logger = require "rspamd_logger"
+local rspamd_tcp = require "rspamd_tcp"
 local ucl = require "ucl"
 local E = {}
 local N = 'metadata_exporter'
+local HOSTNAME = rspamd_util.get_hostname()
 
 local settings = {
   pusher_enabled = {},
@@ -74,10 +76,30 @@ local function get_general_metadata(task, flatten, no_content)
   r.user = task:get_user() or 'unknown'
   r.qid = task:get_queue_id() or 'unknown'
   r.subject = task:get_subject() or 'unknown'
-  r.action = task:get_metric_action('default')
+  r.action = task:get_metric_action()
+  r.rspamd_server = HOSTNAME
 
-  local s = task:get_metric_score('default')[1]
+  local s = task:get_metric_score()[1]
   r.score = flatten and string.format('%.2f', s) or s
+
+  local fuzzy = task:get_mempool():get_variable("fuzzy_hashes", "fstrings")
+  if fuzzy and #fuzzy > 0 then
+    local fz = {}
+    for _, h in ipairs(fuzzy) do
+      table.insert(fz, h)
+    end
+    if not flatten then
+      r.fuzzy = fz
+    else
+      r.fuzzy = table.concat(fz, ', ')
+    end
+  else
+    if not flatten then
+      r.fuzzy = {}
+    else
+      r.fuzzy = ''
+    end
+  end
 
   local rcpt = task:get_recipients('smtp')
   if rcpt then
@@ -132,6 +154,20 @@ local function get_general_metadata(task, flatten, no_content)
       return 'unknown'
     end
   end
+
+  local scan_real = task:get_scan_time()
+  scan_real = math.floor(scan_real * 1000)
+  if scan_real < 0 then
+    rspamd_logger.messagex(task,
+        'clock skew detected for message: %s ms real sca time (reset to 0)',
+        scan_real)
+    scan_real = 0
+  end
+
+  r.scan_time = scan_real
+  local content = task:get_content()
+  r.size = content and content:len() or 0
+
   if not no_content then
     r.header_from = process_header('from')
     r.header_to = process_header('to')
@@ -158,7 +194,7 @@ local formatters = {
     else
       for _, e in ipairs(mail_rcpt) do
         table.insert(display_emails, string.format('<%s>', e))
-        table.insert(mail_targets, mail_rcpt)
+        table.insert(mail_targets, e)
       end
     end
     if rule.email_alert_sender then
@@ -189,7 +225,7 @@ local formatters = {
     meta.mail_to = table.concat(display_emails, ', ')
     meta.our_message_id = rspamd_util.random_hex(12) .. '@rspamd'
     meta.date = rspamd_util.time_to_string(rspamd_util.get_time())
-    return lua_util.template(rule.email_template or settings.email_template, meta), { mail_targets = mail_targets}
+    return lua_util.template(rule.email_template or settings.email_template, meta), { mail_targets = mail_targets }
   end,
   json = function(task)
     return ucl.to_format(get_general_metadata(task), 'json-compact')
@@ -205,26 +241,30 @@ local selectors = {
     return true
   end,
   is_spam = function(task)
-    local action = task:get_metric_action('default')
+    local action = task:get_metric_action()
     return is_spam(action)
   end,
   is_spam_authed = function(task)
     if not task:get_user() then
       return false
     end
-    local action = task:get_metric_action('default')
+    local action = task:get_metric_action()
     return is_spam(action)
   end,
   is_reject = function(task)
-    local action = task:get_metric_action('default')
+    local action = task:get_metric_action()
     return (action == 'reject')
   end,
   is_reject_authed = function(task)
     if not task:get_user() then
       return false
     end
-    local action = task:get_metric_action('default')
+    local action = task:get_metric_action()
     return (action == 'reject')
+  end,
+  is_not_soft_reject = function(task)
+    local action = task:get_metric_action()
+    return (action ~= 'soft reject')
   end,
 }
 
@@ -237,7 +277,7 @@ end
 
 local pushers = {
   redis_pubsub = function(task, formatted, rule)
-    local _,ret,upstream
+    local _, ret, upstream
     local function redis_pub_cb(err)
       if err then
         rspamd_logger.errx(task, 'got error %s when publishing on server %s',
@@ -246,13 +286,13 @@ local pushers = {
       end
       return true
     end
-    ret,_,upstream = rspamd_redis_make_request(task,
-      redis_params, -- connect params
-      nil, -- hash key
-      true, -- is write
-      redis_pub_cb, --callback
-      'PUBLISH', -- command
-      {rule.channel, formatted} -- arguments
+    ret, _, upstream = rspamd_redis_make_request(task,
+        redis_params, -- connect params
+        nil, -- hash key
+        true, -- is write
+        redis_pub_cb, --callback
+        'PUBLISH', -- command
+        { rule.channel, formatted } -- arguments
     )
     if not ret then
       rspamd_logger.errx(task, 'error connecting to redis')
@@ -261,15 +301,19 @@ local pushers = {
   end,
   http = function(task, formatted, rule)
     local function http_callback(err, code)
+      local valid_status = { 200, 201, 202, 204 }
+
       if err then
         rspamd_logger.errx(task, 'got error %s in http callback', err)
         return maybe_defer(task, rule)
       end
-      if code ~= 200 then
-        rspamd_logger.errx(task, 'got unexpected http status: %s', code)
-        return maybe_defer(task, rule)
+      for _, v in ipairs(valid_status) do
+        if v == code then
+          return true
+        end
       end
-      return true
+      rspamd_logger.errx(task, 'got unexpected http status: %s', code)
+      return maybe_defer(task, rule)
     end
     local hdrs = {}
     if rule.meta_headers then
@@ -279,17 +323,20 @@ local pushers = {
         if type(v) == 'table' then
           hdrs[pfx .. k] = ucl.to_format(v, 'json-compact')
         else
-          hdrs[pfx .. k] = v
+          hdrs[pfx .. k] = rspamd_util.mime_header_encode(v)
         end
       end
     end
+
     rspamd_http.request({
-      task=task,
-      url=rule.url,
-      body=formatted,
-      callback=http_callback,
-      mime_type=rule.mime_type or settings.mime_type,
-      headers=hdrs,
+      task = task,
+      url = rule.url,
+      user = rule.user,
+      password = rule.password,
+      body = formatted,
+      callback = http_callback,
+      mime_type = rule.mime_type or settings.mime_type,
+      headers = hdrs,
     })
   end,
   send_mail = function(task, formatted, rule, extra)
@@ -311,10 +358,29 @@ local pushers = {
       timeout = rule.timeout or settings.timeout,
     }, formatted, sendmail_cb)
   end,
+  json_raw_tcp = function(task, formatted, rule)
+    local function json_raw_tcp_callback(err, code)
+      if err then
+        rspamd_logger.errx(task, 'got error %s in json_raw_tcp callback', err)
+        return maybe_defer(task, rule)
+      end
+      return true
+    end
+    rspamd_tcp.request({
+      task = task,
+      host = rule.host,
+      port = rule.port,
+      data = formatted,
+      callback = json_raw_tcp_callback,
+      read = false,
+    })
+  end,
 }
 
 local opts = rspamd_config:get_all_opt(N)
-if not opts then return end
+if not opts then
+  return
+end
 local process_settings = {
   select = function(val)
     selectors.custom = assert(load(val))()
@@ -447,6 +513,7 @@ if type(settings.rules) ~= 'table' then
       r.defer = settings.defer
       r.selector = settings.pusher_select.redis_pubsub
       r.formatter = settings.pusher_format.redis_pubsub
+      r.timeout = redis_params.timeout
       settings.rules[r.backend:upper()] = r
     end
   end
@@ -462,6 +529,7 @@ if type(settings.rules) ~= 'table' then
       r.defer = settings.defer
       r.selector = settings.pusher_select.http
       r.formatter = settings.pusher_format.http
+      r.timeout = settings.timeout or 0.0
       settings.rules[r.backend:upper()] = r
     end
   end
@@ -479,8 +547,24 @@ if type(settings.rules) ~= 'table' then
       r.smtp_port = settings.smtp_port
       r.email_template = settings.email_template
       r.defer = settings.defer
+      r.timeout = settings.timeout or 0.0
       r.selector = settings.pusher_select.send_mail
       r.formatter = settings.pusher_format.send_mail
+      settings.rules[r.backend:upper()] = r
+    end
+  end
+  if settings.pusher_enabled.json_raw_tcp then
+    if not (settings.host and settings.port) then
+      rspamd_logger.errx(rspamd_config, 'No host and/or port is specified')
+      settings.pusher_enabled.json_raw_tcp = nil
+    else
+      local r = {}
+      r.backend = 'json_raw_tcp'
+      r.host = settings.host
+      r.port = settings.port
+      r.defer = settings.defer
+      r.selector = settings.pusher_select.json_raw_tcp
+      r.formatter = settings.pusher_format.json_raw_tcp
       settings.rules[r.backend:upper()] = r
     end
   end
@@ -506,6 +590,10 @@ local backend_required_elements = {
   },
   redis_pubsub = {
     'channel',
+  },
+  json_raw_tcp = {
+    'host',
+    'port',
   },
 }
 local check_element = {
@@ -556,6 +644,7 @@ backend_check.redis_pubsub = function(k, rule)
     settings.rules[k] = nil
   else
     backend_check.default(k, rule)
+    rule.timeout = redis_params.timeout
   end
 end
 setmetatable(backend_check, {
@@ -583,8 +672,10 @@ for k, v in pairs(settings.rules) do
 end
 
 local function gen_exporter(rule)
-  return function (task)
-    if task:has_flag('skip') then return end
+  return function(task)
+    if task:has_flag('skip') then
+      return
+    end
     local selector = rule.selector or 'default'
     local selected = selectors[selector](task)
     if selected then
@@ -611,7 +702,7 @@ for k, r in pairs(settings.rules) do
     name = 'EXPORT_METADATA_' .. k,
     type = 'idempotent',
     callback = gen_exporter(r),
-    priority = 10,
     flags = 'empty,explicit_disable,ignore_passthrough',
+    augmentations = { string.format("timeout=%f", r.timeout or 0.0) }
   })
 end

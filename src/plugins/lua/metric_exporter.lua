@@ -1,6 +1,6 @@
 --[[
 Copyright (c) 2016, Andrew Lewis <nerf@judo.za.org>
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -132,7 +132,7 @@ local function graphite_push(kwargs)
     data = {
       metrics_str, '\n',
     },
-    callback = (function (err)
+    callback = (function(err)
       if err then
         logger.errx('Push failed: %1', err)
         return
@@ -171,12 +171,14 @@ if not configure_metric_exporter() then
   return
 end
 
-rspamd_config:add_on_load(function (_, ev_base, worker)
+rspamd_config:add_on_load(function(_, ev_base, worker)
   -- Exit unless we're the first 'controller' worker
-  if not worker:is_primary_controller() then return end
+  if not worker:is_primary_controller() then
+    return
+  end
   -- Persist mempool variable to statefile on shutdown
   pool = mempool.create()
-  rspamd_config:register_finish_script(function ()
+  rspamd_config:register_finish_script(function()
     local stamp = pool:get_variable(VAR_NAME, 'double')
     if not stamp then
       logger.warn('No last metric exporter push to persist to disk')
@@ -207,14 +209,14 @@ rspamd_config:add_on_load(function (_, ev_base, worker)
   end
   -- Push metrics at regular intervals
   local function schedule_regular_push()
-    rspamd_config:add_periodic(ev_base, settings['interval'], function ()
+    rspamd_config:add_periodic(ev_base, settings['interval'], function()
       push_metrics()
       return true
     end)
   end
   -- Push metrics to backend and reschedule check
   local function schedule_intermediate_push(when)
-    rspamd_config:add_periodic(ev_base, when, function ()
+    rspamd_config:add_periodic(ev_base, when, function()
       push_metrics()
       schedule_regular_push()
       return false

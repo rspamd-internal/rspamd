@@ -61,7 +61,7 @@ reconf['R_NO_SPACE_IN_FROM'] = {
   re = 'From=/\\S<[-\\w\\.]+\\@[-\\w\\.]+>/X',
   score = 1.0,
   mime_only = true,
-  description = 'No space in from header',
+  description = 'No space in From header',
   group = 'headers'
 }
 
@@ -106,21 +106,30 @@ reconf['MISSING_TO'] = {
 }
 
 -- Detects undisclosed recipients
-local undisc_rcpt = 'To=/^<?undisclosed[- ]recipient/Hi'
 reconf['R_UNDISC_RCPT'] = {
-  re = string.format('(%s)', undisc_rcpt),
+  -- match:
+  -- To: undisclosed-recipients:;
+  -- To: Undisclosed recipients:;
+  -- To: undisclosed-recipients: ;
+  -- To: <Undisclosed-Recipient:;>
+  -- To: <"Undisclosed-Recipient:;">
+  -- To: "undisclosed-recipients (utajeni adresati)": ;
+  -- To: Undisclosed recipients:
+  -- but do not match:
+  -- Undisclosed Recipient <user@example.org>
+  re = [[To=/^<?"?undisclosed[- ]recipients?\b.*:/i{header}]],
   score = 3.0,
   description = 'Recipients are absent or undisclosed',
   group = 'headers',
   mime_only = true,
 }
 
--- Detects missing Message-Id
+-- Detects missing Message-ID
 local has_mid = 'header_exists(Message-Id)'
 reconf['MISSING_MID'] = {
   re = '!header_exists(Message-Id)',
   score = 2.5,
-  description = 'Message id is missing',
+  description = 'Message-ID header is missing',
   group = 'headers',
   mime_only = true,
 }
@@ -138,18 +147,9 @@ reconf['R_RCVD_SPAMBOTS'] = {
 -- Charset is missing in message
 reconf['R_MISSING_CHARSET'] = {
   re = string.format('!is_empty_body() & content_type_is_type(text) & content_type_is_subtype(plain) & !content_type_has_param(charset) & !%s',
-    'compare_transfer_encoding(7bit)'),
-  score = 2.5,
-  description = 'Charset is missing in a message',
-  group = 'headers',
-  mime_only = true,
-}
-
--- Subject seems to be spam
-reconf['R_SAJDING'] = {
-  re = 'Subject=/\\bsajding(?:om|a)?\\b/iH',
-  score = 8.0,
-  description = 'Subject seems to be spam',
+      'compare_transfer_encoding(7bit)'),
+  score = 0.5,
+  description = 'Charset header is missing',
   group = 'headers',
   mime_only = true,
 }
@@ -163,7 +163,7 @@ local any_outlook_mua = 'X-Mailer=/^Microsoft Outlook\\b/H'
 reconf['FORGED_OUTLOOK_HTML'] = {
   re = string.format('!%s & %s & %s', yahoo_bulk, outlook_mua, 'has_only_html_part()'),
   score = 5.0,
-  description = 'Forged outlook HTML signature',
+  description = 'Forged Outlook HTML signature',
   group = 'headers',
   mime_only = true,
 }
@@ -201,7 +201,7 @@ local from_needs_mime = 'From=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]/Hr'
 reconf['FROM_EXCESS_BASE64'] = {
   re = string.format('%s & !%s', from_encoded_b64, from_needs_mime),
   score = 1.5,
-  description = 'From that contains encoded characters while base 64 is not needed as all symbols are 7bit',
+  description = 'From header is unnecessarily encoded in base64',
   group = 'excessb64',
   mime_only = true,
 }
@@ -210,7 +210,7 @@ reconf['FROM_EXCESS_BASE64'] = {
 reconf['FROM_EXCESS_QP'] = {
   re = string.format('%s & !%s', from_encoded_qp, from_needs_mime),
   score = 1.2,
-  description = 'From that contains encoded characters while quoted-printable is not needed as all symbols are 7bit',
+  description = 'From header is unnecessarily encoded in quoted-printable',
   group = 'excessqp'
 }
 
@@ -220,7 +220,7 @@ local to_needs_mime = 'To=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]/Hr'
 reconf['TO_EXCESS_BASE64'] = {
   re = string.format('%s & !%s', to_encoded_b64, to_needs_mime),
   score = 1.5,
-  description = 'To that contains encoded characters while base 64 is not needed as all symbols are 7bit',
+  description = 'To header is unnecessarily encoded in base64',
   group = 'excessb64'
 }
 
@@ -229,7 +229,7 @@ reconf['TO_EXCESS_BASE64'] = {
 reconf['TO_EXCESS_QP'] = {
   re = string.format('%s & !%s', to_encoded_qp, to_needs_mime),
   score = 1.2,
-  description = 'To that contains encoded characters while quoted-printable is not needed as all symbols are 7bit',
+  description = 'To header is unnecessarily encoded in quoted-printable',
   group = 'excessqp'
 }
 
@@ -242,7 +242,7 @@ local replyto_needs_mime = 'Reply-To=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\x
 reconf['REPLYTO_EXCESS_BASE64'] = {
   re = string.format('%s & !%s', replyto_encoded_b64, replyto_needs_mime),
   score = 1.5,
-  description = 'Reply-To that contains encoded characters while base 64 is not needed as all symbols are 7bit',
+  description = 'Reply-To header is unnecessarily encoded in base64',
   group = 'excessb64'
 }
 
@@ -253,7 +253,7 @@ local replyto_encoded_qp = 'Reply-To=/\\=\\?\\S+\\?Q\\?/iX'
 reconf['REPLYTO_EXCESS_QP'] = {
   re = string.format('%s & !%s', replyto_encoded_qp, replyto_needs_mime),
   score = 1.2,
-  description = 'Reply-To that contains encoded characters while quoted-printable is not needed as all symbols are 7bit',
+  description = 'Reply-To header is unnecessarily encoded in quoted-printable',
   group = 'excessqp'
 }
 
@@ -266,7 +266,7 @@ local cc_needs_mime = 'Cc=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]/Hr'
 reconf['CC_EXCESS_BASE64'] = {
   re = string.format('%s & !%s', cc_encoded_b64, cc_needs_mime),
   score = 1.5,
-  description = 'Cc that contains encoded characters while base 64 is not needed as all symbols are 7bit',
+  description = 'Cc header is unnecessarily encoded in base64',
   group = 'excessb64'
 }
 
@@ -277,7 +277,7 @@ local cc_encoded_qp = 'Cc=/\\=\\?\\S+\\?Q\\?/iX'
 reconf['CC_EXCESS_QP'] = {
   re = string.format('%s & !%s', cc_encoded_qp, cc_needs_mime),
   score = 1.2,
-  description = 'Cc that contains encoded characters while quoted-printable is not needed as all symbols are 7bit',
+  description = 'Cc header is unnecessarily encoded in quoted-printable',
   group = 'excessqp'
 }
 
@@ -286,7 +286,7 @@ local subj_needs_mime = 'Subject=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]/
 reconf['SUBJ_EXCESS_BASE64'] = {
   re = string.format('%s & !%s', subj_encoded_b64, subj_needs_mime),
   score = 1.5,
-  description = 'Subject is unnecessarily encoded in base64',
+  description = 'Subject header is unnecessarily encoded in base64',
   group = 'excessb64'
 }
 
@@ -294,7 +294,7 @@ local subj_encoded_qp = 'Subject=/\\=\\?\\S+\\?Q\\?/iX'
 reconf['SUBJ_EXCESS_QP'] = {
   re = string.format('%s & !%s', subj_encoded_qp, subj_needs_mime),
   score = 1.2,
-  description = 'Subject is unnecessarily encoded in quoted-printable',
+  description = 'Subject header is unnecessarily encoded in quoted-printable',
   group = 'excessqp'
 }
 
@@ -319,7 +319,8 @@ local sympatico_msgid = 'Message-Id=/^<?BAYC\\d+-PASMTP\\d+[A-Z0-9]{25}\\@CEZ\\.
 local mailman_msgid = [[Message-ID=/^<mailman\.\d+\.\d+\.\d+\.[-+.:=\w]+@[-a-zA-Z\d.]+>$/H]]
 -- Message id seems to be forged
 local unusable_msgid = string.format('(%s | %s | %s | %s | %s | %s)',
-					lyris_ezml_remailer, wacky_sendmail_version, iplanet_messaging_server, hotmail_baydav_msgid, sympatico_msgid, mailman_msgid)
+    lyris_ezml_remailer, wacky_sendmail_version,
+    iplanet_messaging_server, hotmail_baydav_msgid, sympatico_msgid, mailman_msgid)
 -- Outlook express data seems to be forged
 local forged_oe = string.format('(%s & !%s & !%s & !%s)', oe_mua, oe_msgid_1, oe_msgid_2, unusable_msgid)
 -- Outlook specific headers
@@ -329,7 +330,7 @@ local vista_msgid = 'Message-Id=/^<?[A-F\\d]{32}\\@\\S+>?$/H'
 local ims_msgid = 'Message-Id=/^<?[A-F\\d]{36,40}\\@\\S+>?$/H'
 -- Forged outlook headers
 local forged_outlook_dollars = string.format('(%s & !%s & !%s & !%s & !%s & !%s)',
-					outlook_dollars_mua, oe_msgid_2, outlook_dollars_other, vista_msgid, ims_msgid, unusable_msgid)
+    outlook_dollars_mua, oe_msgid_2, outlook_dollars_other, vista_msgid, ims_msgid, unusable_msgid)
 -- Outlook versions that should be excluded from summary rule
 local fmo_excl_o3416 = 'X-Mailer=/^Microsoft Outlook, Build 10.0.3416$/H'
 local fmo_excl_oe3790 = 'X-Mailer=/^Microsoft Outlook Express 6.00.3790.3959$/H'
@@ -338,7 +339,7 @@ reconf['FORGED_MUA_OUTLOOK'] = {
   re = string.format('(%s | %s) & !%s & !%s & !%s',
       forged_oe, forged_outlook_dollars, fmo_excl_o3416, fmo_excl_oe3790, vista_msgid),
   score = 3.0,
-  description = 'Forged outlook MUA',
+  description = 'Forged Outlook MUA',
   group = 'mua'
 }
 
@@ -361,30 +362,30 @@ reconf['FORGED_OUTLOOK_TAGS'] = {
 reconf['SUSPICIOUS_BOUNDARY'] = {
   re = 'Content-Type=/^\\s*multipart.+boundary="----=_NextPart_000_[A-Z\\d]{4}_(00EBFFA4|0102FFA4|32C6FFA4|3302FFA4)\\.[A-Z\\d]{8}"[\\r\\n]*$/siX',
   score = 5.0,
-  description = 'Suspicious boundary in header Content-Type',
+  description = 'Suspicious boundary in Content-Type header',
   group = 'mua'
 }
 -- Forged OE/MSO boundary
 reconf['SUSPICIOUS_BOUNDARY2'] = {
   re = 'Content-Type=/^\\s*multipart.+boundary="----=_NextPart_000_[A-Z\\d]{4}_(01C6527E)\\.[A-Z\\d]{8}"[\\r\\n]*$/siX',
   score = 4.0,
-  description = 'Suspicious boundary in header Content-Type',
+  description = 'Suspicious boundary in Content-Type header',
   group = 'mua'
 }
 -- Forged OE/MSO boundary
 reconf['SUSPICIOUS_BOUNDARY3'] = {
   re = 'Content-Type=/^\\s*multipart.+boundary="-----000-00\\d\\d-01C[\\dA-F]{5}-[\\dA-F]{8}"[\\r\\n]*$/siX',
   score = 3.0,
-  description = 'Suspicious boundary in header Content-Type',
+  description = 'Suspicious boundary in Content-Type header',
   group = 'mua'
 }
 -- Forged OE/MSO boundary
-local suspicious_boundary_01C4	= 'Content-Type=/^\\s*multipart.+boundary="----=_NextPart_000_[A-Z\\d]{4}_01C4[\\dA-F]{4}\\.[A-Z\\d]{8}"[\\r\\n]*$/siX'
-local suspicious_boundary_01C4_date	= 'Date=/^\\s*\\w\\w\\w,\\s+\\d+\\s+\\w\\w\\w 20(0[56789]|1\\d)/'
+local suspicious_boundary_01C4 = 'Content-Type=/^\\s*multipart.+boundary="----=_NextPart_000_[A-Z\\d]{4}_01C4[\\dA-F]{4}\\.[A-Z\\d]{8}"[\\r\\n]*$/siX'
+local suspicious_boundary_01C4_date = 'Date=/^\\s*\\w\\w\\w,\\s+\\d+\\s+\\w\\w\\w 20(0[56789]|1\\d)/'
 reconf['SUSPICIOUS_BOUNDARY4'] = {
   re = string.format('(%s) & (%s)', suspicious_boundary_01C4, suspicious_boundary_01C4_date),
   score = 4.0,
-  description = 'Suspicious boundary in header Content-Type',
+  description = 'Suspicious boundary in Content-Type header',
   group = 'mua'
 }
 
@@ -428,20 +429,9 @@ reconf['FORGED_MUA_KMAIL_MSGID_UNKNOWN'] = {
 local opera1x_mua = 'User-Agent=/^\\s*Opera Mail\\/1[01]\\.\\d+ /H'
 -- Opera Mail Message-ID template
 local opera1x_msgid = 'Message-ID=/^<?op\\.[a-z\\d]{14}\\@\\S+>?$/H'
--- Suspicious Opera Mail User-Agent header
-local suspicious_opera10w_mua = 'User-Agent=/^\\s*Opera Mail\\/10\\.\\d+ \\(Windows\\)$/H'
--- Suspicious Opera Mail Message-ID, apparently from KMail
-local suspicious_opera10w_msgid = 'Message-Id=/^<?2009\\d{8}\\.\\d+\\.\\S+\\@\\S+?>$/H'
--- Summary rule for forged Opera Mail User-Agent header and Message-ID header from KMail
-reconf['SUSPICIOUS_OPERA_10W_MSGID'] = {
-  re = string.format('(%s) & (%s)', suspicious_opera10w_mua, suspicious_opera10w_msgid),
-  score = 4.0,
-  description = 'Message pretends to be send from suspicious Opera Mail/10.x (Windows) but has forged Message-ID, apparently from KMail',
-  group = 'mua'
-}
--- Summary rule for forged Opera Mail Message-ID header
+-- Rule for forged Opera Mail Message-ID header
 reconf['FORGED_MUA_OPERA_MSGID'] = {
-  re = string.format('(%s) & !(%s) & !(%s) & !(%s)', opera1x_mua, opera1x_msgid, reconf['SUSPICIOUS_OPERA_10W_MSGID']['re'], unusable_msgid),
+  re = string.format('(%s) & !(%s) & !(%s)', opera1x_mua, opera1x_msgid, unusable_msgid),
   score = 4.0,
   description = 'Message pretends to be send from Opera Mail but has forged Message-ID',
   group = 'mua'
@@ -449,24 +439,27 @@ reconf['FORGED_MUA_OPERA_MSGID'] = {
 
 -- Detect forged Mozilla Mail/Thunderbird/Seamonkey/Postbox headers
 -- Mozilla based X-Mailer
-local user_agent_mozilla5	= 'User-Agent=/^\\s*Mozilla\\/5\\.0/H'
-local user_agent_thunderbird	= 'User-Agent=/^\\s*(Thunderbird|Mozilla Thunderbird|Mozilla\\/.*Gecko\\/.*(Thunderbird|Icedove)\\/)/H'
-local user_agent_seamonkey	= 'User-Agent=/^\\s*Mozilla\\/5\\.0\\s.+\\sSeaMonkey\\/\\d+\\.\\d+/H'
-local user_agent_postbox	= [[User-Agent=/^\s*Mozilla\/5\.0\s\([^)]+\)\sGecko\/\d+\sPostboxApp\/\d+(?:\.\d+){2,3}$/H]]
-local user_agent_mozilla	= string.format('(%s) & !(%s) & !(%s) & !(%s)', user_agent_mozilla5, user_agent_thunderbird, user_agent_seamonkey, user_agent_postbox)
+local user_agent_mozilla5 = 'User-Agent=/^\\s*Mozilla\\/5\\.0/H'
+local user_agent_thunderbird = 'User-Agent=/^\\s*(Thunderbird|Mozilla Thunderbird|Mozilla\\/.*Gecko\\/.*(Thunderbird|Betterbird|Icedove)\\/)/H'
+local user_agent_seamonkey = 'User-Agent=/^\\s*Mozilla\\/5\\.0\\s.+\\sSeaMonkey\\/\\d+\\.\\d+/H'
+local user_agent_postbox = [[User-Agent=/^\s*Mozilla\/5\.0\s\([^)]+\)\sGecko\/\d+\sPostboxApp\/\d+(?:\.\d+){2,3}$/H]]
+local user_agent_mozilla = string.format('(%s) & !(%s) & !(%s) & !(%s)', user_agent_mozilla5, user_agent_thunderbird,
+    user_agent_seamonkey, user_agent_postbox)
 -- Mozilla based common Message-ID template
-local mozilla_msgid_common	= 'Message-ID=/^\\s*<[\\dA-F]{8}\\.\\d{1,7}\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
-local mozilla_msgid_common_sec	= 'Message-ID=/^\\s*<[\\da-f]{8}-([\\da-f]{4}-){3}[\\da-f]{12}\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
-local mozilla_msgid		= 'Message-ID=/^\\s*<(3[3-9A-F]|4[\\dA-F]|5[\\dA-F])[\\dA-F]{6}\\.(\\d0){1,4}\\d\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
+local mozilla_msgid_common = 'Message-ID=/^\\s*<[\\dA-F]{8}\\.\\d{1,7}\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
+local mozilla_msgid_common_sec = 'Message-ID=/^\\s*<[\\da-f]{8}-([\\da-f]{4}-){3}[\\da-f]{12}\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
+local mozilla_msgid = 'Message-ID=/^\\s*<(3[3-9A-F]|[4-9A-F][\\dA-F])[\\dA-F]{6}\\.(\\d0){1,4}\\d\\@([^>\\.]+\\.)+[^>\\.]+>$/H'
 -- Summary rule for forged Mozilla Mail Message-ID header
 reconf['FORGED_MUA_MOZILLA_MAIL_MSGID'] = {
-  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_mozilla, mozilla_msgid_common, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_mozilla, mozilla_msgid_common, mozilla_msgid,
+      unusable_msgid),
   score = 4.0,
   description = 'Message pretends to be send from Mozilla Mail but has forged Message-ID',
   group = 'mua'
 }
 reconf['FORGED_MUA_MOZILLA_MAIL_MSGID_UNKNOWN'] = {
-  re = string.format('(%s) & !(%s) & !(%s) & !(%s)', user_agent_mozilla, mozilla_msgid_common, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & !(%s) & !(%s) & !(%s)', user_agent_mozilla, mozilla_msgid_common, mozilla_msgid,
+      unusable_msgid),
   score = 2.5,
   description = 'Message pretends to be send from Mozilla Mail but has forged Message-ID',
   group = 'mua'
@@ -474,44 +467,49 @@ reconf['FORGED_MUA_MOZILLA_MAIL_MSGID_UNKNOWN'] = {
 
 -- Summary rule for forged Thunderbird Message-ID header
 reconf['FORGED_MUA_THUNDERBIRD_MSGID'] = {
-  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_thunderbird, mozilla_msgid_common, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_thunderbird, mozilla_msgid_common, mozilla_msgid,
+      unusable_msgid),
   score = 4.0,
   description = 'Forged mail pretending to be from Mozilla Thunderbird but has forged Message-ID',
   group = 'mua'
 }
 reconf['FORGED_MUA_THUNDERBIRD_MSGID_UNKNOWN'] = {
-  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_thunderbird, mozilla_msgid_common, mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_thunderbird, mozilla_msgid_common,
+      mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
   score = 2.5,
   description = 'Forged mail pretending to be from Mozilla Thunderbird but has forged Message-ID',
   group = 'mua'
 }
 -- Summary rule for forged Seamonkey Message-ID header
 reconf['FORGED_MUA_SEAMONKEY_MSGID'] = {
-  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_seamonkey, mozilla_msgid_common, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_seamonkey, mozilla_msgid_common, mozilla_msgid,
+      unusable_msgid),
   score = 4.0,
   description = 'Forged mail pretending to be from Mozilla Seamonkey but has forged Message-ID',
   group = 'mua'
 }
 reconf['FORGED_MUA_SEAMONKEY_MSGID_UNKNOWN'] = {
-  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_seamonkey, mozilla_msgid_common, mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_seamonkey, mozilla_msgid_common,
+      mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
   score = 2.5,
   description = 'Forged mail pretending to be from Mozilla Seamonkey but has forged Message-ID',
   group = 'mua'
 }
 -- Summary rule for forged Postbox Message-ID header
 reconf['FORGED_MUA_POSTBOX_MSGID'] = {
-  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_postbox, mozilla_msgid_common, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & (%s) & !(%s) & !(%s)', user_agent_postbox, mozilla_msgid_common, mozilla_msgid,
+      unusable_msgid),
   score = 4.0,
   description = 'Forged mail pretending to be from Postbox but has forged Message-ID',
   group = 'mua'
 }
 reconf['FORGED_MUA_POSTBOX_MSGID_UNKNOWN'] = {
-  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_postbox, mozilla_msgid_common, mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
+  re = string.format('(%s) & !((%s) | (%s)) & !(%s) & !(%s)', user_agent_postbox, mozilla_msgid_common,
+      mozilla_msgid_common_sec, mozilla_msgid, unusable_msgid),
   score = 2.5,
   description = 'Forged mail pretending to be from Postbox but has forged Message-ID',
   group = 'mua'
 }
-
 
 -- Message id validity
 local sane_msgid = 'Message-Id=/^<?[^<>\\\\ \\t\\n\\r\\x0b\\x80-\\xff]+\\@[^<>\\\\ \\t\\n\\r\\x0b\\x80-\\xff]+>?\\s*$/H'
@@ -519,10 +517,9 @@ local msgid_comment = 'Message-Id=/\\(.*\\)/H'
 reconf['INVALID_MSGID'] = {
   re = string.format('(%s) & !((%s) | (%s))', has_mid, sane_msgid, msgid_comment),
   score = 1.7,
-  description = 'Message id is incorrect',
+  description = 'Message-ID header is incorrect',
   group = 'headers'
 }
-
 
 -- Only Content-Type header without other MIME headers
 local cd = 'header_exists(Content-Disposition)'
@@ -536,7 +533,6 @@ reconf['MIME_HEADER_CTYPE_ONLY'] = {
   description = 'Only Content-Type header without other MIME headers',
   group = 'headers'
 }
-
 
 -- Forged Exchange messages
 local msgid_dollars_ok = 'Message-Id=/[0-9a-f]{4,}\\$[0-9a-f]{4,}\\$[0-9a-f]{4,}\\@\\S+/H'
@@ -553,17 +549,7 @@ reconf['RATWARE_MS_HASH'] = {
 reconf['STOX_REPLY_TYPE'] = {
   re = 'Content-Type=/text\\/plain; .* reply-type=original/H',
   score = 1.0,
-  description = 'Reply-type in content-type',
-  group = 'headers'
-}
-
--- Fake Verizon headers
-local fhelo_verizon = 'X-Spam-Relays-Untrusted=/^[^\\]]+ helo=[^ ]+verizon\\.net /iH'
-local fhost_verizon = 'X-Spam-Relays-Untrusted=/^[^\\]]+ rdns=[^ ]+verizon\\.net /iH'
-reconf['FM_FAKE_HELO_VERIZON'] = {
-  re = string.format('(%s) & !(%s)', fhelo_verizon, fhost_verizon),
-  score = 2.0,
-  description = 'Fake helo for verizon provider',
+  description = 'Reply-type in Content-Type header',
   group = 'headers'
 }
 
@@ -573,7 +559,7 @@ local from_yahoo_com = 'From=/\\@yahoo\\.com\\b/iH'
 reconf['FORGED_MSGID_YAHOO'] = {
   re = string.format('(%s) & !(%s)', at_yahoo_msgid, from_yahoo_com),
   score = 2.0,
-  description = 'Forged yahoo msgid',
+  description = 'Forged Yahoo Message-ID header',
   group = 'headers'
 }
 
@@ -595,7 +581,7 @@ local rcvd_e_mail_ru = 'Received=/^(?:from \\[\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\
 reconf['MAIL_RU_MAILER'] = {
   re = string.format('(%s) & (%s)', xm_mail_ru_mailer_1_0, rcvd_e_mail_ru),
   score = 0.0,
-  description = 'Sent with Mail.Ru web-mail',
+  description = 'Sent with Mail.Ru webmail',
   group = 'headers'
 }
 
@@ -605,24 +591,24 @@ local rcvd_web_yandex_ru = 'Received=/^by web\\d{1,2}[a-z]\\.yandex\\.ru with HT
 reconf['YANDEX_RU_MAILER'] = {
   re = string.format('(%s) & (%s)', xm_yandex_ru_mailer_5_0, rcvd_web_yandex_ru),
   score = 0.0,
-  description = 'Sent with yandex.ru web-mail',
+  description = 'Sent with Yandex webmail',
   group = 'headers'
 }
 
 -- Detect 1C v8.2 and v8.3 mailers
 reconf['MAILER_1C_8'] = {
-    re = 'X-Mailer=/^1C:Enterprise 8\\.[23]$/H',
-    score = 0.0,
-    description = 'Sent with 1C:Enterprise 8',
-    group = 'headers'
+  re = 'X-Mailer=/^1C:Enterprise 8\\.[23]$/H',
+  score = 0.0,
+  description = 'Sent with 1C:Enterprise 8',
+  group = 'headers'
 }
 
 -- Detect rogue 'strongmail' MTA with IPv4 and '(-)' in Received line
 reconf['STRONGMAIL'] = {
-    re = [[Received=/^from\s+strongmail\s+\(\[\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\]\) by \S+ \(-\); /mH]],
-    score = 6.0,
-    description = 'Sent via rogue "strongmail" MTA',
-    group = 'headers'
+  re = [[Received=/^from\s+strongmail\s+\(\[\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\]\) by \S+ \(-\); /mH]],
+  score = 6.0,
+  description = 'Sent via rogue "strongmail" MTA',
+  group = 'headers'
 }
 
 -- Two received headers with ip addresses
@@ -631,7 +617,7 @@ local double_ip_spam_2 = 'Received=/from\\s+\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d
 reconf['RCVD_DOUBLE_IP_SPAM'] = {
   re = string.format('(%s) | (%s)', double_ip_spam_1, double_ip_spam_2),
   score = 2.0,
-  description = 'Two received headers with ip addresses',
+  description = 'Has two Received headers containing bare IP addresses',
   group = 'headers'
 }
 
@@ -640,208 +626,177 @@ local repto_quote = 'Reply-To=/\\".*\\"\\s*\\</H'
 reconf['REPTO_QUOTE_YAHOO'] = {
   re = string.format('(%s) & ((%s) | (%s))', repto_quote, from_yahoo_com, at_yahoo_msgid),
   score = 2.0,
-  description = 'Quoted reply-to from yahoo (seems to be forged)',
+  description = 'Quoted Reply-To header from Yahoo (seems to be forged)',
   group = 'headers'
 }
 
--- MUA definitions
-local xm_gnus = 'X-Mailer=/^Gnus v/H'
-local xm_msoe5 = 'X-Mailer=/^Microsoft Outlook Express 5/H'
-local xm_msoe6 = 'X-Mailer=/^Microsoft Outlook Express 6/H'
-local xm_moz4 = 'X-Mailer=/^Mozilla 4/H'
-local xm_skyri = 'X-Mailer=/^SKYRiXgreen/H'
-local xm_wwwmail = 'X-Mailer=/^WWW-Mail \\d/H'
-local ua_gnus = 'User-Agent=/^Gnus/H'
-local ua_knode = 'User-Agent=/^KNode/H'
-local ua_mutt = 'User-Agent=/^Mutt/H'
-local ua_pan = 'User-Agent=/^Pan/H'
-local ua_xnews = 'User-Agent=/^Xnews/H'
-local no_inr_yes_ref = string.format('(%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s)', xm_gnus, xm_msoe5, xm_msoe6, xm_moz4, xm_skyri, xm_wwwmail, ua_gnus, ua_knode, ua_mutt, ua_pan, ua_xnews)
-local subj_re = 'Subject=/^R[eE]:/H'
-local has_ref = '(header_exists(References) | header_exists(In-Reply-To))'
-local missing_ref = string.format('!(%s)', has_ref)
--- Fake reply (has RE in subject, but has no References header)
-reconf['FAKE_REPLY_C'] = {
-  re = string.format('(%s) & (%s) & (%s) & !(%s)', subj_re, missing_ref, no_inr_yes_ref, xm_msoe6),
-  score = 6.0,
-  description = 'Fake reply (has RE in subject, but has no References header)',
-  group = 'subject'
+reconf['FAKE_REPLY'] = {
+  re = [[Subject=/^re:/i{header} & !(header_exists(In-Reply-To) | header_exists(References))]],
+  description = 'Fake reply',
+  score = 1.0,
+  group = 'headers'
 }
 
--- Mime-OLE is needed but absent (e.g. fake Outlook or fake Ecxchange)
+-- Mime-OLE is needed but absent (e.g. fake Outlook or fake Exchange)
 local has_msmail_pri = 'header_exists(X-MSMail-Priority)'
 local has_mimeole = 'header_exists(X-MimeOLE)'
 local has_squirrelmail_in_mailer = 'X-Mailer=/SquirrelMail\\b/H'
 local has_office_version_in_mailer = [[X-Mailer=/^Microsoft (?:Office )?Outlook [12]\d\.0/]]
+local has_x_android_message_id = 'header_exists(X-Android-Message-Id)'
 reconf['MISSING_MIMEOLE'] = {
-  re = string.format('(%s) & !(%s) & !(%s) & !(%s)',
+  re = string.format('(%s) & !(%s) & !(%s) & !(%s) & !(%s)',
       has_msmail_pri,
       has_mimeole,
       has_squirrelmail_in_mailer,
-      has_office_version_in_mailer),
+      has_office_version_in_mailer,
+      has_x_android_message_id),
   score = 2.0,
   description = 'Mime-OLE is needed but absent (e.g. fake Outlook or fake Exchange)',
   group = 'headers'
 }
 
--- Header delimiters
-local yandex_from = 'From=/\\@(yandex\\.ru|yandex\\.net|ya\\.ru)/iX'
-local yandex_x_envelope_from = 'X-Envelope-From=/\\@(yandex\\.ru|yandex\\.net|ya\\.ru)/iX'
-local yandex_return_path = 'Return-Path=/\\@(yandex\\.ru|yandex\\.net|ya\\.ru)/iX'
-local yandex_received = 'Received=/^\\s*from \\S+\\.(yandex\\.ru|yandex\\.net)/mH'
-local yandex = string.format('(%s) & ((%s) | (%s) | (%s))', yandex_received, yandex_from, yandex_x_envelope_from, yandex_return_path)
--- Tabs as delimiters between header names and header values
-function check_header_delimiter_tab(task, header_name)
-	for _,rh in ipairs(task:get_header_full(header_name)) do
-		if rh['tab_separated'] then return true end
-	end
-	return false
-end
-reconf['HEADER_FROM_DELIMITER_TAB'] = {
-  re = string.format('(%s) & !(%s)', 'check_header_delimiter_tab(From)', yandex),
-  score = 1.0,
-  description = 'Header From begins with tab',
-  group = 'headers'
-}
-reconf['HEADER_TO_DELIMITER_TAB'] = {
-  re = string.format('(%s) & !(%s)', 'check_header_delimiter_tab(To)', yandex),
-  score = 1.0,
-  description = 'Header To begins with tab',
-  group = 'headers'
-}
-reconf['HEADER_CC_DELIMITER_TAB'] = {
-  re = string.format('(%s) & !(%s)', 'check_header_delimiter_tab(Cc)', yandex),
-  score = 1.0,
-  description = 'Header To begins with tab',
-  group = 'headers'
-}
-reconf['HEADER_REPLYTO_DELIMITER_TAB'] = {
-  re = string.format('(%s) & !(%s)', 'check_header_delimiter_tab(Reply-To)', yandex),
-  score = 1.0,
-  description = 'Header Reply-To begins with tab',
-  group = 'headers'
-}
-reconf['HEADER_DATE_DELIMITER_TAB'] = {
-  re = string.format('(%s) & !(%s)', 'check_header_delimiter_tab(Date)', yandex),
-  score = 1.0,
-  description = 'Header Date begins with tab',
-  group = 'headers'
-}
 -- Empty delimiters between header names and header values
-function check_header_delimiter_empty(task, header_name)
-	for _,rh in ipairs(task:get_header_full(header_name)) do
-		if rh['empty_separator'] then return true end
-	end
-	return false
+local function gen_check_header_delimiter_empty(header_name)
+  return function(task)
+    for _, rh in ipairs(task:get_header_full(header_name) or {}) do
+      if rh['empty_separator'] then
+        return true
+      end
+    end
+    return false
+  end
 end
 reconf['HEADER_FROM_EMPTY_DELIMITER'] = {
-  re = string.format('(%s)', 'check_header_delimiter_empty(From)'),
+  re = string.format('(%s)', 'lua:check_from_delim_empty'),
   score = 1.0,
-  description = 'Header From has no delimiter between header name and header value',
-  group = 'headers'
+  description = 'From header has no delimiter between header name and header value',
+  group = 'headers',
+  functions = {
+    check_from_delim_empty = gen_check_header_delimiter_empty('From')
+  }
 }
 reconf['HEADER_TO_EMPTY_DELIMITER'] = {
-  re = string.format('(%s)', 'check_header_delimiter_empty(To)'),
+  re = string.format('(%s)', 'lua:check_to_delim_empty'),
   score = 1.0,
-  description = 'Header To has no delimiter between header name and header value',
-  group = 'headers'
+  description = 'To header has no delimiter between header name and header value',
+  group = 'headers',
+  functions = {
+    check_to_delim_empty = gen_check_header_delimiter_empty('To')
+  }
 }
 reconf['HEADER_CC_EMPTY_DELIMITER'] = {
-  re = string.format('(%s)', 'check_header_delimiter_empty(Cc)'),
+  re = string.format('(%s)', 'lua:check_cc_delim_empty'),
   score = 1.0,
-  description = 'Header Cc has no delimiter between header name and header value',
-  group = 'headers'
+  description = 'Cc header has no delimiter between header name and header value',
+  group = 'headers',
+  functions = {
+    check_cc_delim_empty = gen_check_header_delimiter_empty('Cc')
+  }
 }
 reconf['HEADER_REPLYTO_EMPTY_DELIMITER'] = {
-  re = string.format('(%s)', 'check_header_delimiter_empty(Reply-To)'),
+  re = string.format('(%s)', 'lua:check_repto_delim_empty'),
   score = 1.0,
-  description = 'Header Reply-To has no delimiter between header name and header value',
-  group = 'headers'
+  description = 'Reply-To header has no delimiter between header name and header value',
+  group = 'headers',
+  functions = {
+    check_repto_delim_empty = gen_check_header_delimiter_empty('Reply-To')
+  }
 }
 reconf['HEADER_DATE_EMPTY_DELIMITER'] = {
-  re = string.format('(%s)', 'check_header_delimiter_empty(Date)'),
+  re = string.format('(%s)', 'lua:check_date_delim_empty'),
   score = 1.0,
-  description = 'Header Date has no delimiter between header name and header value',
-  group = 'headers'
+  description = 'Date header has no delimiter between header name and header value',
+  group = 'headers',
+  functions = {
+    check_date_delim_empty = gen_check_header_delimiter_empty('Date')
+  }
 }
 
 -- Definitions of received headers regexp
 reconf['RCVD_ILLEGAL_CHARS'] = {
   re = 'Received=/[\\x80-\\xff]/X',
   score = 4.0,
-  description = 'Header Received has raw illegal character',
+  description = 'Received header has raw illegal character',
   group = 'headers'
 }
 
-local MAIL_RU_Return_Path	= 'Return-path=/^\\s*<.+\\@mail\\.ru>$/iX'
-local MAIL_RU_X_Envelope_From	= 'X-Envelope-From=/^\\s*<.+\\@mail\\.ru>$/iX'
-local MAIL_RU_From		= 'From=/\\@mail\\.ru>?$/iX'
-local MAIL_RU_Received		= 'Received=/from mail\\.ru \\(/mH'
+local MAIL_RU_Return_Path = 'Return-path=/^\\s*<.+\\@mail\\.ru>$/iX'
+local MAIL_RU_X_Envelope_From = 'X-Envelope-From=/^\\s*<.+\\@mail\\.ru>$/iX'
+local MAIL_RU_From = 'From=/\\@mail\\.ru>?$/iX'
+local MAIL_RU_Received = 'Received=/from mail\\.ru \\(/mH'
 
 reconf['FAKE_RECEIVED_mail_ru'] = {
-  re = string.format('(%s) & !(((%s) | (%s)) & (%s))', MAIL_RU_Received, MAIL_RU_Return_Path, MAIL_RU_X_Envelope_From, MAIL_RU_From),
+  re = string.format('(%s) & !(((%s) | (%s)) & (%s))',
+      MAIL_RU_Received, MAIL_RU_Return_Path, MAIL_RU_X_Envelope_From, MAIL_RU_From),
   score = 4.0,
-  description = 'Fake helo mail.ru in header Received from non mail.ru sender address',
+  description = 'Fake HELO mail.ru in Received header from non-mail.ru sender address',
   group = 'headers'
 }
 
-local GMAIL_COM_Return_Path	= 'Return-path=/^\\s*<.+\\@gmail\\.com>$/iX'
-local GMAIL_COM_X_Envelope_From	= 'X-Envelope-From=/^\\s*<.+\\@gmail\\.com>$/iX'
-local GMAIL_COM_From		= 'From=/\\@gmail\\.com>?$/iX'
+local GMAIL_COM_Return_Path = 'Return-path=/^\\s*<.+\\@gmail\\.com>$/iX'
+local GMAIL_COM_X_Envelope_From = 'X-Envelope-From=/^\\s*<.+\\@gmail\\.com>$/iX'
+local GMAIL_COM_From = 'From=/\\@gmail\\.com>?$/iX'
 
-local UKR_NET_Return_Path	= 'Return-path=/^\\s*<.+\\@ukr\\.net>$/iX'
-local UKR_NET_X_Envelope_From	= 'X-Envelope-From=/^\\s*<.+\\@ukr\\.net>$/iX'
-local UKR_NET_From		= 'From=/\\@ukr\\.net>?$/iX'
+local UKR_NET_Return_Path = 'Return-path=/^\\s*<.+\\@ukr\\.net>$/iX'
+local UKR_NET_X_Envelope_From = 'X-Envelope-From=/^\\s*<.+\\@ukr\\.net>$/iX'
+local UKR_NET_From = 'From=/\\@ukr\\.net>?$/iX'
 
-local RECEIVED_smtp_yandex_ru_1	= 'Received=/from \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] \\((port=\\d+ )?helo=smtp\\.yandex\\.ru\\)/iX'
-local RECEIVED_smtp_yandex_ru_2	= 'Received=/from \\[UNAVAILABLE\\] \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]:\\d+ helo=smtp\\.yandex\\.ru\\)/iX'
-local RECEIVED_smtp_yandex_ru_3	= 'Received=/from \\S+ \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]:\\d+ helo=smtp\\.yandex\\.ru\\)/iX'
-local RECEIVED_smtp_yandex_ru_4	= 'Received=/from \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] \\(account \\S+ HELO smtp\\.yandex\\.ru\\)/iX'
-local RECEIVED_smtp_yandex_ru_5	= 'Received=/from smtp\\.yandex\\.ru \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]\\)/iX'
-local RECEIVED_smtp_yandex_ru_6	= 'Received=/from smtp\\.yandex\\.ru \\(\\S+ \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]\\)/iX'
-local RECEIVED_smtp_yandex_ru_7	= 'Received=/from \\S+ \\(HELO smtp\\.yandex\\.ru\\) \\(\\S+\\@\\d+\\.\\d+\\.\\d+\\.\\d+\\)/iX'
-local RECEIVED_smtp_yandex_ru_8	= 'Received=/from \\S+ \\(HELO smtp\\.yandex\\.ru\\) \\(\\d+\\.\\d+\\.\\d+\\.\\d+\\)/iX'
-local RECEIVED_smtp_yandex_ru_9	= 'Received=/from \\S+ \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] helo=smtp\\.yandex\\.ru\\)/iX'
+local RECEIVED_smtp_yandex_ru_1 = 'Received=/from \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] \\((port=\\d+ )?helo=smtp\\.yandex\\.ru\\)/iX'
+local RECEIVED_smtp_yandex_ru_2 = 'Received=/from \\[UNAVAILABLE\\] \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]:\\d+ helo=smtp\\.yandex\\.ru\\)/iX'
+local RECEIVED_smtp_yandex_ru_3 = 'Received=/from \\S+ \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]:\\d+ helo=smtp\\.yandex\\.ru\\)/iX'
+local RECEIVED_smtp_yandex_ru_4 = 'Received=/from \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] \\(account \\S+ HELO smtp\\.yandex\\.ru\\)/iX'
+local RECEIVED_smtp_yandex_ru_5 = 'Received=/from smtp\\.yandex\\.ru \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]\\)/iX'
+local RECEIVED_smtp_yandex_ru_6 = 'Received=/from smtp\\.yandex\\.ru \\(\\S+ \\[\\d+\\.\\d+\\.\\d+\\.\\d+\\]\\)/iX'
+local RECEIVED_smtp_yandex_ru_7 = 'Received=/from \\S+ \\(HELO smtp\\.yandex\\.ru\\) \\(\\S+\\@\\d+\\.\\d+\\.\\d+\\.\\d+\\)/iX'
+local RECEIVED_smtp_yandex_ru_8 = 'Received=/from \\S+ \\(HELO smtp\\.yandex\\.ru\\) \\(\\d+\\.\\d+\\.\\d+\\.\\d+\\)/iX'
+local RECEIVED_smtp_yandex_ru_9 = 'Received=/from \\S+ \\(\\[\\d+\\.\\d+\\.\\d+\\.\\d+\\] helo=smtp\\.yandex\\.ru\\)/iX'
 
 reconf['FAKE_RECEIVED_smtp_yandex_ru'] = {
-  re = string.format('(((%s) & ((%s) | (%s))) | ((%s) & ((%s) | (%s))) | ((%s) & ((%s) | (%s)))) & (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s)', MAIL_RU_From, MAIL_RU_Return_Path, MAIL_RU_X_Envelope_From, GMAIL_COM_From, GMAIL_COM_Return_Path, GMAIL_COM_X_Envelope_From, UKR_NET_From, UKR_NET_Return_Path, UKR_NET_X_Envelope_From, RECEIVED_smtp_yandex_ru_1, RECEIVED_smtp_yandex_ru_2, RECEIVED_smtp_yandex_ru_3, RECEIVED_smtp_yandex_ru_4, RECEIVED_smtp_yandex_ru_5, RECEIVED_smtp_yandex_ru_6, RECEIVED_smtp_yandex_ru_7, RECEIVED_smtp_yandex_ru_8, RECEIVED_smtp_yandex_ru_9),
+  re = string.format('(((%s) & ((%s) | (%s))) | ((%s) & ((%s) | (%s))) ' ..
+      ' | ((%s) & ((%s) | (%s)))) & (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s) | (%s)',
+      MAIL_RU_From, MAIL_RU_Return_Path, MAIL_RU_X_Envelope_From, GMAIL_COM_From,
+      GMAIL_COM_Return_Path, GMAIL_COM_X_Envelope_From, UKR_NET_From, UKR_NET_Return_Path,
+      UKR_NET_X_Envelope_From, RECEIVED_smtp_yandex_ru_1, RECEIVED_smtp_yandex_ru_2,
+      RECEIVED_smtp_yandex_ru_3, RECEIVED_smtp_yandex_ru_4, RECEIVED_smtp_yandex_ru_5,
+      RECEIVED_smtp_yandex_ru_6, RECEIVED_smtp_yandex_ru_7, RECEIVED_smtp_yandex_ru_8,
+      RECEIVED_smtp_yandex_ru_9),
   score = 4.0,
-  description = 'Fake smtp.yandex.ru Received',
+  description = 'Fake smtp.yandex.ru Received header',
   group = 'headers'
 }
 
 reconf['FORGED_GENERIC_RECEIVED'] = {
   re = 'Received=/^\\s*(.+\\n)*from \\[\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\] by (([\\w\\d-]+\\.)+[a-zA-Z]{2,6}|\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}); \\w{3}, \\d+ \\w{3} 20\\d\\d \\d\\d\\:\\d\\d\\:\\d\\d [+-]\\d\\d\\d0/X',
   score = 3.6,
-  description = 'Forged generic Received',
+  description = 'Forged generic Received header',
   group = 'headers'
 }
 
 reconf['FORGED_GENERIC_RECEIVED2'] = {
   re = 'Received=/^\\s*(.+\\n)*from \\[\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\] by ([\\w\\d-]+\\.)+[a-z]{2,6} id [\\w\\d]{12}; \\w{3}, \\d+ \\w{3} 20\\d\\d \\d\\d\\:\\d\\d\\:\\d\\d [+-]\\d\\d\\d0/X',
   score = 3.6,
-  description = 'Forged generic Received',
+  description = 'Forged generic Received header',
   group = 'headers'
 }
 
 reconf['FORGED_GENERIC_RECEIVED3'] = {
   re = 'Received=/^\\s*(.+\\n)*by \\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3} with SMTP id [a-zA-Z]{14}\\.\\d{13};[\\r\\n\\s]*\\w{3}, \\d+ \\w{3} 20\\d\\d \\d\\d\\:\\d\\d\\:\\d\\d [+-]\\d\\d\\d0 \\(GMT\\)/X',
   score = 3.6,
-  description = 'Forged generic Received',
+  description = 'Forged generic Received header',
   group = 'headers'
 }
 
 reconf['FORGED_GENERIC_RECEIVED4'] = {
   re = 'Received=/^\\s*(.+\\n)*from localhost by \\S+;\\s+\\w{3}, \\d+ \\w{3} 20\\d\\d \\d\\d\\:\\d\\d\\:\\d\\d [+-]\\d\\d\\d0[\\s\\r\\n]*$/X',
   score = 3.6,
-  description = 'Forged generic Received',
+  description = 'Forged generic Received header',
   group = 'headers'
 }
 
 reconf['INVALID_POSTFIX_RECEIVED'] = {
   re = 'Received=/ \\(Postfix\\) with ESMTP id [A-Z\\d]+([\\s\\r\\n]+for <\\S+?>)?;[\\s\\r\\n]*[A-Z][a-z]{2}, \\d{1,2} [A-Z][a-z]{2} \\d\\d\\d\\d \\d\\d:\\d\\d:\\d\\d [\\+\\-]\\d\\d\\d\\d$/X',
   score = 3.0,
-  description = 'Invalid Postfix Received',
+  description = 'Invalid Postfix Received header',
   group = 'headers'
 }
 
@@ -875,11 +830,11 @@ reconf['CTE_CASE'] = {
 
 reconf['HAS_INTERSPIRE_SIG'] = {
   re = string.format('((%s) & (%s) & (%s) & (%s)) | (%s)',
-                     'header_exists(X-Mailer-LID)',
-                     'header_exists(X-Mailer-RecptId)',
-                     'header_exists(X-Mailer-SID)',
-                     'header_exists(X-Mailer-Sent-By)',
-                     'List-Unsubscribe=/\\/unsubscribe\\.php\\?M=[^&]+&C=[^&]+&L=[^&]+&N=[^>]+>$/Xi'),
+      'header_exists(X-Mailer-LID)',
+      'header_exists(X-Mailer-RecptId)',
+      'header_exists(X-Mailer-SID)',
+      'header_exists(X-Mailer-Sent-By)',
+      'List-Unsubscribe=/\\/unsubscribe\\.php\\?M=[^&]+&C=[^&]+&L=[^&]+&N=[^>]+>$/Xi'),
   description = "Has Interspire fingerprint",
   score = 1.0,
   group = 'headers'
@@ -887,41 +842,41 @@ reconf['HAS_INTERSPIRE_SIG'] = {
 
 reconf['CT_EXTRA_SEMI'] = {
   re = 'Content-Type=/;$/X',
-  description = 'Content-Type ends with a semi-colon',
+  description = 'Content-Type header ends with a semi-colon',
   score = 1.0,
   group = 'headers'
 }
 
 reconf['SUBJECT_ENDS_EXCLAIM'] = {
   re = 'Subject=/!\\s*$/H',
-  description = 'Subject ends with an exclaimation',
+  description = 'Subject ends with an exclamation mark',
   score = 0.0,
   group = 'headers'
 }
 
 reconf['SUBJECT_HAS_EXCLAIM'] = {
   re = string.format('%s & !%s', 'Subject=/!/H', 'Subject=/!\\s*$/H'),
-  description = 'Subject contains an exclaimation',
+  description = 'Subject contains an exclamation mark',
   score = 0.0,
   group = 'headers'
 }
 
 reconf['SUBJECT_ENDS_QUESTION'] = {
   re = 'Subject=/\\?\\s*$/Hu',
-  description = 'Subject ends with a question',
+  description = 'Subject ends with a question mark',
   score = 1.0,
   group = 'headers'
 }
 
 reconf['SUBJECT_HAS_QUESTION'] = {
   re = string.format('%s & !%s', 'Subject=/\\?/H', 'Subject=/\\?\\s*$/Hu'),
-  description = 'Subject contains a question',
+  description = 'Subject contains a question mark',
   score = 0.0,
   group = 'headers'
 }
 
 reconf['SUBJECT_HAS_CURRENCY'] = {
-  re = 'Subject=/[$€$¢¥₽]/Hu',
+  re = 'Subject=/\\p{Sc}/Hu',
   description = 'Subject contains currency',
   score = 1.0,
   group = 'headers'
@@ -963,27 +918,129 @@ reconf['HAS_LIST_UNSUB'] = {
 }
 
 reconf['HAS_GUC_PROXY_URI'] = {
-   re = '/\\.googleusercontent\\.com\\/proxy/{url}i',
-   description = 'Has googleusercontent.com proxy URI',
-   score = 0.01,
-   group = 'experimental'
+  re = '/\\.googleusercontent\\.com\\/proxy/{url}i',
+  description = 'Has googleusercontent.com proxy URL',
+  score = 1.0,
+  group = 'url'
 }
 
 reconf['HAS_GOOGLE_REDIR'] = {
-  re = '/\\.google\\.com\\/url\\?/{url}i',
-  description = 'Has google.com/url redirection',
-  score = 0.01,
-  group = 'experimental'
+  re = '/\\.google\\.([a-z]{2,3}(|\\.[a-z]{2,3})|info|jobs)\\/(amp\\/s\\/|url\\?)/{url}i',
+  description = 'Has google.com/url or alike Google redirection URL',
+  score = 1.0,
+  group = 'url'
+}
+
+reconf['HAS_GOOGLE_FIREBASE_URL'] = {
+  re = '/\\.firebasestorage\\.googleapis\\.com\\//{url}i',
+  description = 'Contains firebasestorage.googleapis.com URL',
+  score = 2.0,
+  group = 'url'
 }
 
 reconf['XM_UA_NO_VERSION'] = {
   re = string.format('(!%s && !%s) && (%s || %s)',
-                     'X-Mailer=/https?:/H',
-                     'User-Agent=/https?:/H',
-                     'X-Mailer=/^[^0-9]+$/H',
-                     'User-Agent=/^[^0-9]+$/H'),
-  description = 'X-Mailer/User-Agent has no version',
+      'X-Mailer=/https?:/H',
+      'User-Agent=/https?:/H',
+      'X-Mailer=/^[^0-9]+$/H',
+      'User-Agent=/^[^0-9]+$/H'),
+  description = 'X-Mailer/User-Agent header has no version number',
   score = 0.01,
   group = 'experimental'
 }
 
+-- Detects messages missing both X-Mailer and User-Agent header
+local has_ua = 'header_exists(User-Agent)'
+local has_xmailer = 'header_exists(X-Mailer)'
+reconf['MISSING_XM_UA'] = {
+  re = string.format('!%s && !%s', has_xmailer, has_ua),
+  score = 0.0,
+  description = 'Message has neither X-Mailer nor User-Agent header',
+  group = 'headers',
+}
+
+-- X-Mailer for old MUA versions which are forged by spammers
+local old_x_mailers = {
+  -- Outlook Express 6.0 was last included in Windows XP (EOL 2014).  Windows
+  -- XP is still used (in 2020) by relatively small number of internet users,
+  -- but this header is widely abused by spammers.
+  'Microsoft Outlook Express',
+  -- Qualcomm Eudora for Windows 7.1.0.9 was released in 2006
+  [[QUALCOMM Windows Eudora (Pro )?Version [1-6]\.]],
+  -- The Bat 3.0 was released in 2004
+  [[The Bat! \(v[12]\.]],
+  -- Can be found in public maillist archives, messages circa 2000
+  [[Microsoft Outlook IMO, Build 9\.0\.]],
+  -- Outlook 2002 (Office XP)
+  [[Microsoft Outlook, Build 10\.]],
+  -- Some old Apple iOS versions are used on old devices, match only very old
+  -- versions (iOS 4.3.5 buid 8L1 was supported until 2013) and less old
+  -- versions frequently seen in spam
+  [[i(Phone|Pad) Mail \((?:[1-8][A-L]|12H|13E)]],
+}
+
+reconf['OLD_X_MAILER'] = {
+  description = 'X-Mailer header has a very old MUA version',
+  re = string.format('X-Mailer=/^(?:%s)/{header}', table.concat(old_x_mailers, '|')),
+  score = 2.0,
+  group = 'headers',
+}
+
+-- Detect Apple Mail
+local apple_x_mailer = [[Apple Mail \((?:(?:Version )?[1-9]\d{0,2}\.\d{1,3}|[1-9]\d{0,2}\.\d{1,4}\.\d{1,4}\.\d{1,4})\)]]
+reconf['APPLE_MAILER'] = {
+  description = 'Sent with Apple Mail',
+  re = string.format('X-Mailer=/^%s/{header}', apple_x_mailer),
+  score = 0.0,
+  group = 'headers',
+}
+
+-- Detect Apple iPhone/iPad Mail
+-- Apple iPhone/iPad Mail X-Mailer contains iOS build number, e. g. 9B206, 16H5, 18G5023c
+-- https://en.wikipedia.org/wiki/IOS_version_history
+local apple_ios_x_mailer = [[i(?:Phone|Pad) Mail \(\d{1,2}[A-Z]\d{1,4}[a-z]?\)]]
+reconf['APPLE_IOS_MAILER'] = {
+  description = 'Sent with Apple iPhone/iPad Mail',
+  re = string.format('X-Mailer=/^%s/{header}', apple_ios_x_mailer),
+  score = 0.0,
+  group = 'headers',
+}
+
+-- X-Mailer header values which should not occur (in the modern mail) at all
+local bad_x_mailers = {
+  -- header name repeated in the header value
+  [[X-Mailer: ]],
+  -- Mozilla Thunderbird uses User-Agent header, not X-Mailer
+  -- Early Thunderbird had U-A like:
+  -- Mozilla Thunderbird 1.0.2 (Windows/20050317)
+  -- Thunderbird 2.0.0.23 (X11/20090812)
+  [[(?:Mozilla )?Thunderbird \d]],
+  -- Was used by Yahoo Groups in 2000s, no one expected to use this in 2020s
+  [[eGroups Message Poster]],
+  -- Regexp for genuine iOS X-Mailer is below, anything which doesn't match it,
+  -- but starts with 'iPhone Mail' or 'iPad Mail' is likely fake
+  [[i(?:Phone|Pad) Mail]],
+}
+
+reconf['FORGED_X_MAILER'] = {
+  description = 'Forged X-Mailer header',
+  re = string.format('X-Mailer=/^(?:%s)/{header} && !X-Mailer=/^%s/{header}',
+      table.concat(bad_x_mailers, '|'), apple_ios_x_mailer),
+  score = 4.5,
+  group = 'headers',
+}
+
+-- X-Mailer headers like: 'Internet Mail Service (5.5.2650.21)' are being
+-- forged by spammers, but MS Exchange 5.5 is still being used (in 2020) on
+-- some mail servers. Example of genuine headers (DC-EXMPL is a hostname which
+-- can be a FQDN):
+-- Received: by DC-EXMPL with Internet Mail Service (5.5.2656.59)
+-- 	id <HKH4BJQX>; Tue, 8 Dec 2020 07:10:54 -0600
+-- Message-ID: <E7209F9DB64FCC4BB1051420F0E955DD05C9D59F@DC-EXMPL>
+-- X-Mailer: Internet Mail Service (5.5.2656.59)
+reconf['FORGED_IMS'] = {
+  description = 'Forged X-Mailer: Internet Mail Service',
+  re = [[X-Mailer=/^Internet Mail Service \(5\./{header} & !Received=/^by \S+ with Internet Mail Service \(5\./{header}]],
+  score = 3.0,
+  group = 'headers',
+}

@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ local exports = {
 }
 
 local function require_scanner(name)
-  local sc = require ("lua_scanners/" .. name)
+  local sc = require("lua_scanners/" .. name)
 
   exports[sc.name or name] = sc
 end
@@ -48,6 +48,8 @@ require_scanner('vadesecure')
 require_scanner('spamassassin')
 require_scanner('p0f')
 require_scanner('razor')
+require_scanner('pyzor')
+require_scanner('cloudmark')
 
 exports.add_scanner = function(name, t, conf_func, check_func)
   assert(type(conf_func) == 'function' and type(check_func) == 'function',
@@ -63,7 +65,9 @@ exports.filter = function(t)
   return fun.tomap(fun.filter(function(_, elt)
     return type(elt) == 'table' and elt.type and (
         (type(elt.type) == 'string' and elt.type == t) or
-        (type(elt.type) == 'table' and fun.any(function(tt) return tt == t end, elt.type))
+            (type(elt.type) == 'table' and fun.any(function(tt)
+              return tt == t
+            end, elt.type))
     )
   end, exports))
 end

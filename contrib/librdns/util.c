@@ -40,6 +40,21 @@
 #include "logger.h"
 #include "rdns.h"
 
+inline void
+rdns_request_remove_from_hash (struct rdns_request *req)
+{
+	/* Remove from id hashes */
+	if (req->io) {
+		khiter_t k;
+
+		k = kh_get(rdns_requests_hash, req->io->requests, req->id);
+
+		if (k != kh_end(req->io->requests)) {
+			kh_del(rdns_requests_hash, req->io->requests, k);
+		}
+	}
+}
+
 static int
 rdns_make_socket_nonblocking (int fd)
 {
@@ -207,7 +222,7 @@ rdns_make_client_socket (const char *credits,
 		hints.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
 
 		snprintf (portbuf, sizeof (portbuf), "%d", (int)port);
-		if ((r = getaddrinfo (credits, portbuf, &hints, &res)) == 0) {
+		if (getaddrinfo (credits, portbuf, &hints, &res) == 0) {
 			r = rdns_make_inet_socket (type, res, psockaddr, psocklen);
 
 			if (r != -1 && psockaddr) {
@@ -217,6 +232,7 @@ rdns_make_client_socket (const char *credits,
 
 				if (cpy == NULL) {
 					close (r);
+					freeaddrinfo (res);
 
 					return -1;
 				}
@@ -290,6 +306,9 @@ rdns_type_fromstr (const char *str)
 		else if (strcmp (str, "tlsa") == 0) {
 			return RDNS_REQUEST_TLSA;
 		}
+		else if (strcmp (str, "cname") == 0) {
+			return RDNS_REQUEST_CNAME;
+		}
 		else if (strcmp (str, "any") == 0) {
 			return RDNS_REQUEST_ANY;
 		}
@@ -302,32 +321,34 @@ const char *
 rdns_str_from_type (enum rdns_request_type rcode)
 {
 	switch (rcode) {
-		case RDNS_REQUEST_INVALID:
-			return "(invalid)";
-		case RDNS_REQUEST_A:
-			return "a";
-		case RDNS_REQUEST_NS:
-			return "ns";
-		case RDNS_REQUEST_SOA:
-			return "soa";
-		case RDNS_REQUEST_PTR:
-			return "ptr";
-		case RDNS_REQUEST_MX:
-			return "mx";
-		case RDNS_REQUEST_TXT:
-			return "txt";
-		case RDNS_REQUEST_SRV:
-			return "srv";
-		case RDNS_REQUEST_SPF:
-			return "spf";
-		case RDNS_REQUEST_AAAA:
-			return "aaaa";
-		case RDNS_REQUEST_TLSA:
-			return "tlsa";
-		case RDNS_REQUEST_ANY:
-			return "any";
-		default:
-			return "(unknown)";
+	case RDNS_REQUEST_INVALID:
+		return "(invalid)";
+	case RDNS_REQUEST_A:
+		return "a";
+	case RDNS_REQUEST_NS:
+		return "ns";
+	case RDNS_REQUEST_SOA:
+		return "soa";
+	case RDNS_REQUEST_PTR:
+		return "ptr";
+	case RDNS_REQUEST_MX:
+		return "mx";
+	case RDNS_REQUEST_TXT:
+		return "txt";
+	case RDNS_REQUEST_SRV:
+		return "srv";
+	case RDNS_REQUEST_SPF:
+		return "spf";
+	case RDNS_REQUEST_AAAA:
+		return "aaaa";
+	case RDNS_REQUEST_TLSA:
+		return "tlsa";
+	case RDNS_REQUEST_CNAME:
+		return "cname";
+	case RDNS_REQUEST_ANY:
+		return "any";
+	default:
+		return "(unknown)";
 	}
 
 }
@@ -390,6 +411,24 @@ rdns_permutor_generate_id (void)
 	return id;
 }
 
+struct rdns_reply *
+rdns_make_reply (struct rdns_request *req, enum dns_rcode rcode)
+{
+	struct rdns_reply *rep;
+
+	rep = malloc (sizeof (struct rdns_reply));
+	if (rep != NULL) {
+		rep->request = req;
+		rep->resolver = req->resolver;
+		rep->entries = NULL;
+		rep->code = rcode;
+		req->reply = rep;
+		rep->flags = 0;
+		rep->requested_name = req->requested_names[0].name;
+	}
+
+	return rep;
+}
 
 void
 rdns_reply_free (struct rdns_reply *rep)
@@ -422,6 +461,9 @@ rdns_reply_free (struct rdns_reply *rep)
 			case RDNS_REQUEST_SOA:
 				free (entry->content.soa.mname);
 				free (entry->content.soa.admin);
+				break;
+			case RDNS_REQUEST_CNAME:
+				free(entry->content.cname.name);
 				break;
 			default:
 				break;
@@ -456,15 +498,14 @@ rdns_request_free (struct rdns_request *req)
 				/* Remove timer */
 				req->async->del_timer (req->async->data,
 						req->async_event);
-				/* Remove from id hashes */
-				HASH_DEL (req->io->requests, req);
+				rdns_request_remove_from_hash(req);
 				req->async_event = NULL;
 			}
 			else if (req->state == RDNS_REQUEST_WAIT_SEND) {
 				/* Remove retransmit event */
 				req->async->del_write (req->async->data,
 						req->async_event);
-				HASH_DEL (req->io->requests, req);
+				rdns_request_remove_from_hash(req);
 				req->async_event = NULL;
 			}
 			else if (req->state == RDNS_REQUEST_FAKE) {
@@ -472,6 +513,14 @@ rdns_request_free (struct rdns_request *req)
 						req->async_event);
 				req->async_event = NULL;
 			}
+		}
+		if (req->state == RDNS_REQUEST_TCP) {
+			if (req->async_event) {
+				req->async->del_timer (req->async->data,
+						req->async_event);
+			}
+
+			rdns_request_remove_from_hash(req);
 		}
 #ifdef TWEETNACL
 		if (req->curve_plugin_data != NULL) {
@@ -491,17 +540,91 @@ rdns_request_free (struct rdns_request *req)
 void
 rdns_ioc_free (struct rdns_io_channel *ioc)
 {
-	struct rdns_request *req, *rtmp;
+	struct rdns_request *req;
 
-	HASH_ITER (hh, ioc->requests, req, rtmp) {
-		REF_RELEASE (req);
+	if (IS_CHANNEL_TCP(ioc)) {
+		rdns_ioc_tcp_reset(ioc);
 	}
 
-	ioc->resolver->async->del_read (ioc->resolver->async->data,
-			ioc->async_io);
-	close (ioc->sock);
-	free (ioc->saddr);
+	kh_foreach_value(ioc->requests, req, {
+		REF_RELEASE (req);
+	});
+
+	if (ioc->async_io) {
+		ioc->resolver->async->del_read(ioc->resolver->async->data,
+				ioc->async_io);
+	}
+	kh_destroy(rdns_requests_hash, ioc->requests);
+
+	if (ioc->sock != -1) {
+		close(ioc->sock);
+	}
+
+	if (ioc->saddr != NULL) {
+		free(ioc->saddr);
+	}
+
 	free (ioc);
+}
+
+struct rdns_io_channel *
+rdns_ioc_new (struct rdns_server *serv,
+			  struct rdns_resolver *resolver,
+			  bool is_tcp)
+{
+	struct rdns_io_channel *nioc;
+
+	if (is_tcp) {
+		nioc = calloc (1, sizeof (struct rdns_io_channel)
+				+ sizeof (struct rdns_tcp_channel));
+	}
+	else {
+		nioc = calloc (1, sizeof (struct rdns_io_channel));
+	}
+
+	if (nioc == NULL) {
+		rdns_err ("calloc fails to allocate rdns_io_channel");
+		return NULL;
+	}
+
+	nioc->struct_magic = RDNS_IO_CHANNEL_TAG;
+	nioc->srv = serv;
+	nioc->resolver = resolver;
+
+	nioc->sock = rdns_make_client_socket (serv->name, serv->port,
+			is_tcp ? SOCK_STREAM : SOCK_DGRAM, &nioc->saddr, &nioc->slen);
+	if (nioc->sock == -1) {
+		rdns_err ("cannot open socket to %s: %s", serv->name,
+				strerror (errno));
+		free (nioc);
+		return NULL;
+	}
+
+	if (is_tcp) {
+		/* We also need to connect a TCP channel and set a TCP buffer */
+		nioc->tcp = (struct rdns_tcp_channel *)(((unsigned char *)nioc) + sizeof(*nioc));
+
+		if (!rdns_ioc_tcp_connect(nioc)) {
+			rdns_err ("cannot connect TCP socket to %s: %s", serv->name,
+					strerror (errno));
+			close (nioc->sock);
+			free (nioc);
+
+			return NULL;
+		}
+
+		nioc->flags |= RDNS_CHANNEL_TCP;
+	}
+	else {
+		nioc->flags |= RDNS_CHANNEL_ACTIVE;
+		nioc->async_io = resolver->async->add_read(resolver->async->data,
+				nioc->sock, nioc);
+	}
+
+	nioc->requests = kh_init(rdns_requests_hash);
+	REF_INIT_RETAIN (nioc, rdns_ioc_free);
+
+	return nioc;
 }
 
 void
@@ -518,31 +641,199 @@ rdns_request_retain (struct rdns_request *req)
 }
 
 void
-rdns_request_unschedule (struct rdns_request *req)
+rdns_request_unschedule (struct rdns_request *req, bool remove_from_hash)
 {
-	if (req->async_event) {
-		if (req->state == RDNS_REQUEST_WAIT_REPLY) {
+	struct rdns_resolver *resolver = req->resolver;
+
+	switch (req->state) {
+	case RDNS_REQUEST_WAIT_REPLY:
+		/* We have a timer pending */
+		if (req->async_event) {
 			req->async->del_timer (req->async->data,
 					req->async_event);
-			/* Remove from id hashes */
-			HASH_DEL (req->io->requests, req);
+			if (remove_from_hash) {
+				rdns_request_remove_from_hash(req);
+			}
 			req->async_event = NULL;
 		}
-		else if (req->state == RDNS_REQUEST_WAIT_SEND) {
+		break;
+	case RDNS_REQUEST_WAIT_SEND:
+		/* We have write request pending */
+		if (req->async_event) {
 			req->async->del_write (req->async->data,
 					req->async_event);
 			/* Remove from id hashes */
-			HASH_DEL (req->io->requests, req);
+			if (remove_from_hash) {
+				rdns_request_remove_from_hash(req);
+			}
 			req->async_event = NULL;
 		}
+		break;
+	case RDNS_REQUEST_TCP:
+		/* We also have a timer */
+		if (req->async_event) {
+			if (remove_from_hash) {
+				rdns_request_remove_from_hash(req);
+			}
+
+			req->async->del_timer(req->async->data,
+					req->async_event);
+
+			req->async_event = NULL;
+		}
+	default:
+		/* Nothing to unschedule, so blame if we have any event pending */
+		if (req->async_event) {
+			rdns_err("internal error: have unexpected pending async state on stage %d",
+					req->state);
+		}
+		break;
 	}
 }
 
 void
 rdns_request_release (struct rdns_request *req)
 {
-	rdns_request_unschedule (req);
+	rdns_request_unschedule (req, true);
 	REF_RELEASE (req);
+}
+
+void
+rdns_ioc_tcp_reset (struct rdns_io_channel *ioc)
+{
+	struct rdns_resolver *resolver = ioc->resolver;
+
+	if (IS_CHANNEL_CONNECTED(ioc)) {
+		if (ioc->tcp->async_write) {
+			resolver->async->del_write (resolver->async->data, ioc->tcp->async_write);
+			ioc->tcp->async_write = NULL;
+		}
+		if (ioc->tcp->async_read) {
+			resolver->async->del_read (resolver->async->data, ioc->tcp->async_read);
+			ioc->tcp->async_read = NULL;
+		}
+
+		/* Clean all buffers and temporaries */
+		if (ioc->tcp->cur_read_buf) {
+			free (ioc->tcp->cur_read_buf);
+			ioc->tcp->read_buf_allocated = 0;
+			ioc->tcp->next_read_size = 0;
+			ioc->tcp->cur_read = 0;
+			ioc->tcp->cur_read_buf = NULL;
+		}
+
+		struct rdns_tcp_output_chain *oc, *tmp;
+		DL_FOREACH_SAFE(ioc->tcp->output_chain, oc, tmp) {
+			DL_DELETE (ioc->tcp->output_chain, oc);
+			free (oc);
+		}
+
+		ioc->tcp->cur_output_chains = 0;
+		ioc->tcp->output_chain = NULL;
+
+		ioc->flags &= ~RDNS_CHANNEL_CONNECTED;
+	}
+
+	/* Remove all requests pending as we are unable to complete them */
+	struct rdns_request *req;
+	kh_foreach_value(ioc->requests, req, {
+		struct rdns_reply *rep = rdns_make_reply (req, RDNS_RC_NETERR);
+		/*
+		 * Unschedule request explicitly as we set state to RDNS_REQUEST_REPLIED
+		 * that will prevent timer from being removed on req dtor.
+		 *
+		 * We skip hash removal here, as the hash will be cleared as a single
+		 * operation afterwards.
+		 */
+		rdns_request_unschedule(req, false);
+		req->state = RDNS_REQUEST_REPLIED;
+		req->func (rep, req->arg);
+		REF_RELEASE (req);
+	});
+
+	if (ioc->sock != -1) {
+		close (ioc->sock);
+		ioc->sock = -1;
+	}
+	if (ioc->saddr) {
+		free (ioc->saddr);
+		ioc->saddr = NULL;
+	}
+
+	kh_clear(rdns_requests_hash, ioc->requests);
+}
+
+bool
+rdns_ioc_tcp_connect (struct rdns_io_channel *ioc)
+{
+	struct rdns_resolver *resolver = ioc->resolver;
+
+	if (IS_CHANNEL_CONNECTED(ioc)) {
+		rdns_err ("trying to connect already connected IO channel!");
+		return false;
+	}
+
+	if (ioc->flags & RDNS_CHANNEL_TCP_CONNECTING) {
+		/* Already connecting channel, ignore connect request */
+
+		return true;
+	}
+
+	if (ioc->sock == -1) {
+		ioc->sock = rdns_make_client_socket (ioc->srv->name, ioc->srv->port,
+				SOCK_STREAM, &ioc->saddr, &ioc->slen);
+		if (ioc->sock == -1) {
+			rdns_err ("cannot open socket to %s: %s", ioc->srv->name,
+					strerror (errno));
+
+			if (ioc->saddr) {
+				free (ioc->saddr);
+				ioc->saddr = NULL;
+			}
+
+			return false;
+		}
+	}
+
+	int r = connect (ioc->sock, ioc->saddr, ioc->slen);
+
+	if (r == -1) {
+		if (errno != EAGAIN && errno != EINTR && errno != EINPROGRESS) {
+			rdns_err ("cannot connect a TCP socket: %s for server %s",
+					strerror(errno), ioc->srv->name);
+			close (ioc->sock);
+
+			if (ioc->saddr) {
+				free (ioc->saddr);
+				ioc->saddr = NULL;
+			}
+
+			ioc->sock = -1;
+
+			return false;
+		}
+		else {
+			/* We need to wait for write readiness here */
+			if (ioc->tcp->async_write != NULL) {
+				rdns_err("internal rdns error: write event is already registered on connect");
+			}
+			else {
+				ioc->tcp->async_write = resolver->async->add_write(resolver->async->data,
+						ioc->sock, ioc);
+			}
+			/* Prevent double connect attempts */
+			ioc->flags |= RDNS_CHANNEL_TCP_CONNECTING;
+		}
+	}
+	else {
+		/* Always be ready to read from a TCP socket */
+		ioc->flags |= RDNS_CHANNEL_CONNECTED|RDNS_CHANNEL_ACTIVE;
+		ioc->flags &= ~RDNS_CHANNEL_TCP_CONNECTING;
+		ioc->tcp->async_read = resolver->async->add_read(resolver->async->data,
+				ioc->sock, ioc);
+	}
+
+	return true;
 }
 
 static bool

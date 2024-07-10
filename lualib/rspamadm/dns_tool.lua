@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ local ansicolors = require "ansicolors"
 local bit = require "bit"
 
 local parser = argparse()
-    :name "rspamadm dns_tool"
+    :name "rspamadm dnstool"
     :description "DNS tools provided by Rspamd"
     :help_description_margin(30)
     :command_target("command")
@@ -33,8 +33,8 @@ parser:option "-c --config"
       :default(rspamd_paths["CONFDIR"] .. "/" .. "rspamd.conf")
 
 local spf = parser:command "spf"
-                      :description "Extracts spf records"
-parser:mutex(
+                  :description "Extracts spf records"
+spf:mutex(
     spf:option "-d --domain"
        :description "Domain to use"
        :argname("<domain>"),
@@ -69,14 +69,14 @@ local function red(str)
 end
 
 local function load_config(opts)
-  local _r,err = rspamd_config:load_ucl(opts['config'])
+  local _r, err = rspamd_config:load_ucl(opts['config'])
 
   if not _r then
     rspamd_logger.errx('cannot parse %s: %s', opts['config'], err)
     os.exit(1)
   end
 
-  _r,err = rspamd_config:parse_rcl({'logging', 'worker'})
+  _r, err = rspamd_config:parse_rcl({ 'logging', 'worker' })
   if not _r then
     rspamd_logger.errx('cannot process %s: %s', opts['config'], err)
     os.exit(1)
@@ -95,12 +95,21 @@ local function spf_handler(opts)
   if opts.ip then
     opts.ip = rspamd_ip.fromstring(opts.ip)
     task:set_from_ip(opts.ip)
+  else
+    opts.all = true
   end
 
   if opts.from then
-    task:set_from('smtp', {addr = opts.from})
+    local rspamd_parsers = require "rspamd_parsers"
+    local addr_parsed = rspamd_parsers.parse_mail_address(opts.from)
+    if addr_parsed then
+      task:set_from('smtp', addr_parsed[1])
+    else
+      io.stderr:write('Invalid from addr\n')
+      os.exit(1)
+    end
   elseif opts.domain then
-    task:set_from('smtp', {user = 'user', domain = opts.domain})
+    task:set_from('smtp', { user = 'user', domain = opts.domain })
   else
     io.stderr:write('Neither domain nor from specified\n')
     os.exit(1)
@@ -119,7 +128,9 @@ local function spf_handler(opts)
   end
 
   local function display_spf_results(elt, colored)
-    local dec = function(e) return e end
+    local dec = function(e)
+      return e
+    end
     local policy_decode = function(e)
       if e == rspamd_spf.policy.fail then
         return 'reject'
@@ -135,12 +146,18 @@ local function spf_handler(opts)
     end
 
     if colored then
-      dec = function(e) return highlight(e) end
+      dec = function(e)
+        return highlight(e)
+      end
 
-      if elt.result == rspamd_spf.policy.pass  then
-        dec = function(e) return green(e) end
-      elseif elt.result  == rspamd_spf.policy.fail then
-        dec = function(e) return red(e) end
+      if elt.result == rspamd_spf.policy.pass then
+        dec = function(e)
+          return green(e)
+        end
+      elseif elt.result == rspamd_spf.policy.fail then
+        dec = function(e)
+          return red(e)
+        end
       end
 
     end
@@ -157,6 +174,8 @@ local function spf_handler(opts)
       local result, flag_or_policy, error_or_addr
       if opts.ip then
         result, flag_or_policy, error_or_addr = record:check_ip(opts.ip)
+      elseif opts.all then
+        result = true
       end
       if opts.ip and not opts.all then
         if result then
@@ -171,7 +190,7 @@ local function spf_handler(opts)
       if result then
         printf('SPF record for %s; digest: %s',
             highlight(opts.domain or opts.from), highlight(record:get_digest()))
-        for _,elt in ipairs(record:get_elts()) do
+        for _, elt in ipairs(record:get_elts()) do
           if result and error_or_addr and elt.str and elt.str == error_or_addr.str then
             printf("%s", highlight('*** Matched ***'))
             display_spf_results(elt, true)
@@ -207,7 +226,7 @@ end
 
 return {
   name = 'dnstool',
-  aliases = {'dns', 'dns_tool'},
+  aliases = { 'dns', 'dns_tool' },
   handler = handler,
   description = parser._description
 }

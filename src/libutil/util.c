@@ -1,11 +1,11 @@
-/*-
- * Copyright 2017 Vsevolod Stakhov
+/*
+ * Copyright 2024 Vsevolod Stakhov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,9 +17,9 @@
 #include "util.h"
 #include "unix-std.h"
 
-#include "xxhash.h"
 #include "ottery.h"
 #include "cryptobox.h"
+#include "contrib/libev/ev.h"
 
 #ifdef HAVE_TERMIOS_H
 #include <termios.h>
@@ -77,56 +77,48 @@
  * Should be defined in a single point
  */
 const struct rspamd_controller_pbkdf pbkdf_list[] = {
-		{
-				.name = "PBKDF2-blake2b",
-				.alias = "pbkdf2",
-				.description = "standard CPU intensive \"slow\" KDF using blake2b hash function",
-				.type = RSPAMD_CRYPTOBOX_PBKDF2,
-				.id = RSPAMD_PBKDF_ID_V1,
-				.complexity = 16000,
-				.salt_len = 20,
-				.key_len = rspamd_cryptobox_HASHBYTES / 2
-		},
-		{
-				.name = "Catena-Butterfly",
-				.alias = "catena",
-				.description = "modern CPU and memory intensive KDF",
-				.type = RSPAMD_CRYPTOBOX_CATENA,
-				.id = RSPAMD_PBKDF_ID_V2,
-				.complexity = 10,
-				.salt_len = 20,
-				.key_len = rspamd_cryptobox_HASHBYTES / 2
-		}
-};
+	{.name = "PBKDF2-blake2b",
+	 .alias = "pbkdf2",
+	 .description = "standard CPU intensive \"slow\" KDF using blake2b hash function",
+	 .type = RSPAMD_CRYPTOBOX_PBKDF2,
+	 .id = RSPAMD_PBKDF_ID_V1,
+	 .complexity = 16000,
+	 .salt_len = 20,
+	 .key_len = rspamd_cryptobox_HASHBYTES / 2},
+	{.name = "Catena-Butterfly",
+	 .alias = "catena",
+	 .description = "modern CPU and memory intensive KDF",
+	 .type = RSPAMD_CRYPTOBOX_CATENA,
+	 .id = RSPAMD_PBKDF_ID_V2,
+	 .complexity = 10,
+	 .salt_len = 20,
+	 .key_len = rspamd_cryptobox_HASHBYTES / 2}};
 
-gint
-rspamd_socket_nonblocking (gint fd)
+gint rspamd_socket_nonblocking(gint fd)
 {
 	gint ofl;
 
-	ofl = fcntl (fd, F_GETFL, 0);
+	ofl = fcntl(fd, F_GETFL, 0);
 
-	if (fcntl (fd, F_SETFL, ofl | O_NONBLOCK) == -1) {
+	if (fcntl(fd, F_SETFL, ofl | O_NONBLOCK) == -1) {
 		return -1;
 	}
 	return 0;
 }
 
-gint
-rspamd_socket_blocking (gint fd)
+gint rspamd_socket_blocking(gint fd)
 {
 	gint ofl;
 
-	ofl = fcntl (fd, F_GETFL, 0);
+	ofl = fcntl(fd, F_GETFL, 0);
 
-	if (fcntl (fd, F_SETFL, ofl & (~O_NONBLOCK)) == -1) {
+	if (fcntl(fd, F_SETFL, ofl & (~O_NONBLOCK)) == -1) {
 		return -1;
 	}
 	return 0;
 }
 
-gint
-rspamd_socket_poll (gint fd, gint timeout, short events)
+gint rspamd_socket_poll(gint fd, gint timeout, short events)
 {
 	gint r;
 	struct pollfd fds[1];
@@ -134,7 +126,7 @@ rspamd_socket_poll (gint fd, gint timeout, short events)
 	fds->fd = fd;
 	fds->events = events;
 	fds->revents = 0;
-	while ((r = poll (fds, 1, timeout)) < 0) {
+	while ((r = poll(fds, 1, timeout)) < 0) {
 		if (errno != EINTR) {
 			break;
 		}
@@ -143,24 +135,23 @@ rspamd_socket_poll (gint fd, gint timeout, short events)
 	return r;
 }
 
-gint
-rspamd_socket_create (gint af, gint type, gint protocol, gboolean async)
+gint rspamd_socket_create(gint af, gint type, gint protocol, gboolean async)
 {
 	gint fd;
 
-	fd = socket (af, type, protocol);
+	fd = socket(af, type, protocol);
 	if (fd == -1) {
 		return -1;
 	}
 
 	/* Set close on exec */
-	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
-		close (fd);
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+		close(fd);
 		return -1;
 	}
 	if (async) {
-		if (rspamd_socket_nonblocking (fd) == -1) {
-			close (fd);
+		if (rspamd_socket_nonblocking(fd) == -1) {
+			close(fd);
 			return -1;
 		}
 	}
@@ -169,8 +160,8 @@ rspamd_socket_create (gint af, gint type, gint protocol, gboolean async)
 }
 
 static gint
-rspamd_inet_socket_create (gint type, struct addrinfo *addr, gboolean is_server,
-	gboolean async, GList **list)
+rspamd_inet_socket_create(gint type, struct addrinfo *addr, gboolean is_server,
+						  gboolean async, GList **list)
 {
 	gint fd = -1, r, on = 1, s_error;
 	struct addrinfo *cur;
@@ -180,24 +171,24 @@ rspamd_inet_socket_create (gint type, struct addrinfo *addr, gboolean is_server,
 	cur = addr;
 	while (cur) {
 		/* Create socket */
-		fd = rspamd_socket_create (cur->ai_family, type, cur->ai_protocol, TRUE);
+		fd = rspamd_socket_create(cur->ai_family, type, cur->ai_protocol, TRUE);
 		if (fd == -1) {
 			goto out;
 		}
 
 		if (is_server) {
-			(void)setsockopt (fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&on,
-					sizeof (gint));
+			(void) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *) &on,
+							  sizeof(gint));
 #ifdef HAVE_IPV6_V6ONLY
 			if (cur->ai_family == AF_INET6) {
-				setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY, (const void *)&on,
-						sizeof (gint));
+				setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const void *) &on,
+						   sizeof(gint));
 			}
 #endif
-			r = bind (fd, cur->ai_addr, cur->ai_addrlen);
+			r = bind(fd, cur->ai_addr, cur->ai_addrlen);
 		}
 		else {
-			r = connect (fd, cur->ai_addr, cur->ai_addrlen);
+			r = connect(fd, cur->ai_addr, cur->ai_addrlen);
 		}
 
 		if (r == -1) {
@@ -206,14 +197,14 @@ rspamd_inet_socket_create (gint type, struct addrinfo *addr, gboolean is_server,
 			}
 			if (!async) {
 				/* Try to poll */
-				if (rspamd_socket_poll (fd, CONNECT_TIMEOUT * 1000,
-					POLLOUT) <= 0) {
+				if (rspamd_socket_poll(fd, CONNECT_TIMEOUT * 1000,
+									   POLLOUT) <= 0) {
 					errno = ETIMEDOUT;
 					goto out;
 				}
 				else {
 					/* Make synced again */
-					if (rspamd_socket_blocking (fd) < 0) {
+					if (rspamd_socket_blocking(fd) < 0) {
 						goto out;
 					}
 				}
@@ -221,9 +212,9 @@ rspamd_inet_socket_create (gint type, struct addrinfo *addr, gboolean is_server,
 		}
 		else {
 			/* Still need to check SO_ERROR on socket */
-			optlen = sizeof (s_error);
+			optlen = sizeof(s_error);
 
-			if (getsockopt (fd, SOL_SOCKET, SO_ERROR, (void *)&s_error, &optlen) != -1) {
+			if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *) &s_error, &optlen) != -1) {
 				if (s_error) {
 					errno = s_error;
 					goto out;
@@ -235,14 +226,14 @@ rspamd_inet_socket_create (gint type, struct addrinfo *addr, gboolean is_server,
 			break;
 		}
 		else if (fd != -1) {
-			ptr = GINT_TO_POINTER (fd);
-			*list = g_list_prepend (*list, ptr);
+			ptr = GINT_TO_POINTER(fd);
+			*list = g_list_prepend(*list, ptr);
 			cur = cur->ai_next;
 			continue;
 		}
-out:
+	out:
 		if (fd != -1) {
-			close (fd);
+			close(fd);
 		}
 		fd = -1;
 		cur = cur->ai_next;
@@ -251,24 +242,21 @@ out:
 	return (fd);
 }
 
-gint
-rspamd_socket_tcp (struct addrinfo *addr, gboolean is_server, gboolean async)
+gint rspamd_socket_tcp(struct addrinfo *addr, gboolean is_server, gboolean async)
 {
-	return rspamd_inet_socket_create (SOCK_STREAM, addr, is_server, async, NULL);
+	return rspamd_inet_socket_create(SOCK_STREAM, addr, is_server, async, NULL);
 }
 
-gint
-rspamd_socket_udp (struct addrinfo *addr, gboolean is_server, gboolean async)
+gint rspamd_socket_udp(struct addrinfo *addr, gboolean is_server, gboolean async)
 {
-	return rspamd_inet_socket_create (SOCK_DGRAM, addr, is_server, async, NULL);
+	return rspamd_inet_socket_create(SOCK_DGRAM, addr, is_server, async, NULL);
 }
 
-gint
-rspamd_socket_unix (const gchar *path,
-	struct sockaddr_un *addr,
-	gint type,
-	gboolean is_server,
-	gboolean async)
+gint rspamd_socket_unix(const gchar *path,
+						struct sockaddr_un *addr,
+						gint type,
+						gboolean is_server,
+						gboolean async)
 {
 
 	socklen_t optlen;
@@ -280,16 +268,16 @@ rspamd_socket_unix (const gchar *path,
 
 	addr->sun_family = AF_UNIX;
 
-	rspamd_strlcpy (addr->sun_path, path, sizeof (addr->sun_path));
+	rspamd_strlcpy(addr->sun_path, path, sizeof(addr->sun_path));
 #ifdef FREEBSD
-	addr->sun_len = SUN_LEN (addr);
+	addr->sun_len = SUN_LEN(addr);
 #endif
 
 	if (is_server) {
 		/* Unlink socket if it exists already */
-		if (lstat (addr->sun_path, &st) != -1) {
-			if (S_ISSOCK (st.st_mode)) {
-				if (unlink (addr->sun_path) == -1) {
+		if (lstat(addr->sun_path, &st) != -1) {
+			if (S_ISSOCK(st.st_mode)) {
+				if (unlink(addr->sun_path) == -1) {
 					goto out;
 				}
 			}
@@ -298,27 +286,27 @@ rspamd_socket_unix (const gchar *path,
 			}
 		}
 	}
-	fd = socket (PF_LOCAL, type, 0);
+	fd = socket(PF_LOCAL, type, 0);
 
 	if (fd == -1) {
 		return -1;
 	}
 
-	if (rspamd_socket_nonblocking (fd) < 0) {
+	if (rspamd_socket_nonblocking(fd) < 0) {
 		goto out;
 	}
 
 	/* Set close on exec */
-	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
 		goto out;
 	}
 	if (is_server) {
-		(void)setsockopt (fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&on,
-			sizeof (gint));
-		r = bind (fd, (struct sockaddr *)addr, SUN_LEN (addr));
+		(void) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *) &on,
+						  sizeof(gint));
+		r = bind(fd, (struct sockaddr *) addr, SUN_LEN(addr));
 	}
 	else {
-		r = connect (fd, (struct sockaddr *)addr, SUN_LEN (addr));
+		r = connect(fd, (struct sockaddr *) addr, SUN_LEN(addr));
 	}
 
 	if (r == -1) {
@@ -327,13 +315,13 @@ rspamd_socket_unix (const gchar *path,
 		}
 		if (!async) {
 			/* Try to poll */
-			if (rspamd_socket_poll (fd, CONNECT_TIMEOUT * 1000, POLLOUT) <= 0) {
+			if (rspamd_socket_poll(fd, CONNECT_TIMEOUT * 1000, POLLOUT) <= 0) {
 				errno = ETIMEDOUT;
 				goto out;
 			}
 			else {
 				/* Make synced again */
-				if (rspamd_socket_blocking (fd) < 0) {
+				if (rspamd_socket_blocking(fd) < 0) {
 					goto out;
 				}
 			}
@@ -341,9 +329,9 @@ rspamd_socket_unix (const gchar *path,
 	}
 	else {
 		/* Still need to check SO_ERROR on socket */
-		optlen = sizeof (s_error);
+		optlen = sizeof(s_error);
 
-		if (getsockopt (fd, SOL_SOCKET, SO_ERROR, (void *)&s_error, &optlen) != -1) {
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *) &s_error, &optlen) != -1) {
 			if (s_error) {
 				errno = s_error;
 				goto out;
@@ -357,14 +345,14 @@ rspamd_socket_unix (const gchar *path,
 out:
 	serrno = errno;
 	if (fd != -1) {
-		close (fd);
+		close(fd);
 	}
 	errno = serrno;
 	return (-1);
 }
 
 static int
-rspamd_prefer_v4_hack (const struct addrinfo *a1, const struct addrinfo *a2)
+rspamd_prefer_v4_hack(const struct addrinfo *a1, const struct addrinfo *a2)
 {
 	return a1->ai_addr->sa_family - a2->ai_addr->sa_family;
 }
@@ -373,13 +361,12 @@ rspamd_prefer_v4_hack (const struct addrinfo *a1, const struct addrinfo *a2)
  * Make a universal socket
  * @param credits host, ip or path to unix socket
  * @param port port (used for network sockets)
- * @param async make this socket asynced
+ * @param async make this socket async
  * @param is_server make this socket as server socket
  * @param try_resolve try name resolution for a socket (BLOCKING)
  */
-gint
-rspamd_socket (const gchar *credits, guint16 port,
-	gint type, gboolean async, gboolean is_server, gboolean try_resolve)
+gint rspamd_socket(const gchar *credits, guint16 port,
+				   gint type, gboolean async, gboolean is_server, gboolean try_resolve)
 {
 	struct sockaddr_un un;
 	struct stat st;
@@ -389,10 +376,10 @@ rspamd_socket (const gchar *credits, guint16 port,
 
 	if (*credits == '/') {
 		if (is_server) {
-			return rspamd_socket_unix (credits, &un, type, is_server, async);
+			return rspamd_socket_unix(credits, &un, type, is_server, async);
 		}
 		else {
-			r = stat (credits, &st);
+			r = stat(credits, &st);
 			if (r == -1) {
 				/* Unix socket doesn't exists it must be created first */
 				errno = ENOENT;
@@ -405,22 +392,22 @@ rspamd_socket (const gchar *credits, guint16 port,
 					return -1;
 				}
 				else {
-					return rspamd_socket_unix (credits,
-							   &un,
-							   type,
-							   is_server,
-							   async);
+					return rspamd_socket_unix(credits,
+											  &un,
+											  type,
+											  is_server,
+											  async);
 				}
 			}
 		}
 	}
 	else {
 		/* TCP related part */
-		memset (&hints, 0, sizeof (hints));
-		hints.ai_family = AF_UNSPEC;     /* Allow IPv4 or IPv6 */
-		hints.ai_socktype = type; /* Type of the socket */
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC; /* Allow IPv4 or IPv6 */
+		hints.ai_socktype = type;    /* Type of the socket */
 		hints.ai_flags = is_server ? AI_PASSIVE : 0;
-		hints.ai_protocol = 0;           /* Any protocol */
+		hints.ai_protocol = 0; /* Any protocol */
 		hints.ai_canonname = NULL;
 		hints.ai_addr = NULL;
 		hints.ai_next = NULL;
@@ -429,11 +416,11 @@ rspamd_socket (const gchar *credits, guint16 port,
 			hints.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
 		}
 
-		rspamd_snprintf (portbuf, sizeof (portbuf), "%d", (int)port);
-		if ((r = getaddrinfo (credits, portbuf, &hints, &res)) == 0) {
-			LL_SORT2 (res, rspamd_prefer_v4_hack, ai_next);
-			r = rspamd_inet_socket_create (type, res, is_server, async, NULL);
-			freeaddrinfo (res);
+		rspamd_snprintf(portbuf, sizeof(portbuf), "%d", (int) port);
+		if ((r = getaddrinfo(credits, portbuf, &hints, &res)) == 0) {
+			LL_SORT2(res, rspamd_prefer_v4_hack, ai_next);
+			r = rspamd_inet_socket_create(type, res, is_server, async, NULL);
+			freeaddrinfo(res);
 			return r;
 		}
 		else {
@@ -443,21 +430,21 @@ rspamd_socket (const gchar *credits, guint16 port,
 }
 
 gboolean
-rspamd_socketpair (gint pair[2], gint af)
+rspamd_socketpair(gint pair[2], gint af)
 {
 	gint r = -1, serrno;
 
 #ifdef HAVE_SOCK_SEQPACKET
 	if (af == SOCK_SEQPACKET) {
-		r = socketpair (AF_LOCAL, SOCK_SEQPACKET, 0, pair);
+		r = socketpair(AF_LOCAL, SOCK_SEQPACKET, 0, pair);
 
 		if (r == -1) {
-			r = socketpair (AF_LOCAL, SOCK_DGRAM, 0, pair);
+			r = socketpair(AF_LOCAL, SOCK_DGRAM, 0, pair);
 		}
 	}
 #endif
 	if (r == -1) {
-		r = socketpair (AF_LOCAL, af, 0, pair);
+		r = socketpair(AF_LOCAL, af, 0, pair);
 	}
 
 	if (r == -1) {
@@ -465,10 +452,10 @@ rspamd_socketpair (gint pair[2], gint af)
 	}
 
 	/* Set close on exec */
-	if (fcntl (pair[0], F_SETFD, FD_CLOEXEC) == -1) {
+	if (fcntl(pair[0], F_SETFD, FD_CLOEXEC) == -1) {
 		goto out;
 	}
-	if (fcntl (pair[1], F_SETFD, FD_CLOEXEC) == -1) {
+	if (fcntl(pair[1], F_SETFD, FD_CLOEXEC) == -1) {
 		goto out;
 	}
 
@@ -476,40 +463,38 @@ rspamd_socketpair (gint pair[2], gint af)
 
 out:
 	serrno = errno;
-	close (pair[0]);
-	close (pair[1]);
+	close(pair[0]);
+	close(pair[1]);
 	errno = serrno;
 
 	return FALSE;
 }
 
 #ifdef HAVE_SA_SIGINFO
-void
-rspamd_signals_init (struct sigaction *signals, void (*sig_handler)(gint,
-	siginfo_t *,
-	void *))
+void rspamd_signals_init(struct sigaction *signals, void (*sig_handler)(gint,
+																		siginfo_t *,
+																		void *))
 #else
-void
-rspamd_signals_init (struct sigaction *signals, void (*sig_handler)(gint))
+void rspamd_signals_init(struct sigaction *signals, void (*sig_handler)(gint))
 #endif
 {
 	struct sigaction sigpipe_act;
 	/* Setting up signal handlers */
 	/* SIGUSR1 - reopen config file */
 	/* SIGUSR2 - worker is ready for accept */
-	sigemptyset (&signals->sa_mask);
-	sigaddset (&signals->sa_mask, SIGTERM);
-	sigaddset (&signals->sa_mask, SIGINT);
-	sigaddset (&signals->sa_mask, SIGHUP);
-	sigaddset (&signals->sa_mask, SIGCHLD);
-	sigaddset (&signals->sa_mask, SIGUSR1);
-	sigaddset (&signals->sa_mask, SIGUSR2);
-	sigaddset (&signals->sa_mask, SIGALRM);
+	sigemptyset(&signals->sa_mask);
+	sigaddset(&signals->sa_mask, SIGTERM);
+	sigaddset(&signals->sa_mask, SIGINT);
+	sigaddset(&signals->sa_mask, SIGHUP);
+	sigaddset(&signals->sa_mask, SIGCHLD);
+	sigaddset(&signals->sa_mask, SIGUSR1);
+	sigaddset(&signals->sa_mask, SIGUSR2);
+	sigaddset(&signals->sa_mask, SIGALRM);
 #ifdef SIGPOLL
-	sigaddset (&signals->sa_mask, SIGPOLL);
+	sigaddset(&signals->sa_mask, SIGPOLL);
 #endif
 #ifdef SIGIO
-	sigaddset (&signals->sa_mask, SIGIO);
+	sigaddset(&signals->sa_mask, SIGIO);
 #endif
 
 #ifdef HAVE_SA_SIGINFO
@@ -520,26 +505,26 @@ rspamd_signals_init (struct sigaction *signals, void (*sig_handler)(gint))
 	signals->sa_handler = sig_handler;
 	signals->sa_flags = 0;
 #endif
-	sigaction (SIGTERM, signals, NULL);
-	sigaction (SIGINT,	signals, NULL);
-	sigaction (SIGHUP,	signals, NULL);
-	sigaction (SIGCHLD, signals, NULL);
-	sigaction (SIGUSR1, signals, NULL);
-	sigaction (SIGUSR2, signals, NULL);
-	sigaction (SIGALRM, signals, NULL);
+	sigaction(SIGTERM, signals, NULL);
+	sigaction(SIGINT, signals, NULL);
+	sigaction(SIGHUP, signals, NULL);
+	sigaction(SIGCHLD, signals, NULL);
+	sigaction(SIGUSR1, signals, NULL);
+	sigaction(SIGUSR2, signals, NULL);
+	sigaction(SIGALRM, signals, NULL);
 #ifdef SIGPOLL
-	sigaction (SIGPOLL, signals, NULL);
+	sigaction(SIGPOLL, signals, NULL);
 #endif
 #ifdef SIGIO
-	sigaction (SIGIO, signals, NULL);
+	sigaction(SIGIO, signals, NULL);
 #endif
 
 	/* Ignore SIGPIPE as we handle write errors manually */
-	sigemptyset (&sigpipe_act.sa_mask);
-	sigaddset (&sigpipe_act.sa_mask, SIGPIPE);
+	sigemptyset(&sigpipe_act.sa_mask);
+	sigaddset(&sigpipe_act.sa_mask, SIGPIPE);
 	sigpipe_act.sa_handler = SIG_IGN;
 	sigpipe_act.sa_flags = 0;
-	sigaction (SIGPIPE, &sigpipe_act, NULL);
+	sigaction(SIGPIPE, &sigpipe_act, NULL);
 }
 
 #ifndef HAVE_SETPROCTITLE
@@ -548,28 +533,33 @@ rspamd_signals_init (struct sigaction *signals, void (*sig_handler)(gint))
 static gchar *title_buffer = NULL;
 static size_t title_buffer_size = 0;
 static gchar *title_progname, *title_progname_full;
-#endif
+gchar **old_environ = NULL;
 
-#ifdef LINUX
 static void
-rspamd_title_dtor (gpointer d)
+rspamd_title_dtor(gpointer d)
 {
-	gchar **env = (gchar **)d;
+	/* Restore old environment */
+	if (old_environ != NULL) {
+		environ = old_environ;
+	}
+
+	gchar **env = (gchar **) d;
 	guint i;
 
 	for (i = 0; env[i] != NULL; i++) {
-		g_free (env[i]);
+		g_free(env[i]);
 	}
 
-	g_free (env);
+	g_free(env);
 }
-#endif
+#endif /* ifdef LINUX */
 
-gint
-init_title (rspamd_mempool_t *pool,
-		gint argc, gchar *argv[], gchar *envp[])
+#endif /* ifndef HAVE_SETPROCTITLE */
+
+gint rspamd_init_title(rspamd_mempool_t *pool,
+					   gint argc, gchar *argv[], gchar *envp[])
 {
-#ifdef LINUX
+#if defined(LINUX) && !defined(HAVE_SETPROCTITLE)
 	gchar *begin_of_buffer = 0, *end_of_buffer = 0;
 	gint i;
 
@@ -578,7 +568,7 @@ init_title (rspamd_mempool_t *pool,
 			begin_of_buffer = argv[i];
 		}
 		if (!end_of_buffer || end_of_buffer + 1 == argv[i]) {
-			end_of_buffer = argv[i] + strlen (argv[i]);
+			end_of_buffer = argv[i] + strlen(argv[i]);
 		}
 	}
 
@@ -587,7 +577,7 @@ init_title (rspamd_mempool_t *pool,
 			begin_of_buffer = envp[i];
 		}
 		if (!end_of_buffer || end_of_buffer + 1 == envp[i]) {
-			end_of_buffer = envp[i] + strlen (envp[i]);
+			end_of_buffer = envp[i] + strlen(envp[i]);
 		}
 	}
 
@@ -595,18 +585,18 @@ init_title (rspamd_mempool_t *pool,
 		return 0;
 	}
 
-	gchar **new_environ = g_malloc ((i + 1) * sizeof (envp[0]));
+	gchar **new_environ = g_malloc((i + 1) * sizeof(envp[0]));
 
 	for (i = 0; envp[i]; ++i) {
-		new_environ[i] = g_strdup (envp[i]);
+		new_environ[i] = g_strdup(envp[i]);
 	}
 
 	new_environ[i] = NULL;
 
 	if (program_invocation_name) {
-		title_progname_full = g_strdup (program_invocation_name);
+		title_progname_full = g_strdup(program_invocation_name);
 
-		gchar *p = strrchr (title_progname_full, '/');
+		gchar *p = strrchr(title_progname_full, '/');
 
 		if (p) {
 			title_progname = p + 1;
@@ -619,58 +609,71 @@ init_title (rspamd_mempool_t *pool,
 		program_invocation_short_name = title_progname;
 	}
 
+	old_environ = environ;
 	environ = new_environ;
 	title_buffer = begin_of_buffer;
 	title_buffer_size = end_of_buffer - begin_of_buffer;
 
-	rspamd_mempool_add_destructor (pool,
-			rspamd_title_dtor, new_environ);
+	rspamd_mempool_add_destructor(pool,
+								  rspamd_title_dtor,
+								  new_environ);
 #endif
 
 	return 0;
 }
 
-gint
-setproctitle (const gchar *fmt, ...)
+gint rspamd_setproctitle(const gchar *fmt, ...)
 {
+#ifdef HAVE_SETPROCTITLE
+	if (fmt) {
+		static char titlebuf[4096];
+		va_list ap;
+
+		va_start(ap, fmt);
+		rspamd_vsnprintf(titlebuf, sizeof(titlebuf), fmt, ap);
+		va_end(ap);
+
+		setproctitle("%s", titlebuf);
+	}
+#else
 #if defined(LINUX)
 	if (!title_buffer || !title_buffer_size) {
 		errno = ENOMEM;
 		return -1;
 	}
 
-	memset (title_buffer, '\0', title_buffer_size);
+	memset(title_buffer, '\0', title_buffer_size);
 
 	ssize_t written;
 
 	if (fmt) {
 		va_list ap;
 
-		written = rspamd_snprintf (title_buffer,
-				title_buffer_size,
-				"%s: ",
-				title_progname);
+		written = rspamd_snprintf(title_buffer,
+								  title_buffer_size,
+								  "%s: ",
+								  title_progname);
 		if (written < 0 || (size_t) written >= title_buffer_size)
 			return -1;
 
-		va_start (ap, fmt);
-		rspamd_vsnprintf (title_buffer + written,
-				title_buffer_size - written,
-				fmt,
-				ap);
-		va_end (ap);
+		va_start(ap, fmt);
+		rspamd_vsnprintf(title_buffer + written,
+						 title_buffer_size - written,
+						 fmt,
+						 ap);
+		va_end(ap);
 	}
 	else {
-		written = rspamd_snprintf (title_buffer,
-				title_buffer_size,
-				"%s",
-				title_progname);
+		written = rspamd_snprintf(title_buffer,
+								  title_buffer_size,
+								  "%s",
+								  title_progname);
 		if (written < 0 || (size_t) written >= title_buffer_size)
 			return -1;
 	}
 
-	written = strlen (title_buffer);
-	memset (title_buffer + written, '\0', title_buffer_size - written);
+	written = strlen(title_buffer);
+	memset(title_buffer + written, '\0', title_buffer_size - written);
 #elif defined(__APPLE__)
 	/* OSX is broken, ignore this brain damaged system */
 #else
@@ -678,25 +681,26 @@ setproctitle (const gchar *fmt, ...)
 	GString *dest;
 	va_list ap;
 
-	dest = g_string_new ("");
-	va_start (ap, fmt);
-	rspamd_vprintf_gstring (dest, fmt, ap);
-	va_end (ap);
+	dest = g_string_new("");
+	va_start(ap, fmt);
+	rspamd_vprintf_gstring(dest, fmt, ap);
+	va_end(ap);
 
-	g_set_prgname (dest->str);
-	g_string_free (dest, TRUE);
+	g_set_prgname(dest->str);
+	g_string_free(dest, TRUE);
 
-#endif
+#endif /* defined(LINUX) */
+
+#endif /* HAVE_SETPROCTITLE */
 	return 0;
 }
 
-#endif
 
 #ifndef HAVE_PIDFILE
-static gint _rspamd_pidfile_remove (rspamd_pidfh_t *pfh, gint freeit);
+static gint _rspamd_pidfile_remove(rspamd_pidfh_t *pfh, gint freeit);
 
 static gint
-rspamd_pidfile_verify (rspamd_pidfh_t *pfh)
+rspamd_pidfile_verify(rspamd_pidfh_t *pfh)
 {
 	struct stat sb;
 
@@ -705,7 +709,7 @@ rspamd_pidfile_verify (rspamd_pidfh_t *pfh)
 	/*
 	 * Check remembered descriptor.
 	 */
-	if (fstat (pfh->pf_fd, &sb) == -1)
+	if (fstat(pfh->pf_fd, &sb) == -1)
 		return (errno);
 	if (sb.st_dev != pfh->pf_dev || sb.st_ino != pfh->pf_ino)
 		return -1;
@@ -713,25 +717,25 @@ rspamd_pidfile_verify (rspamd_pidfh_t *pfh)
 }
 
 static gint
-rspamd_pidfile_read (const gchar *path, pid_t * pidptr)
+rspamd_pidfile_read(const gchar *path, pid_t *pidptr)
 {
 	gchar buf[16], *endptr;
 	gint error, fd, i;
 
-	fd = open (path, O_RDONLY);
+	fd = open(path, O_RDONLY);
 	if (fd == -1)
 		return (errno);
 
-	i = read (fd, buf, sizeof (buf) - 1);
-	error = errno;              /* Remember errno in case close() wants to change it. */
-	close (fd);
+	i = read(fd, buf, sizeof(buf) - 1);
+	error = errno; /* Remember errno in case close() wants to change it. */
+	close(fd);
 	if (i == -1)
 		return error;
 	else if (i == 0)
 		return EAGAIN;
 	buf[i] = '\0';
 
-	*pidptr = strtol (buf, &endptr, 10);
+	*pidptr = strtol(buf, &endptr, 10);
 	if (endptr != &buf[i])
 		return EINVAL;
 
@@ -739,66 +743,66 @@ rspamd_pidfile_read (const gchar *path, pid_t * pidptr)
 }
 
 rspamd_pidfh_t *
-rspamd_pidfile_open (const gchar *path, mode_t mode, pid_t * pidptr)
+rspamd_pidfile_open(const gchar *path, mode_t mode, pid_t *pidptr)
 {
 	rspamd_pidfh_t *pfh;
 	struct stat sb;
 	gint error, fd, len, count;
 	struct timespec rqtp;
 
-	pfh = g_malloc (sizeof (*pfh));
+	pfh = g_malloc(sizeof(*pfh));
 	if (pfh == NULL)
 		return NULL;
 
 	if (path == NULL)
-		len = snprintf (pfh->pf_path,
-				sizeof (pfh->pf_path),
-				"/var/run/%s.pid",
-				g_get_prgname ());
+		len = snprintf(pfh->pf_path,
+					   sizeof(pfh->pf_path),
+					   "/var/run/%s.pid",
+					   g_get_prgname());
 	else
-		len = snprintf (pfh->pf_path, sizeof (pfh->pf_path), "%s", path);
-	if (len >= (gint)sizeof (pfh->pf_path)) {
-		g_free (pfh);
+		len = snprintf(pfh->pf_path, sizeof(pfh->pf_path), "%s", path);
+	if (len >= (gint) sizeof(pfh->pf_path)) {
+		g_free(pfh);
 		errno = ENAMETOOLONG;
 		return NULL;
 	}
 
 	/*
 	 * Open the PID file and obtain exclusive lock.
-	 * We truncate PID file here only to remove old PID immediatelly,
+	 * We truncate PID file here only to remove old PID immediately,
 	 * PID file will be truncated again in pidfile_write(), so
 	 * pidfile_write() can be called multiple times.
 	 */
-	fd = open (pfh->pf_path, O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK, mode);
-	rspamd_file_lock (fd, TRUE);
+	fd = open(pfh->pf_path, O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK, mode);
+	rspamd_file_lock(fd, TRUE);
 	if (fd == -1) {
 		count = 0;
 		rqtp.tv_sec = 0;
 		rqtp.tv_nsec = 5000000;
 		if (errno == EWOULDBLOCK && pidptr != NULL) {
-again:
-			errno = rspamd_pidfile_read (pfh->pf_path, pidptr);
+		again:
+			errno = rspamd_pidfile_read(pfh->pf_path, pidptr);
 			if (errno == 0)
 				errno = EEXIST;
 			else if (errno == EAGAIN) {
 				if (++count <= 3) {
-					nanosleep (&rqtp, 0);
+					nanosleep(&rqtp, 0);
 					goto again;
 				}
 			}
 		}
-		g_free (pfh);
+		g_free(pfh);
 		return NULL;
 	}
 	/*
 	 * Remember file information, so in pidfile_write() we are sure we write
 	 * to the proper descriptor.
 	 */
-	if (fstat (fd, &sb) == -1) {
+	if (fstat(fd, &sb) == -1) {
 		error = errno;
-		unlink (pfh->pf_path);
-		close (fd);
-		g_free (pfh);
+		unlink(pfh->pf_path);
+		close(fd);
+		g_free(pfh);
 		errno = error;
 		return NULL;
 	}
@@ -810,8 +814,7 @@ again:
 	return pfh;
 }
 
-gint
-rspamd_pidfile_write (rspamd_pidfh_t *pfh)
+gint rspamd_pidfile_write(rspamd_pidfh_t *pfh)
 {
 	gchar pidstr[16];
 	gint error, fd;
@@ -820,7 +823,7 @@ rspamd_pidfile_write (rspamd_pidfh_t *pfh)
 	 * Check remembered descriptor, so we don't overwrite some other
 	 * file if pidfile was closed and descriptor reused.
 	 */
-	errno = rspamd_pidfile_verify (pfh);
+	errno = rspamd_pidfile_verify(pfh);
 	if (errno != 0) {
 		/*
 		 * Don't close descriptor, because we are not sure if it's ours.
@@ -832,17 +835,17 @@ rspamd_pidfile_write (rspamd_pidfh_t *pfh)
 	/*
 	 * Truncate PID file, so multiple calls of pidfile_write() are allowed.
 	 */
-	if (ftruncate (fd, 0) == -1) {
+	if (ftruncate(fd, 0) == -1) {
 		error = errno;
-		_rspamd_pidfile_remove (pfh, 0);
+		_rspamd_pidfile_remove(pfh, 0);
 		errno = error;
 		return -1;
 	}
 
-	rspamd_snprintf (pidstr, sizeof (pidstr), "%P", getpid ());
-	if (pwrite (fd, pidstr, strlen (pidstr), 0) != (ssize_t) strlen (pidstr)) {
+	rspamd_snprintf(pidstr, sizeof(pidstr), "%P", getpid());
+	if (pwrite(fd, pidstr, strlen(pidstr), 0) != (ssize_t) strlen(pidstr)) {
 		error = errno;
-		_rspamd_pidfile_remove (pfh, 0);
+		_rspamd_pidfile_remove(pfh, 0);
 		errno = error;
 		return -1;
 	}
@@ -850,20 +853,19 @@ rspamd_pidfile_write (rspamd_pidfh_t *pfh)
 	return 0;
 }
 
-gint
-rspamd_pidfile_close (rspamd_pidfh_t *pfh)
+gint rspamd_pidfile_close(rspamd_pidfh_t *pfh)
 {
 	gint error;
 
-	error = rspamd_pidfile_verify (pfh);
+	error = rspamd_pidfile_verify(pfh);
 	if (error != 0) {
 		errno = error;
 		return -1;
 	}
 
-	if (close (pfh->pf_fd) == -1)
+	if (close(pfh->pf_fd) == -1)
 		error = errno;
-	g_free (pfh);
+	g_free(pfh);
 	if (error != 0) {
 		errno = error;
 		return -1;
@@ -872,28 +874,28 @@ rspamd_pidfile_close (rspamd_pidfh_t *pfh)
 }
 
 static gint
-_rspamd_pidfile_remove (rspamd_pidfh_t *pfh, gint freeit)
+_rspamd_pidfile_remove(rspamd_pidfh_t *pfh, gint freeit)
 {
 	gint error;
 
-	error = rspamd_pidfile_verify (pfh);
+	error = rspamd_pidfile_verify(pfh);
 	if (error != 0) {
 		errno = error;
 		return -1;
 	}
 
-	if (unlink (pfh->pf_path) == -1)
+	if (unlink(pfh->pf_path) == -1)
 		error = errno;
-	if (!rspamd_file_unlock (pfh->pf_fd, FALSE)) {
+	if (!rspamd_file_unlock(pfh->pf_fd, FALSE)) {
 		if (error == 0)
 			error = errno;
 	}
-	if (close (pfh->pf_fd) == -1) {
+	if (close(pfh->pf_fd) == -1) {
 		if (error == 0)
 			error = errno;
 	}
 	if (freeit)
-		g_free (pfh);
+		g_free(pfh);
 	else
 		pfh->pf_fd = -1;
 	if (error != 0) {
@@ -903,34 +905,33 @@ _rspamd_pidfile_remove (rspamd_pidfh_t *pfh, gint freeit)
 	return 0;
 }
 
-gint
-rspamd_pidfile_remove (rspamd_pidfh_t *pfh)
+gint rspamd_pidfile_remove(rspamd_pidfh_t *pfh)
 {
 
-	return (_rspamd_pidfile_remove (pfh, 1));
+	return (_rspamd_pidfile_remove(pfh, 1));
 }
 #endif
 
 /* Replace %r with rcpt value and %f with from value, new string is allocated in pool */
 gchar *
-resolve_stat_filename (rspamd_mempool_t * pool,
-	gchar *pattern,
-	gchar *rcpt,
-	gchar *from)
+resolve_stat_filename(rspamd_mempool_t *pool,
+					  gchar *pattern,
+					  gchar *rcpt,
+					  gchar *from)
 {
 	gint need_to_format = 0, len = 0;
 	gint rcptlen, fromlen;
 	gchar *c = pattern, *new, *s;
 
 	if (rcpt) {
-		rcptlen = strlen (rcpt);
+		rcptlen = strlen(rcpt);
 	}
 	else {
 		rcptlen = 0;
 	}
 
 	if (from) {
-		fromlen = strlen (from);
+		fromlen = strlen(from);
 	}
 	else {
 		fromlen = 0;
@@ -959,7 +960,7 @@ resolve_stat_filename (rspamd_mempool_t * pool,
 	}
 
 	/* Allocate new string */
-	new = rspamd_mempool_alloc (pool, len);
+	new = rspamd_mempool_alloc(pool, len);
 	c = pattern;
 	s = new;
 
@@ -967,7 +968,7 @@ resolve_stat_filename (rspamd_mempool_t * pool,
 	while (*c++) {
 		if (*c == '%' && *(c + 1) == 'r') {
 			c += 2;
-			memcpy (s, rcpt, rcptlen);
+			memcpy(s, rcpt, rcptlen);
 			s += rcptlen;
 			continue;
 		}
@@ -980,7 +981,7 @@ resolve_stat_filename (rspamd_mempool_t * pool,
 }
 
 const gchar *
-rspamd_log_check_time (gdouble start, gdouble end, gint resolution)
+rspamd_log_check_time(gdouble start, gdouble end, gint resolution)
 {
 	gdouble diff;
 	static gchar res[64];
@@ -988,17 +989,17 @@ rspamd_log_check_time (gdouble start, gdouble end, gint resolution)
 
 	diff = (end - start) * 1000.0;
 
-	rspamd_snprintf (fmt, sizeof (fmt), "%%.%dfms", resolution);
-	rspamd_snprintf (res, sizeof (res), fmt, diff);
+	rspamd_snprintf(fmt, sizeof(fmt), "%%.%dfms", resolution);
+	rspamd_snprintf(res, sizeof(res), fmt, diff);
 
-	return (const gchar *)res;
+	return (const gchar *) res;
 }
 
 
 #ifdef HAVE_FLOCK
 /* Flock version */
 gboolean
-rspamd_file_lock (gint fd, gboolean async)
+rspamd_file_lock(gint fd, gboolean async)
 {
 	gint flags;
 
@@ -1009,11 +1010,7 @@ rspamd_file_lock (gint fd, gboolean async)
 		flags = LOCK_EX;
 	}
 
-	if (flock (fd, flags) == -1) {
-		if (async && errno == EAGAIN) {
-			return FALSE;
-		}
-
+	if (flock(fd, flags) == -1) {
 		return FALSE;
 	}
 
@@ -1021,7 +1018,7 @@ rspamd_file_lock (gint fd, gboolean async)
 }
 
 gboolean
-rspamd_file_unlock (gint fd, gboolean async)
+rspamd_file_unlock(gint fd, gboolean async)
 {
 	gint flags;
 
@@ -1032,7 +1029,7 @@ rspamd_file_unlock (gint fd, gboolean async)
 		flags = LOCK_UN;
 	}
 
-	if (flock (fd, flags) == -1) {
+	if (flock(fd, flags) == -1) {
 		if (async && errno == EAGAIN) {
 			return FALSE;
 		}
@@ -1041,26 +1038,21 @@ rspamd_file_unlock (gint fd, gboolean async)
 	}
 
 	return TRUE;
-
 }
-#else /* HAVE_FLOCK */
+#else  /* HAVE_FLOCK */
 /* Fctnl version */
 gboolean
-rspamd_file_lock (gint fd, gboolean async)
+rspamd_file_lock(gint fd, gboolean async)
 {
 	struct flock fl = {
 		.l_type = F_WRLCK,
 		.l_whence = SEEK_SET,
 		.l_start = 0,
-		.l_len = 0
-	};
+		.l_len = 0};
 
-	if (fcntl (fd, async ? F_SETLK : F_SETLKW, &fl) == -1) {
+	if (fcntl(fd, async ? F_SETLK : F_SETLKW, &fl) == -1) {
 		if (async && (errno == EAGAIN || errno == EACCES)) {
 			return FALSE;
-		}
-		if (errno != ENOTSUP) {
-			msg_warn ("lock on file failed: %s", strerror (errno));
 		}
 
 		return FALSE;
@@ -1070,108 +1062,98 @@ rspamd_file_lock (gint fd, gboolean async)
 }
 
 gboolean
-rspamd_file_unlock (gint fd, gboolean async)
+rspamd_file_unlock(gint fd, gboolean async)
 {
 	struct flock fl = {
 		.l_type = F_UNLCK,
 		.l_whence = SEEK_SET,
 		.l_start = 0,
-		.l_len = 0
-	};
+		.l_len = 0};
 
-	if (fcntl (fd, async ? F_SETLK : F_SETLKW, &fl) == -1) {
+	if (fcntl(fd, async ? F_SETLK : F_SETLKW, &fl) == -1) {
 		if (async && (errno == EAGAIN || errno == EACCES)) {
 			return FALSE;
 		}
 
-		if (errno != ENOTSUP) {
-			msg_warn ("unlock on file failed: %s", strerror (errno));
-		}
 		return FALSE;
 	}
 
 	return TRUE;
-
 }
 #endif /* HAVE_FLOCK */
 
 
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 22))
-void
-g_ptr_array_unref (GPtrArray *array)
+void g_ptr_array_unref(GPtrArray *array)
 {
-	g_ptr_array_free (array, TRUE);
+	g_ptr_array_free(array, TRUE);
 }
 gboolean
-g_int64_equal (gconstpointer v1, gconstpointer v2)
+g_int64_equal(gconstpointer v1, gconstpointer v2)
 {
-	return *((const gint64*) v1) == *((const gint64*) v2);
+	return *((const gint64 *) v1) == *((const gint64 *) v2);
 }
-guint
-g_int64_hash (gconstpointer v)
+guint g_int64_hash(gconstpointer v)
 {
-	guint64 v64 = *(guint64 *)v;
+	guint64 v64 = *(guint64 *) v;
 
 	return (guint) (v ^ (v >> 32));
 }
 #endif
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 14))
-void
-g_queue_clear (GQueue *queue)
+void g_queue_clear(GQueue *queue)
 {
-	g_return_if_fail (queue != NULL);
+	g_return_if_fail(queue != NULL);
 
-	g_list_free (queue->head);
+	g_list_free(queue->head);
 	queue->head = queue->tail = NULL;
 	queue->length = 0;
 }
 #endif
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 30))
-GPtrArray*
-g_ptr_array_new_full (guint reserved_size,
-		GDestroyNotify element_free_func)
+GPtrArray *
+g_ptr_array_new_full(guint reserved_size,
+					 GDestroyNotify element_free_func)
 {
 	GPtrArray *array;
 
-	array = g_ptr_array_sized_new (reserved_size);
-	g_ptr_array_set_free_func (array, element_free_func);
+	array = g_ptr_array_sized_new(reserved_size);
+	g_ptr_array_set_free_func(array, element_free_func);
 
 	return array;
 }
 #endif
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 32))
-void
-g_queue_free_full (GQueue *queue, GDestroyNotify free_func)
+void g_queue_free_full(GQueue *queue, GDestroyNotify free_func)
 {
 	GList *cur;
 
 	cur = queue->head;
 
 	while (cur) {
-		free_func (cur->data);
-		cur = g_list_next (cur);
+		free_func(cur->data);
+		cur = g_list_next(cur);
 	}
 
-	g_queue_free (queue);
+	g_queue_free(queue);
 }
 #endif
 
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 40))
-void
-g_ptr_array_insert (GPtrArray *array, gint index_, gpointer data)
+void g_ptr_array_insert(GPtrArray *array, gint index_, gpointer data)
 {
-	g_return_if_fail (array);
-	g_return_if_fail (index_ >= -1);
-	g_return_if_fail (index_ <= (gint )array->len);
+	g_return_if_fail(array);
+	g_return_if_fail(index_ >= -1);
+	g_return_if_fail(index_ <= (gint) array->len);
 
-	g_ptr_array_set_size (array, array->len + 1);
+	g_ptr_array_set_size(array, array->len + 1);
 
 	if (index_ < 0) {
 		index_ = array->len;
 	}
 
 	if (index_ < array->len) {
-		memmove (&(array->pdata[index_ + 1]), &(array->pdata[index_]),
+		memmove(&(array->pdata[index_ + 1]), &(array->pdata[index_]),
 				(array->len - index_) * sizeof(gpointer));
 	}
 
@@ -1181,7 +1163,7 @@ g_ptr_array_insert (GPtrArray *array, gint index_, gpointer data)
 
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION < 32))
 const gchar *
-g_environ_getenv (gchar **envp, const gchar *variable)
+g_environ_getenv(gchar **envp, const gchar *variable)
 {
 	gsize len;
 	gint i;
@@ -1190,10 +1172,10 @@ g_environ_getenv (gchar **envp, const gchar *variable)
 		return NULL;
 	}
 
-	len = strlen (variable);
+	len = strlen(variable);
 
 	for (i = 0; envp[i]; i++) {
-		if (strncmp (envp[i], variable, len) == 0 && envp[i][len] == '=') {
+		if (strncmp(envp[i], variable, len) == 0 && envp[i][len] == '=') {
 			return envp[i] + len + 1;
 		}
 	}
@@ -1202,13 +1184,12 @@ g_environ_getenv (gchar **envp, const gchar *variable)
 }
 #endif
 
-gint
-rspamd_fallocate (gint fd, off_t offset, off_t len)
+gint rspamd_fallocate(gint fd, off_t offset, off_t len)
 {
 #if defined(HAVE_FALLOCATE)
-	return fallocate (fd, 0, offset, len);
+	return fallocate(fd, 0, offset, len);
 #elif defined(HAVE_POSIX_FALLOCATE)
-	return posix_fallocate (fd, offset, len);
+	return posix_fallocate(fd, offset, len);
 #else
 	/* Return 0 as nothing can be done on this system */
 	return 0;
@@ -1221,15 +1202,15 @@ rspamd_fallocate (gint fd, off_t offset, off_t len)
  * @return mutex or NULL
  */
 inline rspamd_mutex_t *
-rspamd_mutex_new (void)
+rspamd_mutex_new(void)
 {
 	rspamd_mutex_t *new;
 
-	new = g_malloc0 (sizeof (rspamd_mutex_t));
+	new = g_malloc0(sizeof(rspamd_mutex_t));
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION > 30))
-	g_mutex_init (&new->mtx);
+	g_mutex_init(&new->mtx);
 #else
-	g_static_mutex_init (&new->mtx);
+	g_static_mutex_init(&new->mtx);
 #endif
 
 	return new;
@@ -1240,12 +1221,12 @@ rspamd_mutex_new (void)
  * @param mtx
  */
 inline void
-rspamd_mutex_lock (rspamd_mutex_t *mtx)
+rspamd_mutex_lock(rspamd_mutex_t *mtx)
 {
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION > 30))
-	g_mutex_lock (&mtx->mtx);
+	g_mutex_lock(&mtx->mtx);
 #else
-	g_static_mutex_lock (&mtx->mtx);
+	g_static_mutex_lock(&mtx->mtx);
 #endif
 }
 
@@ -1254,22 +1235,21 @@ rspamd_mutex_lock (rspamd_mutex_t *mtx)
  * @param mtx
  */
 inline void
-rspamd_mutex_unlock (rspamd_mutex_t *mtx)
+rspamd_mutex_unlock(rspamd_mutex_t *mtx)
 {
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION > 30))
-	g_mutex_unlock (&mtx->mtx);
+	g_mutex_unlock(&mtx->mtx);
 #else
-	g_static_mutex_unlock (&mtx->mtx);
+	g_static_mutex_unlock(&mtx->mtx);
 #endif
 }
 
-void
-rspamd_mutex_free (rspamd_mutex_t *mtx)
+void rspamd_mutex_free(rspamd_mutex_t *mtx)
 {
 #if ((GLIB_MAJOR_VERSION == 2) && (GLIB_MINOR_VERSION > 30))
-	g_mutex_clear (&mtx->mtx);
+	g_mutex_clear(&mtx->mtx);
 #endif
-	g_free (mtx);
+	g_free(mtx);
 }
 
 struct rspamd_thread_data {
@@ -1280,26 +1260,26 @@ struct rspamd_thread_data {
 };
 
 static gpointer
-rspamd_thread_func (gpointer ud)
+rspamd_thread_func(gpointer ud)
 {
 	struct rspamd_thread_data *td = ud;
 	sigset_t s_mask;
 
 	/* Ignore signals in thread */
-	sigemptyset (&s_mask);
-	sigaddset (&s_mask, SIGINT);
-	sigaddset (&s_mask, SIGHUP);
-	sigaddset (&s_mask, SIGCHLD);
-	sigaddset (&s_mask, SIGUSR1);
-	sigaddset (&s_mask, SIGUSR2);
-	sigaddset (&s_mask, SIGALRM);
-	sigaddset (&s_mask, SIGPIPE);
+	sigemptyset(&s_mask);
+	sigaddset(&s_mask, SIGINT);
+	sigaddset(&s_mask, SIGHUP);
+	sigaddset(&s_mask, SIGCHLD);
+	sigaddset(&s_mask, SIGUSR1);
+	sigaddset(&s_mask, SIGUSR2);
+	sigaddset(&s_mask, SIGALRM);
+	sigaddset(&s_mask, SIGPIPE);
 
-	pthread_sigmask (SIG_BLOCK, &s_mask, NULL);
+	pthread_sigmask(SIG_BLOCK, &s_mask, NULL);
 
-	ud = td->func (td->data);
-	g_free (td->name);
-	g_free (td);
+	ud = td->func(td->data);
+	g_free(td->name);
+	g_free(td);
 
 	return ud;
 }
@@ -1312,16 +1292,17 @@ struct hash_copy_callback_data {
 };
 
 static void
-copy_foreach_callback (gpointer key, gpointer value, gpointer ud)
+copy_foreach_callback(gpointer key, gpointer value, gpointer ud)
 {
 	struct hash_copy_callback_data *cb = ud;
 	gpointer nkey, nvalue;
 
-	nkey = cb->key_copy_func ? cb->key_copy_func (key, cb->ud) : (gpointer)key;
+	nkey = cb->key_copy_func ? cb->key_copy_func(key, cb->ud) : (gpointer) key;
 	nvalue =
-		cb->value_copy_func ? cb->value_copy_func (value,
-			cb->ud) : (gpointer)value;
-	g_hash_table_insert (cb->dst, nkey, nvalue);
+		cb->value_copy_func ? cb->value_copy_func(value,
+												  cb->ud)
+							: (gpointer) value;
+	g_hash_table_insert(cb->dst, nkey, nvalue);
 }
 /**
  * Deep copy of one hash table to another
@@ -1331,11 +1312,10 @@ copy_foreach_callback (gpointer key, gpointer value, gpointer ud)
  * @param value_copy_func function called to copy or modify values (or NULL)
  * @param ud user data for copy functions
  */
-void
-rspamd_hash_table_copy (GHashTable *src, GHashTable *dst,
-	gpointer (*key_copy_func)(gconstpointer data, gpointer ud),
-	gpointer (*value_copy_func)(gconstpointer data, gpointer ud),
-	gpointer ud)
+void rspamd_hash_table_copy(GHashTable *src, GHashTable *dst,
+							gpointer (*key_copy_func)(gconstpointer data, gpointer ud),
+							gpointer (*value_copy_func)(gconstpointer data, gpointer ud),
+							gpointer ud)
 {
 	struct hash_copy_callback_data cb;
 	if (src != NULL && dst != NULL) {
@@ -1343,37 +1323,32 @@ rspamd_hash_table_copy (GHashTable *src, GHashTable *dst,
 		cb.value_copy_func = value_copy_func;
 		cb.ud = ud;
 		cb.dst = dst;
-		g_hash_table_foreach (src, copy_foreach_callback, &cb);
+		g_hash_table_foreach(src, copy_foreach_callback, &cb);
 	}
 }
 
 static volatile sig_atomic_t saved_signo[NSIG];
 
-static
-void
-read_pass_tmp_sig_handler (int s)
+static void
+read_pass_tmp_sig_handler(int s)
 {
 
 	saved_signo[s] = 1;
 }
 
 #ifndef _PATH_TTY
-# define _PATH_TTY "/dev/tty"
+#define _PATH_TTY "/dev/tty"
 #endif
 
-gint
-rspamd_read_passphrase (gchar *buf, gint size, gint rwflag, gpointer key)
+gint rspamd_read_passphrase_with_prompt(const gchar *prompt, gchar *buf, gint size, bool echo, gpointer key)
 {
-#ifdef HAVE_PASSPHRASE_H
-	gint len = 0;
-	gchar pass[BUFSIZ];
-
-	if (readpassphrase ("Enter passphrase: ", buf, size, RPP_ECHO_OFF |
-		RPP_REQUIRE_TTY) == NULL) {
+#ifdef HAVE_READPASSPHRASE_H
+	int flags = echo ? RPP_ECHO_ON : RPP_ECHO_OFF;
+	if (readpassphrase(prompt, buf, size, flags | RPP_REQUIRE_TTY) == NULL) {
 		return 0;
 	}
 
-	return strlen (buf);
+	return strlen(buf);
 #else
 	struct sigaction sa, savealrm, saveint, savehup, savequit, saveterm;
 	struct sigaction savetstp, savettin, savettou, savepipe;
@@ -1382,83 +1357,86 @@ rspamd_read_passphrase (gchar *buf, gint size, gint rwflag, gpointer key)
 	gchar *end, *p, ch;
 
 restart:
-	if ((input = output = open (_PATH_TTY, O_RDWR)) == -1) {
+	if ((input = output = open(_PATH_TTY, O_RDWR)) == -1) {
 		errno = ENOTTY;
 		return 0;
 	}
 
-	(void)fcntl (input, F_SETFD, FD_CLOEXEC);
+	(void) fcntl(input, F_SETFD, FD_CLOEXEC);
 
 	/* Turn echo off */
-	if (tcgetattr (input, &oterm) != 0) {
-		close (input);
+	if (tcgetattr(input, &oterm) != 0) {
+		close(input);
 		errno = ENOTTY;
 		return 0;
 	}
 
-	memcpy (&term, &oterm, sizeof(term));
-	term.c_lflag &= ~(ECHO | ECHONL);
+	memcpy(&term, &oterm, sizeof(term));
 
-	if (tcsetattr (input, TCSAFLUSH, &term) == -1) {
+	if (!echo) {
+		term.c_lflag &= ~(ECHO | ECHONL);
+	}
+
+	if (tcsetattr(input, TCSAFLUSH, &term) == -1) {
 		errno = ENOTTY;
-		close (input);
+		close(input);
 		return 0;
 	}
 
-	g_assert (write (output, "Enter passphrase: ", sizeof ("Enter passphrase: ") -
-		1) != -1);
+	g_assert(write(output, prompt, sizeof("Enter passphrase: ") - 1) != -1);
 
 	/* Save the current sighandler */
 	for (i = 0; i < NSIG; i++) {
 		saved_signo[i] = 0;
 	}
-	sigemptyset (&sa.sa_mask);
+	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
 	sa.sa_handler = read_pass_tmp_sig_handler;
-	(void)sigaction (SIGALRM, &sa, &savealrm);
-	(void)sigaction (SIGHUP, &sa, &savehup);
-	(void)sigaction (SIGINT, &sa, &saveint);
-	(void)sigaction (SIGPIPE, &sa, &savepipe);
-	(void)sigaction (SIGQUIT, &sa, &savequit);
-	(void)sigaction (SIGTERM, &sa, &saveterm);
-	(void)sigaction (SIGTSTP, &sa, &savetstp);
-	(void)sigaction (SIGTTIN, &sa, &savettin);
-	(void)sigaction (SIGTTOU, &sa, &savettou);
+	(void) sigaction(SIGALRM, &sa, &savealrm);
+	(void) sigaction(SIGHUP, &sa, &savehup);
+	(void) sigaction(SIGINT, &sa, &saveint);
+	(void) sigaction(SIGPIPE, &sa, &savepipe);
+	(void) sigaction(SIGQUIT, &sa, &savequit);
+	(void) sigaction(SIGTERM, &sa, &saveterm);
+	(void) sigaction(SIGTSTP, &sa, &savetstp);
+	(void) sigaction(SIGTTIN, &sa, &savettin);
+	(void) sigaction(SIGTTOU, &sa, &savettou);
 
 	/* Now read a passphrase */
 	p = buf;
 	end = p + size - 1;
-	while (read (input, &ch, 1) == 1 && ch != '\n' && ch != '\r') {
+	while (read(input, &ch, 1) == 1 && ch != '\n' && ch != '\r') {
 		if (p < end) {
 			*p++ = ch;
 		}
 	}
 	*p = '\0';
-	g_assert (write (output, "\n", 1) == 1);
+	g_assert(write(output, "\n", 1) == 1);
 
 	/* Restore terminal state */
-	if (memcmp (&term, &oterm, sizeof (term)) != 0) {
-		while (tcsetattr (input, TCSAFLUSH, &oterm) == -1 &&
-			errno == EINTR && !saved_signo[SIGTTOU]) ;
+	if (memcmp(&term, &oterm, sizeof(term)) != 0) {
+		while (tcsetattr(input, TCSAFLUSH, &oterm) == -1 &&
+			   errno == EINTR && !saved_signo[SIGTTOU])
+			;
 	}
 
 	/* Restore signal handlers */
-	(void)sigaction (SIGALRM, &savealrm, NULL);
-	(void)sigaction (SIGHUP, &savehup, NULL);
-	(void)sigaction (SIGINT, &saveint, NULL);
-	(void)sigaction (SIGQUIT, &savequit, NULL);
-	(void)sigaction (SIGPIPE, &savepipe, NULL);
-	(void)sigaction (SIGTERM, &saveterm, NULL);
-	(void)sigaction (SIGTSTP, &savetstp, NULL);
-	(void)sigaction (SIGTTIN, &savettin, NULL);
-	(void)sigaction (SIGTTOU, &savettou, NULL);
+	(void) sigaction(SIGALRM, &savealrm, NULL);
+	(void) sigaction(SIGHUP, &savehup, NULL);
+	(void) sigaction(SIGINT, &saveint, NULL);
+	(void) sigaction(SIGQUIT, &savequit, NULL);
+	(void) sigaction(SIGPIPE, &savepipe, NULL);
+	(void) sigaction(SIGTERM, &saveterm, NULL);
+	(void) sigaction(SIGTSTP, &savetstp, NULL);
+	(void) sigaction(SIGTTIN, &savettin, NULL);
+	(void) sigaction(SIGTTOU, &savettou, NULL);
 
-	close (input);
+	close(input);
 
 	/* Send signals pending */
 	for (i = 0; i < NSIG; i++) {
 		if (saved_signo[i]) {
-			kill (getpid (), i);
+			kill(getpid(), i);
 			switch (i) {
 			case SIGTSTP:
 			case SIGTTIN:
@@ -1473,38 +1451,38 @@ restart:
 }
 
 #ifdef HAVE_CLOCK_GETTIME
-# ifdef CLOCK_MONOTONIC_COARSE
-#  define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC_COARSE
-# elif defined(CLOCK_MONOTONIC_FAST)
-#  define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC_FAST
-# else
-#  define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC
-# endif
+#ifdef CLOCK_MONOTONIC_COARSE
+#define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC_COARSE
+#elif defined(CLOCK_MONOTONIC_FAST)
+#define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC_FAST
+#else
+#define RSPAMD_FAST_MONOTONIC_CLOCK CLOCK_MONOTONIC
+#endif
 #endif
 
 gdouble
-rspamd_get_ticks (gboolean rdtsc_ok)
+rspamd_get_ticks(gboolean rdtsc_ok)
 {
 	gdouble res;
 
 #ifdef HAVE_RDTSC
-# ifdef __x86_64__
+#ifdef __x86_64__
 	guint64 r64;
 
 	if (rdtsc_ok) {
-		__builtin_ia32_lfence ();
-		r64 = __rdtsc ();
+		__builtin_ia32_lfence();
+		r64 = __rdtsc();
 		/* Preserve lower 52 bits */
 		res = r64 & ((1ULL << 53) - 1);
 		return res;
 	}
-# endif
+#endif
 #endif
 #ifdef HAVE_CLOCK_GETTIME
 	struct timespec ts;
 	gint clk_id = RSPAMD_FAST_MONOTONIC_CLOCK;
 
-	clock_gettime (clk_id, &ts);
+	clock_gettime(clk_id, &ts);
 
 	if (rdtsc_ok) {
 		res = (double) ts.tv_sec * 1e9 + ts.tv_nsec;
@@ -1512,22 +1490,22 @@ rspamd_get_ticks (gboolean rdtsc_ok)
 	else {
 		res = (double) ts.tv_sec + ts.tv_nsec / 1000000000.;
 	}
-# elif defined(__APPLE__)
+#elif defined(__APPLE__)
 	if (rdtsc_ok) {
-		res = mach_absolute_time ();
+		res = mach_absolute_time();
 	}
 	else {
-		res = mach_absolute_time () / 1000000000.;
+		res = mach_absolute_time() / 1000000000.;
 	}
 #else
 	struct timeval tv;
 
-	(void)gettimeofday (&tv, NULL);
+	(void) gettimeofday(&tv, NULL);
 	if (rdtsc_ok) {
 		res = (double) ts.tv_sec * 1e9 + tv.tv_usec * 1e3;
 	}
 	else {
-		res = (double)tv.tv_sec + tv.tv_usec / 1000000.;
+		res = (double) tv.tv_sec + tv.tv_usec / 1000000.;
 	}
 #endif
 
@@ -1535,90 +1513,89 @@ rspamd_get_ticks (gboolean rdtsc_ok)
 }
 
 gdouble
-rspamd_get_virtual_ticks (void)
+rspamd_get_virtual_ticks(void)
 {
 	gdouble res;
 
 #ifdef HAVE_CLOCK_GETTIME
 	struct timespec ts;
-	static clockid_t cid = (clockid_t)-1;
-	if (cid == (clockid_t)-1) {
-# ifdef HAVE_CLOCK_GETCPUCLOCKID
-		if (clock_getcpuclockid (0, &cid) == -1) {
-# endif
-# ifdef CLOCK_PROCESS_CPUTIME_ID
-		cid = CLOCK_PROCESS_CPUTIME_ID;
-# elif defined(CLOCK_PROF)
+	static clockid_t cid = (clockid_t) -1;
+	if (cid == (clockid_t) -1) {
+#ifdef HAVE_CLOCK_GETCPUCLOCKID
+		if (clock_getcpuclockid(0, &cid) == -1) {
+#endif
+#ifdef CLOCK_PROCESS_CPUTIME_ID
+			cid = CLOCK_PROCESS_CPUTIME_ID;
+#elif defined(CLOCK_PROF)
 		cid = CLOCK_PROF;
-# else
+#else
 		cid = CLOCK_REALTIME;
-# endif
-# ifdef HAVE_CLOCK_GETCPUCLOCKID
+#endif
+#ifdef HAVE_CLOCK_GETCPUCLOCKID
 		}
-# endif
+#endif
 	}
 
-	clock_gettime (cid, &ts);
-	res = (double)ts.tv_sec + ts.tv_nsec / 1000000000.;
+	clock_gettime(cid, &ts);
+	res = (double) ts.tv_sec + ts.tv_nsec / 1000000000.;
 #elif defined(__APPLE__)
-	thread_port_t thread = mach_thread_self ();
+	thread_port_t thread = mach_thread_self();
 
 	mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
 	thread_basic_info_data_t info;
-	if (thread_info (thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
+	if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) {
 		return -1;
 	}
 
 	res = info.user_time.seconds + info.system_time.seconds;
-	res += ((gdouble)(info.user_time.microseconds + info.system_time.microseconds)) / 1e6;
+	res += ((gdouble) (info.user_time.microseconds + info.system_time.microseconds)) / 1e6;
 	mach_port_deallocate(mach_task_self(), thread);
 #elif defined(HAVE_RUSAGE_SELF)
 	struct rusage rusage;
-	if (getrusage (RUSAGE_SELF, &rusage) != -1) {
+	if (getrusage(RUSAGE_SELF, &rusage) != -1) {
 		res = (double) rusage.ru_utime.tv_sec +
 			  (double) rusage.ru_utime.tv_usec / 1000000.0;
 	}
 #else
-	res = clock () / (double)CLOCKS_PER_SEC;
+	res = clock() / (double) CLOCKS_PER_SEC;
 #endif
 
 	return res;
 }
 
 gdouble
-rspamd_get_calendar_ticks (void)
+rspamd_get_calendar_ticks(void)
 {
 	gdouble res;
 #ifdef HAVE_CLOCK_GETTIME
 	struct timespec ts;
 
-	clock_gettime (CLOCK_REALTIME, &ts);
-	res = ts_to_double (&ts);
+	clock_gettime(CLOCK_REALTIME, &ts);
+	res = ts_to_double(&ts);
 #else
 	struct timeval tv;
 
-	if (gettimeofday (&tv, NULL) == 0) {
-		res = tv_to_double (&tv);
+	if (gettimeofday(&tv, NULL) == 0) {
+		res = tv_to_double(&tv);
 	}
 	else {
-		res = time (NULL);
+		res = time(NULL);
 	}
 #endif
 
 	return res;
 }
 
-void
-rspamd_random_hex (guchar *buf, guint64 len)
+void rspamd_random_hex(gchar *buf, guint64 len)
 {
 	static const gchar hexdigests[16] = "0123456789abcdef";
 	gint64 i;
 
-	g_assert (len > 0);
+	g_assert(len > 0);
 
-	ottery_rand_bytes (buf, ceil (len / 2.0));
+	ottery_rand_bytes((void *) buf, ceil(len / 2.0));
 
-	for (i = (gint64)len - 1; i >= 0; i -= 2) {
+	for (i = (gint64) len - 1; i >= 0; i -= 2) {
 		buf[i] = hexdigests[buf[i / 2] & 0xf];
 
 		if (i > 0) {
@@ -1627,79 +1604,75 @@ rspamd_random_hex (guchar *buf, guint64 len)
 	}
 }
 
-gint
-rspamd_shmem_mkstemp (gchar *pattern)
+gint rspamd_shmem_mkstemp(gchar *pattern)
 {
 	gint fd = -1;
 	gchar *nbuf, *xpos;
 	gsize blen;
 
-	xpos = strchr (pattern, 'X');
+	xpos = strchr(pattern, 'X');
 
 	if (xpos == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
 
-	blen = strlen (pattern);
-	nbuf = g_malloc (blen + 1);
-	rspamd_strlcpy (nbuf, pattern, blen + 1);
+	blen = strlen(pattern);
+	nbuf = g_malloc(blen + 1);
+	rspamd_strlcpy(nbuf, pattern, blen + 1);
 	xpos = nbuf + (xpos - pattern);
 
 	for (;;) {
-		rspamd_random_hex (xpos, blen - (xpos - nbuf));
+		rspamd_random_hex(xpos, blen - (xpos - nbuf));
 
-		fd = shm_open (nbuf, O_RDWR | O_EXCL | O_CREAT, 0600);
+		fd = shm_open(nbuf, O_RDWR | O_EXCL | O_CREAT, 0600);
 
 		if (fd != -1) {
-			rspamd_strlcpy (pattern, nbuf, blen + 1);
+			rspamd_strlcpy(pattern, nbuf, blen + 1);
 			break;
 		}
 		else if (errno != EEXIST) {
-			g_free (nbuf);
+			g_free(nbuf);
 
 			return -1;
 		}
 	}
 
-	g_free (nbuf);
+	g_free(nbuf);
 
 	return fd;
 }
 
-void
-rspamd_ptr_array_free_hard (gpointer p)
+void rspamd_ptr_array_free_hard(gpointer p)
 {
-	GPtrArray *ar = (GPtrArray *)p;
+	GPtrArray *ar = (GPtrArray *) p;
 
-	g_ptr_array_free (ar, TRUE);
+	g_ptr_array_free(ar, TRUE);
 }
 
-void
-rspamd_array_free_hard (gpointer p)
+void rspamd_array_free_hard(gpointer p)
 {
-	GArray *ar = (GArray *)p;
+	GArray *ar = (GArray *) p;
 
-	g_array_free (ar, TRUE);
+	g_array_free(ar, TRUE);
 }
 
-void
-rspamd_gstring_free_hard (gpointer p)
+void rspamd_gstring_free_hard(gpointer p)
 {
-	GString *ar = (GString *)p;
+	GString *ar = (GString *) p;
 
-	g_string_free (ar, TRUE);
+	g_string_free(ar, TRUE);
 }
 
-void rspamd_gerror_free_maybe (gpointer p)
+void rspamd_gerror_free_maybe(gpointer p)
 {
 	GError **err;
 
 	if (p) {
-		err = (GError **)p;
+		err = (GError **) p;
 
 		if (*err) {
-			g_error_free (*err);
+			g_error_free(*err);
 		}
 	}
 }
@@ -1712,21 +1685,21 @@ void rspamd_gerror_free_maybe (gpointer p)
  */
 #ifdef HAVE_OPENBLAS_SET_NUM_THREADS
 extern void openblas_set_num_threads(int num_threads);
-RSPAMD_CONSTRUCTOR (openblas_thread_fix_ctor)
+RSPAMD_CONSTRUCTOR(openblas_thread_fix_ctor)
 {
-	openblas_set_num_threads (1);
+	openblas_set_num_threads(1);
 }
 #endif
 #ifdef HAVE_BLI_THREAD_SET_NUM_THREADS
 extern void bli_thread_set_num_threads(int num_threads);
-RSPAMD_CONSTRUCTOR (blis_thread_fix_ctor)
+RSPAMD_CONSTRUCTOR(blis_thread_fix_ctor)
 {
-	bli_thread_set_num_threads (1);
+	bli_thread_set_num_threads(1);
 }
 #endif
 
 guint64
-rspamd_hash_seed (void)
+rspamd_hash_seed(void)
 {
 #if 0
 	static guint64 seed;
@@ -1746,113 +1719,124 @@ rspamd_hash_seed (void)
 }
 
 static inline gdouble
-rspamd_double_from_int64 (guint64 x)
+rspamd_double_from_int64(guint64 x)
 {
-	const union { guint64 i; double d; } u = {
-			.i = G_GUINT64_CONSTANT(0x3FF) << 52 | x >> 12
-	};
+	const union {
+		guint64 i;
+		double d;
+	} u = {
+		.i = G_GUINT64_CONSTANT(0x3FF) << 52 | x >> 12};
 
 	return u.d - 1.0;
 }
 
 gdouble
-rspamd_random_double (void)
+rspamd_random_double(void)
 {
 	guint64 rnd_int;
 
-	rnd_int = ottery_rand_uint64 ();
+	rnd_int = ottery_rand_uint64();
 
-	return rspamd_double_from_int64 (rnd_int);
+	return rspamd_double_from_int64(rnd_int);
 }
 
 
-static guint64 xorshifto_seed[4];
+static guint64 *
+rspamd_fast_random_seed(void)
+{
+	static guint64 seed;
 
-static inline guint64
-xoroshiro_rotl (const guint64 x, int k) {
-	return (x << k) | (x >> (64 - k));
+	if (G_UNLIKELY(seed == 0)) {
+		ottery_rand_bytes((void *) &seed, sizeof(seed));
+	}
+
+	return &seed;
+}
+
+/* wyrand */
+inline uint64_t
+rspamd_random_uint64_fast_seed(uint64_t *seed)
+{
+	*seed += UINT64_C(0xa0761d6478bd642f);
+#ifdef __SIZEOF_INT128__
+#if defined(__aarch64__)
+	uint64_t lo, hi, p = *seed ^ UINT64_C(0xe7037ed1a0b428db), v = *seed;
+	lo = v * p;
+	__asm__("umulh %0, %1, %2"
+			: "=r"(hi)
+			: "r"(v), "r"(p));
+	return lo ^ hi;
+#else
+	__uint128_t t = (__uint128_t) *seed * (*seed ^ UINT64_C(0xe7037ed1a0b428db));
+	return (t >> 64) ^ t;
+#endif
+#else
+	/* Implementation of 64x64->128-bit multiplication by four 32x32->64
+	 * bit multiplication.  */
+	uint64_t lo, hi, p = *seed ^ UINT64_C(0xe7037ed1a0b428db), v = *seed;
+	uint64_t hv = v >> 32, hp = p >> 32;
+	uint64_t lv = (uint32_t) v, lp = (uint32_t) p;
+	uint64_t rh = hv * hp;
+	uint64_t rm_0 = hv * lp;
+	uint64_t rm_1 = hp * lv;
+	uint64_t rl = lv * lp;
+	uint64_t t;
+
+	/* We could ignore a carry bit here if we did not care about the
+	   same hash for 32-bit and 64-bit targets.  */
+	t = rl + (rm_0 << 32);
+	lo = t + (rm_1 << 32);
+	hi = rh + (rm_0 >> 32) + (rm_1 >> 32);
+	return lo ^ hi;
+#endif
 }
 
 gdouble
-rspamd_random_double_fast (void)
+rspamd_random_double_fast(void)
 {
-	return rspamd_random_double_fast_seed (xorshifto_seed);
+	return rspamd_random_double_fast_seed(rspamd_fast_random_seed());
 }
 
 /* xoshiro256+ */
 inline gdouble
-rspamd_random_double_fast_seed (guint64 seed[4])
+rspamd_random_double_fast_seed(guint64 *seed)
 {
-	const uint64_t result = seed[0] + seed[3];
-
-	const uint64_t t = seed[1] << 17;
-
-	seed[2] ^= seed[0];
-	seed[3] ^= seed[1];
-	seed[1] ^= seed[2];
-	seed[0] ^= seed[3];
-
-	seed[2] ^= t;
-
-	seed[3] = xoroshiro_rotl (seed[3], 45);
-
-	return rspamd_double_from_int64 (result);
-}
-
-/* xoroshiro256** */
-static inline guint64
-rspamd_random_uint64_fast_seed (guint64 seed[4])
-{
-	const uint64_t result = xoroshiro_rotl (seed[1] * 5, 7) * 9;
-
-	const uint64_t t = seed[1] << 17;
-
-	seed[2] ^= seed[0];
-	seed[3] ^= seed[1];
-	seed[1] ^= seed[2];
-	seed[0] ^= seed[3];
-
-	seed[2] ^= t;
-
-	seed[3] = xoroshiro_rotl (seed[3], 45);
-
-	return result;
+	return rspamd_double_from_int64(rspamd_random_uint64_fast_seed(seed));
 }
 
 guint64
-rspamd_random_uint64_fast (void)
+rspamd_random_uint64_fast(void)
 {
-	return rspamd_random_uint64_fast_seed (xorshifto_seed);
+	return rspamd_random_uint64_fast_seed(rspamd_fast_random_seed());
 }
 
-void
-rspamd_random_seed_fast (void)
+void rspamd_random_seed_fast(void)
 {
-	ottery_rand_bytes (xorshifto_seed, sizeof (xorshifto_seed));
+	(void) rspamd_fast_random_seed();
 }
 
 gdouble
-rspamd_time_jitter (gdouble in, gdouble jitter)
+rspamd_time_jitter(gdouble in, gdouble jitter)
 {
 	if (jitter == 0) {
 		jitter = in;
 	}
 
-	return in + jitter * rspamd_random_double ();
+	return in + jitter * rspamd_random_double();
 }
 
 gboolean
-rspamd_constant_memcmp (const void *a, const void *b, gsize len)
+rspamd_constant_memcmp(const void *a, const void *b, gsize len)
 {
 	gsize lena, lenb, i;
 	guint16 d, r = 0, m;
 	guint16 v;
-	const guint8 *aa = (const guint8 *)a,
-			*bb =  (const guint8 *)b;
+	const guint8 *aa = (const guint8 *) a,
+				 *bb = (const guint8 *) b;
 
 	if (len == 0) {
-		lena = strlen ((const char*)a);
-		lenb = strlen ((const char*)b);
+		lena = strlen((const char *) a);
+		lenb = strlen((const char *) b);
 
 		if (lena != lenb) {
 			return FALSE;
@@ -1862,36 +1846,37 @@ rspamd_constant_memcmp (const void *a, const void *b, gsize len)
 	}
 
 	for (i = 0; i < len; i++) {
-		v = ((guint16)(guint8)r) + 255;
+		v = ((guint16) (guint8) r) + 255;
 		m = v / 256 - 1;
-		d = (guint16)((int)aa[i] - (int)bb[i]);
+		d = (guint16) ((int) aa[i] - (int) bb[i]);
 		r |= (d & m);
 	}
 
-	return (((gint32)(guint16)((guint32)r + 0x8000) - 0x8000) == 0);
+	return (((gint32) (guint16) ((guint32) r + 0x8000) - 0x8000) == 0);
 }
 
-int
-rspamd_file_xopen (const char *fname, int oflags, guint mode,
-		gboolean allow_symlink)
+int rspamd_file_xopen(const char *fname, int oflags, guint mode,
+					  gboolean allow_symlink)
 {
 	struct stat sb;
 	int fd, flags = oflags;
 
-	if (lstat (fname, &sb) == -1) {
+	if (!(oflags & O_CREAT)) {
+		if (lstat(fname, &sb) == -1) {
 
-		if (errno != ENOENT) {
-			return (-1);
-		}
-	}
-	else if (!S_ISREG (sb.st_mode)) {
-		if (S_ISLNK (sb.st_mode)) {
-			if (!allow_symlink) {
-				return -1;
+			if (errno != ENOENT) {
+				return (-1);
 			}
 		}
-		else {
-			return -1;
+		else if (!S_ISREG(sb.st_mode)) {
+			if (S_ISLNK(sb.st_mode)) {
+				if (!allow_symlink) {
+					return -1;
+				}
+			}
+			else {
+				return -1;
+			}
 		}
 	}
 
@@ -1902,19 +1887,21 @@ rspamd_file_xopen (const char *fname, int oflags, guint mode,
 #ifdef HAVE_ONOFOLLOW
 	if (!allow_symlink) {
 		flags |= O_NOFOLLOW;
-		fd = open (fname, flags, mode);
+		fd = open(fname, flags, mode);
 	}
 	else {
-		fd = open (fname, flags, mode);
+		fd = open(fname, flags, mode);
 	}
 #else
-	fd = open (fname, flags, mode);
+	fd = open(fname, flags, mode);
 #endif
 
 #ifndef HAVE_OCLOEXEC
-	if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1) {
-		msg_warn ("fcntl failed: %d, '%s'", errno, strerror (errno));
-		close (fd);
+	int serrno;
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+		serrno = errno;
+		close(fd);
+		errno = serrno;
 
 		return -1;
 	}
@@ -1924,43 +1911,43 @@ rspamd_file_xopen (const char *fname, int oflags, guint mode,
 }
 
 gpointer
-rspamd_file_xmap (const char *fname, guint mode, gsize *size,
-		gboolean allow_symlink)
+rspamd_file_xmap(const char *fname, guint mode, gsize *size,
+				 gboolean allow_symlink)
 {
 	gint fd;
 	struct stat sb;
 	gpointer map;
 
-	g_assert (fname != NULL);
-	g_assert (size != NULL);
+	g_assert(fname != NULL);
+	g_assert(size != NULL);
 
 	if (mode & PROT_WRITE) {
-		fd = rspamd_file_xopen (fname, O_RDWR, 0, allow_symlink);
+		fd = rspamd_file_xopen(fname, O_RDWR, 0, allow_symlink);
 	}
 	else {
-		fd = rspamd_file_xopen (fname, O_RDONLY, 0, allow_symlink);
+		fd = rspamd_file_xopen(fname, O_RDONLY, 0, allow_symlink);
 	}
 
 	if (fd == -1) {
 		return NULL;
 	}
 
-	if (fstat (fd, &sb) == -1 || !S_ISREG (sb.st_mode)) {
-		close (fd);
-		*size = (gsize)-1;
+	if (fstat(fd, &sb) == -1 || !S_ISREG(sb.st_mode)) {
+		close(fd);
+		*size = (gsize) -1;
 
 		return NULL;
 	}
 
 	if (sb.st_size == 0) {
-		close (fd);
-		*size = (gsize)0;
+		close(fd);
+		*size = (gsize) 0;
 
 		return NULL;
 	}
 
-	map = mmap (NULL, sb.st_size, mode, MAP_SHARED, fd, 0);
-	close (fd);
+	map = mmap(NULL, sb.st_size, mode, MAP_SHARED, fd, 0);
+	close(fd);
 
 	if (map == MAP_FAILED) {
 		return NULL;
@@ -1973,29 +1960,29 @@ rspamd_file_xmap (const char *fname, guint mode, gsize *size,
 
 
 gpointer
-rspamd_shmem_xmap (const char *fname, guint mode,
-		gsize *size)
+rspamd_shmem_xmap(const char *fname, guint mode,
+				  gsize *size)
 {
 	gint fd;
 	struct stat sb;
 	gpointer map;
 
-	g_assert (fname != NULL);
-	g_assert (size != NULL);
+	g_assert(fname != NULL);
+	g_assert(size != NULL);
 
 #ifdef HAVE_SANE_SHMEM
 	if (mode & PROT_WRITE) {
-		fd = shm_open (fname, O_RDWR, 0);
+		fd = shm_open(fname, O_RDWR, 0);
 	}
 	else {
-		fd = shm_open (fname, O_RDONLY, 0);
+		fd = shm_open(fname, O_RDONLY, 0);
 	}
 #else
 	if (mode & PROT_WRITE) {
-		fd = open (fname, O_RDWR, 0);
+		fd = open(fname, O_RDWR, 0);
 	}
 	else {
-		fd = open (fname, O_RDONLY, 0);
+		fd = open(fname, O_RDONLY, 0);
 	}
 #endif
 
@@ -2003,14 +1990,14 @@ rspamd_shmem_xmap (const char *fname, guint mode,
 		return NULL;
 	}
 
-	if (fstat (fd, &sb) == -1) {
-		close (fd);
+	if (fstat(fd, &sb) == -1) {
+		close(fd);
 
 		return NULL;
 	}
 
-	map = mmap (NULL, sb.st_size, mode, MAP_SHARED, fd, 0);
-	close (fd);
+	map = mmap(NULL, sb.st_size, mode, MAP_SHARED, fd, 0);
+	close(fd);
 
 	if (map == MAP_FAILED) {
 		return NULL;
@@ -2033,20 +2020,20 @@ rspamd_shmem_xmap (const char *fname, guint mode,
  * y = ((x - bias)*2)^8
  */
 gdouble
-rspamd_normalize_probability (gdouble x, gdouble bias)
+rspamd_normalize_probability(gdouble x, gdouble bias)
 {
 	gdouble xx;
 
 	xx = (x - bias) * 2.0;
 
-	return pow (xx, 8);
+	return pow(xx, 8);
 }
 
 /*
  * Calculations from musl libc
  */
 guint64
-rspamd_tm_to_time (const struct tm *tm, glong tz)
+rspamd_tm_to_time(const struct tm *tm, glong tz)
 {
 	guint64 result;
 	gboolean is_leap = FALSE;
@@ -2055,10 +2042,9 @@ rspamd_tm_to_time (const struct tm *tm, glong tz)
 
 	/* How many seconds in each month from the beginning of the year */
 	static const gint secs_through_month[] = {
-			0, 31*86400, 59*86400, 90*86400,
-			120*86400, 151*86400, 181*86400, 212*86400,
-			243*86400, 273*86400, 304*86400, 334*86400
-	};
+		0, 31 * 86400, 59 * 86400, 90 * 86400,
+		120 * 86400, 151 * 86400, 181 * 86400, 212 * 86400,
+		243 * 86400, 273 * 86400, 304 * 86400, 334 * 86400};
 
 	/* Convert year */
 	if (tm->tm_year - 2ULL <= 136) {
@@ -2108,14 +2094,15 @@ rspamd_tm_to_time (const struct tm *tm, glong tz)
 			if (!rem) {
 				is_leap = 1;
 				leaps = 0;
-			} else {
+			}
+			else {
 				leaps = rem / 4U;
 				rem %= 4U;
 				is_leap = !rem;
 			}
 		}
 
-		leaps += 97 * cycles + 24 * centuries - (gint)is_leap;
+		leaps += 97 * cycles + 24 * centuries - (gint) is_leap;
 		result = (y - 100) * 31536000LL + leaps * 86400LL + 946684800 + 86400;
 	}
 
@@ -2126,7 +2113,7 @@ rspamd_tm_to_time (const struct tm *tm, glong tz)
 		result += 86400;
 	}
 
-	result += 86400LL * (tm->tm_mday-1);
+	result += 86400LL * (tm->tm_mday - 1);
 	result += 3600LL * tm->tm_hour;
 	result += 60LL * tm->tm_min;
 	result += tm->tm_sec;
@@ -2138,8 +2125,7 @@ rspamd_tm_to_time (const struct tm *tm, glong tz)
 }
 
 
-void
-rspamd_gmtime (gint64 ts, struct tm *dest)
+void rspamd_gmtime(gint64 ts, struct tm *dest)
 {
 	guint64 days, secs, years;
 	int remdays, remsecs, remyears;
@@ -2149,9 +2135,9 @@ rspamd_gmtime (gint64 ts, struct tm *dest)
 	/* From March */
 	static const uint8_t days_in_month[] = {31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 29};
 	static const guint64 leap_epoch = 946684800ULL + 86400 * (31 + 29);
-	static const guint64 days_per_400y = 365*400 + 97;
-	static const guint64 days_per_100y = 365*100 + 24;
-	static const guint64 days_per_4y = 365*4 + 1;
+	static const guint64 days_per_400y = 365 * 400 + 97;
+	static const guint64 days_per_100y = 365 * 100 + 24;
+	static const guint64 days_per_4y = 365 * 4 + 1;
 
 	secs = ts - leap_epoch;
 	days = secs / 86400;
@@ -2208,7 +2194,7 @@ rspamd_gmtime (gint64 ts, struct tm *dest)
 	years = remyears + 4 * leap_4_cycles + 100 * leap_100_cycles +
 			400ULL * leap_400_cycles;
 
-	for (months=0; days_in_month[months] <= remdays; months++) {
+	for (months = 0; days_in_month[months] <= remdays; months++) {
 		remdays -= days_in_month[months];
 	}
 
@@ -2232,78 +2218,141 @@ rspamd_gmtime (gint64 ts, struct tm *dest)
 #endif
 }
 
-void
-rspamd_localtime (gint64 ts, struct tm *dest)
+void rspamd_localtime(gint64 ts, struct tm *dest)
 {
 	time_t t = ts;
-	localtime_r (&t, dest);
+	localtime_r(&t, dest);
 }
 
 gboolean
-rspamd_fstring_gzip (rspamd_fstring_t **in)
+rspamd_fstring_gzip(rspamd_fstring_t **in)
 {
 	z_stream strm;
-	gint rc;
-	rspamd_fstring_t *comp, *buf = *in;
-	gchar *p;
-	gsize remain;
+	rspamd_fstring_t *buf = *in;
+	int ret;
+	unsigned tmp_remain;
+	unsigned char temp[BUFSIZ];
 
-	memset (&strm, 0, sizeof (strm));
-	rc = deflateInit2 (&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-			MAX_WBITS + 16, MAX_MEM_LEVEL - 1, Z_DEFAULT_STRATEGY);
+	memset(&strm, 0, sizeof(strm));
+	ret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+					   MAX_WBITS + 16, MAX_MEM_LEVEL - 1, Z_DEFAULT_STRATEGY);
 
-	if (rc != Z_OK) {
+	if (ret != Z_OK) {
 		return FALSE;
 	}
 
-	comp = rspamd_fstring_sized_new (deflateBound (&strm, buf->len));
+	if (buf->allocated < deflateBound(&strm, buf->len)) {
+		buf = rspamd_fstring_grow(buf, deflateBound(&strm, buf->len));
+		*in = buf;
+	}
 
+	strm.next_in = buf->str;
 	strm.avail_in = buf->len;
-	strm.next_in = (guchar *)buf->str;
-	p = comp->str;
-	remain = comp->allocated;
 
-	while (strm.avail_in != 0) {
-		strm.avail_out = remain;
-		strm.next_out = p;
+	strm.next_out = temp;
+	strm.avail_out = sizeof(temp) > buf->allocated ? buf->allocated : sizeof(temp);
+	ret = deflate(&strm, Z_FINISH);
+	if (ret == Z_STREAM_ERROR) {
+		deflateEnd(&strm);
+		return FALSE;
+	}
 
-		rc = deflate (&strm, Z_FINISH);
-
-		if (rc != Z_OK && rc != Z_BUF_ERROR) {
-			if (rc == Z_STREAM_END) {
-				break;
-			}
-			else {
-				rspamd_fstring_free (comp);
-				deflateEnd (&strm);
-
-				return FALSE;
-			}
+	/* Try to compress in-place */
+	tmp_remain = strm.next_out - temp;
+	if (tmp_remain <= (strm.avail_in ? buf->len - strm.avail_in : buf->allocated)) {
+		memcpy(buf->str, temp, tmp_remain);
+		strm.next_out = (unsigned char *) buf->str + tmp_remain;
+		tmp_remain = 0;
+		while (ret == Z_OK) {
+			strm.avail_out = strm.avail_in ? strm.next_in - strm.next_out : ((unsigned char *) buf->str + buf->allocated) - strm.next_out;
+			ret = deflate(&strm, Z_FINISH);
 		}
+		if (ret != Z_BUF_ERROR || strm.avail_in == 0) {
+			buf->len = strm.next_out - (unsigned char *) buf->str;
+			*in = buf;
+			deflateEnd(&strm);
 
-		comp->len = strm.total_out;
-
-		if (strm.avail_out == 0 && strm.avail_in != 0) {
-			/* Need to allocate more */
-			remain = comp->len;
-			comp = rspamd_fstring_grow (comp, strm.avail_in);
-			p = comp->str + remain;
-			remain = comp->allocated - remain;
+			return ret == Z_STREAM_END;
 		}
 	}
 
-	deflateEnd (&strm);
-	comp->len = strm.total_out;
-	rspamd_fstring_free (buf); /* We replace buf with its compressed version */
-	*in = comp;
+	/*
+	 * The case when input and output has caught each other, hold the remaining
+	 * in a temporary buffer and compress it separately
+	 */
+	unsigned char *hold = g_malloc(strm.avail_in);
+	memcpy(hold, strm.next_in, strm.avail_in);
+	strm.next_in = hold;
+	if (tmp_remain) {
+		memcpy(buf->str, temp, tmp_remain);
+		strm.next_out = (unsigned char *) buf->str + tmp_remain;
+	}
+	strm.avail_out = ((unsigned char *) buf->str + buf->allocated) - strm.next_out;
+	ret = deflate(&strm, Z_FINISH);
+	g_free(hold);
+	buf->len = strm.next_out - (unsigned char *) buf->str;
+	*in = buf;
+	deflateEnd(&strm);
 
-	return TRUE;
+	return ret == Z_STREAM_END;
+}
+
+gboolean
+rspamd_fstring_gunzip(rspamd_fstring_t **in)
+{
+	z_stream strm;
+	rspamd_fstring_t *buf = *in, *out = rspamd_fstring_sized_new((*in)->len);
+	int ret;
+
+	memset(&strm, 0, sizeof(strm));
+	ret = inflateInit2(&strm, MAX_WBITS + 16);
+
+	if (ret != Z_OK) {
+		return FALSE;
+	}
+
+	strm.next_in = buf->str;
+	strm.avail_in = buf->len;
+
+	gsize total_out = 0;
+
+	do {
+		strm.next_out = out->str + total_out;
+		strm.avail_out = out->allocated - total_out;
+
+		ret = inflate(&strm, Z_NO_FLUSH);
+		if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+			break;
+		}
+
+		gsize out_remain = strm.avail_out;
+		total_out = out->allocated - out_remain;
+		if (out_remain == 0 && ret != Z_STREAM_END) {
+			out = rspamd_fstring_grow(out, out->allocated * 2);
+		}
+
+	} while (ret != Z_STREAM_END);
+
+	if (ret == Z_STREAM_END) {
+		*in = out;
+		out->len = total_out;
+		rspamd_fstring_free(buf);
+	}
+	else {
+		/* Revert */
+		*in = buf;
+		rspamd_fstring_free(out);
+	}
+
+	inflateEnd(&strm);
+
+	return ret == Z_STREAM_END;
 }
 
 static gboolean
-rspamd_glob_dir (const gchar *full_path, const gchar *pattern,
-				 gboolean recursive, guint rec_len,
-				 GPtrArray *res, GError **err)
+rspamd_glob_dir(const gchar *full_path, const gchar *pattern,
+				gboolean recursive, guint rec_len,
+				GPtrArray *res, GError **err)
 {
 	glob_t globbuf;
 	const gchar *path;
@@ -2314,81 +2363,81 @@ rspamd_glob_dir (const gchar *full_path, const gchar *pattern,
 	struct stat st;
 
 	if (rec_len > rec_lim) {
-		g_set_error (err, g_quark_from_static_string ("glob"), EOVERFLOW,
-				"maximum nesting is reached: %d", rec_lim);
+		g_set_error(err, g_quark_from_static_string("glob"), EOVERFLOW,
+					"maximum nesting is reached: %d", rec_lim);
 
 		return FALSE;
 	}
 
-	memset (&globbuf, 0, sizeof (globbuf));
+	memset(&globbuf, 0, sizeof(globbuf));
 
-	if ((rc = glob (full_path, 0, NULL, &globbuf)) != 0) {
+	if ((rc = glob(full_path, 0, NULL, &globbuf)) != 0) {
 
 		if (rc != GLOB_NOMATCH) {
-			g_set_error (err, g_quark_from_static_string ("glob"), errno,
-					"glob %s failed: %s", full_path, strerror (errno));
-			globfree (&globbuf);
+			g_set_error(err, g_quark_from_static_string("glob"), errno,
+						"glob %s failed: %s", full_path, strerror(errno));
+			globfree(&globbuf);
 
 			return FALSE;
 		}
 		else {
-			globfree (&globbuf);
+			globfree(&globbuf);
 
 			return TRUE;
 		}
 	}
 
-	for (i = 0; i < globbuf.gl_pathc; i ++) {
+	for (i = 0; i < globbuf.gl_pathc; i++) {
 		path = globbuf.gl_pathv[i];
 
-		if (stat (path, &st) == -1) {
+		if (stat(path, &st) == -1) {
 			if (errno == EPERM || errno == EACCES || errno == ELOOP) {
 				/* Silently ignore */
 				continue;
 			}
 
-			g_set_error (err, g_quark_from_static_string ("glob"), errno,
-					"stat %s failed: %s", path, strerror (errno));
-			globfree (&globbuf);
+			g_set_error(err, g_quark_from_static_string("glob"), errno,
+						"stat %s failed: %s", path, strerror(errno));
+			globfree(&globbuf);
 
 			return FALSE;
 		}
 
-		if (S_ISREG (st.st_mode)) {
-			g_ptr_array_add (res, g_strdup (path));
+		if (S_ISREG(st.st_mode)) {
+			g_ptr_array_add(res, g_strdup(path));
 		}
-		else if (recursive && S_ISDIR (st.st_mode)) {
-			rspamd_snprintf (pathbuf, sizeof (pathbuf), "%s%c%s",
-					path, G_DIR_SEPARATOR, pattern);
+		else if (recursive && S_ISDIR(st.st_mode)) {
+			rspamd_snprintf(pathbuf, sizeof(pathbuf), "%s%c%s",
+							path, G_DIR_SEPARATOR, pattern);
 
-			if (!rspamd_glob_dir (full_path, pattern, recursive, rec_len + 1,
-					res, err)) {
-				globfree (&globbuf);
+			if (!rspamd_glob_dir(full_path, pattern, recursive, rec_len + 1,
+								 res, err)) {
+				globfree(&globbuf);
 
 				return FALSE;
 			}
 		}
 	}
 
-	globfree (&globbuf);
+	globfree(&globbuf);
 
 	return TRUE;
 }
 
 GPtrArray *
-rspamd_glob_path (const gchar *dir,
-				  const gchar *pattern,
-				  gboolean recursive,
-				  GError **err)
+rspamd_glob_path(const gchar *dir,
+				 const gchar *pattern,
+				 gboolean recursive,
+				 GError **err)
 {
 	gchar path[PATH_MAX];
 	GPtrArray *res;
 
-	res = g_ptr_array_new_full (32, (GDestroyNotify)g_free);
-	rspamd_snprintf (path, sizeof (path), "%s%c%s", dir, G_DIR_SEPARATOR, pattern);
+	res = g_ptr_array_new_full(32, (GDestroyNotify) g_free);
+	rspamd_snprintf(path, sizeof(path), "%s%c%s", dir, G_DIR_SEPARATOR, pattern);
 
-	if (!rspamd_glob_dir (path, pattern, recursive, 0, res, err)) {
-		g_ptr_array_free (res, TRUE);
+	if (!rspamd_glob_dir(path, pattern, recursive, 0, res, err)) {
+		g_ptr_array_free(res, TRUE);
 
 		return NULL;
 	}
@@ -2397,7 +2446,7 @@ rspamd_glob_path (const gchar *dir,
 }
 
 double
-rspamd_set_counter (struct rspamd_counter_data *cd, gdouble value)
+rspamd_set_counter(struct rspamd_counter_data *cd, gdouble value)
 {
 	gdouble cerr;
 
@@ -2407,19 +2456,18 @@ rspamd_set_counter (struct rspamd_counter_data *cd, gdouble value)
 		cd->stddev = 0;
 	}
 
-	cd->mean += (value - cd->mean) / (gdouble)(++cd->number);
+	cd->mean += (value - cd->mean) / (gdouble) (++cd->number);
 	cerr = (value - cd->mean) * (value - cd->mean);
-	cd->stddev += (cerr - cd->stddev) / (gdouble)(cd->number);
+	cd->stddev += (cerr - cd->stddev) / (gdouble) (cd->number);
 
 	return cd->mean;
 }
 
-double
-rspamd_set_counter_ema (struct rspamd_counter_data *cd,
-		gdouble value,
-		gdouble alpha)
+float rspamd_set_counter_ema(struct rspamd_counter_data *cd,
+							 float value,
+							 float alpha)
 {
-	gdouble diff, incr;
+	float diff, incr;
 
 	/* Cumulative moving average using per-process counter data */
 	if (cd->number == 0) {
@@ -2430,14 +2478,13 @@ rspamd_set_counter_ema (struct rspamd_counter_data *cd,
 	diff = value - cd->mean;
 	incr = diff * alpha;
 	cd->mean += incr;
-	cd->stddev = (1 - alpha) * (cd->stddev + diff * incr);
-	cd->number ++;
+	cd->stddev = (1.0f - alpha) * (cd->stddev + diff * incr);
+	cd->number++;
 
 	return cd->mean;
 }
 
-void
-rspamd_ptr_array_shuffle (GPtrArray *ar)
+void rspamd_ptr_array_shuffle(GPtrArray *ar)
 {
 	if (ar->len < 2) {
 		return;
@@ -2446,9 +2493,254 @@ rspamd_ptr_array_shuffle (GPtrArray *ar)
 	guint n = ar->len;
 
 	for (guint i = 0; i < n - 1; i++) {
-		guint j = i + rspamd_random_uint64_fast () % (n - i);
-		gpointer t = g_ptr_array_index (ar, j);
-		g_ptr_array_index (ar, j) = g_ptr_array_index (ar, i);
-		g_ptr_array_index (ar, i) = t;
+		guint j = i + rspamd_random_uint64_fast() % (n - i);
+		gpointer t = g_ptr_array_index(ar, j);
+		g_ptr_array_index(ar, j) = g_ptr_array_index(ar, i);
+		g_ptr_array_index(ar, i) = t;
+	}
+}
+
+float rspamd_sum_floats(float *ar, gsize *nelts)
+{
+	float sum = 0.0f;
+	volatile float c = 0.0f; /* We don't want any optimisations around c */
+	gsize cnt = 0;
+
+	for (gsize i = 0; i < *nelts; i++) {
+		float elt = ar[i];
+
+		if (!isnan(elt)) {
+			cnt++;
+			float y = elt - c;
+			float t = sum + y;
+			c = (t - sum) - y;
+			sum = t;
+		}
+	}
+
+	*nelts = cnt;
+	return sum;
+}
+
+void rspamd_normalize_path_inplace(gchar *path, guint len, gsize *nlen)
+{
+	const gchar *p, *end, *slash = NULL, *dot = NULL;
+	gchar *o;
+	enum {
+		st_normal = 0,
+		st_got_dot,
+		st_got_dot_dot,
+		st_got_slash,
+		st_got_slash_slash,
+	} state = st_normal;
+
+	p = path;
+	end = path + len;
+	o = path;
+
+	while (p < end) {
+		switch (state) {
+		case st_normal:
+			if (G_UNLIKELY(*p == '/')) {
+				state = st_got_slash;
+				slash = p;
+			}
+			else if (G_UNLIKELY(*p == '.')) {
+				state = st_got_dot;
+				dot = p;
+			}
+			else {
+				*o++ = *p;
+			}
+			p++;
+			break;
+		case st_got_slash:
+			if (G_UNLIKELY(*p == '/')) {
+				/* Ignore double slash */
+				*o++ = *p;
+				state = st_got_slash_slash;
+			}
+			else if (G_UNLIKELY(*p == '.')) {
+				dot = p;
+				state = st_got_dot;
+			}
+			else {
+				*o++ = '/';
+				*o++ = *p;
+				slash = NULL;
+				dot = NULL;
+				state = st_normal;
+			}
+			p++;
+			break;
+		case st_got_slash_slash:
+			if (G_LIKELY(*p != '/')) {
+				slash = p - 1;
+				dot = NULL;
+				state = st_normal;
+				continue;
+			}
+			p++;
+			break;
+		case st_got_dot:
+			if (G_UNLIKELY(*p == '/')) {
+				/* Remove any /./ or ./ paths */
+				if (((o > path && *(o - 1) != '/') || (o == path)) && slash) {
+					/* Preserve one slash */
+					*o++ = '/';
+				}
+
+				slash = p;
+				dot = NULL;
+				/* Ignore last slash */
+				state = st_normal;
+			}
+			else if (*p == '.') {
+				/* Double dot character */
+				state = st_got_dot_dot;
+			}
+			else {
+				/* We have something like .some or /.some */
+				if (dot && p > dot) {
+					if (slash == dot - 1 && (o > path && *(o - 1) != '/')) {
+						/* /.blah */
+						memmove(o, slash, p - slash);
+						o += p - slash;
+					}
+					else {
+						memmove(o, dot, p - dot);
+						o += p - dot;
+					}
+				}
+
+				slash = NULL;
+				dot = NULL;
+				state = st_normal;
+				continue;
+			}
+
+			p++;
+			break;
+		case st_got_dot_dot:
+			if (*p == '/') {
+				/* We have something like /../ or ../ */
+				if (slash) {
+					/* We need to remove the last component from o if it is there */
+					if (o > path + 2 && *(o - 1) == '/') {
+						slash = rspamd_memrchr(path, '/', o - path - 2);
+					}
+					else if (o > path + 1) {
+						slash = rspamd_memrchr(path, '/', o - path - 1);
+					}
+					else {
+						slash = NULL;
+					}
+
+					if (slash) {
+						o = (gchar *) slash;
+					}
+					/* Otherwise we keep these dots */
+					slash = p;
+					state = st_got_slash;
+				}
+				else {
+					/* We have something like bla../, so we need to copy it as is */
+					if (o > path && dot && p > dot) {
+						memmove(o, dot, p - dot);
+						o += p - dot;
+					}
+
+					slash = NULL;
+					dot = NULL;
+					state = st_normal;
+					continue;
+				}
+			}
+			else {
+				/* We have something like ..bla or ... */
+				if (slash) {
+					*o++ = '/';
+				}
+
+				if (dot && p > dot) {
+					memmove(o, dot, p - dot);
+					o += p - dot;
+				}
+
+				slash = NULL;
+				dot = NULL;
+				state = st_normal;
+				continue;
+			}
+
+			p++;
+			break;
+		}
+	}
+
+	/* Leftover */
+	switch (state) {
+	case st_got_dot_dot:
+		/* Trailing .. */
+		if (slash) {
+			/* We need to remove the last component from o if it is there */
+			if (o > path + 2 && *(o - 1) == '/') {
+				slash = rspamd_memrchr(path, '/', o - path - 2);
+			}
+			else if (o > path + 1) {
+				slash = rspamd_memrchr(path, '/', o - path - 1);
+			}
+			else {
+				if (o == path) {
+					/* Corner case */
+					*o++ = '/';
+				}
+
+				slash = NULL;
+			}
+
+			if (slash) {
+				/* Remove last / */
+				o = (gchar *) slash;
+			}
+		}
+		else {
+			/* Corner case */
+			if (o == path) {
+				*o++ = '/';
+			}
+			else {
+				if (dot && p > dot) {
+					memmove(o, dot, p - dot);
+					o += p - dot;
+				}
+			}
+		}
+		break;
+	case st_got_dot:
+		if (slash) {
+			/* /. -> must be / */
+			*o++ = '/';
+		}
+		else {
+			if (o > path) {
+				*o++ = '.';
+			}
+		}
+		break;
+	case st_got_slash:
+		*o++ = '/';
+		break;
+	default:
+#if 0
+		if (o > path + 1 && *(o - 1) == '/') {
+			o --;
+		}
+#endif
+		break;
+	}
+
+	if (nlen) {
+		*nlen = (o - path);
 	}
 }

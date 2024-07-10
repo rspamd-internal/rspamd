@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,7 +80,7 @@ local function handler(args)
   if search_str and not sensitive then
     search_str = string.lower(search_str)
   end
-  local inputs = res['input'] or {'stdin'}
+  local inputs = res['input'] or { 'stdin' }
 
   for _, n in ipairs(inputs) do
     local h, err
@@ -115,7 +115,7 @@ local function handler(args)
             if buffer[hash] then
               table.insert(buffer[hash], line)
             else
-              buffer[hash] = {line}
+              buffer[hash] = { line }
             end
           end
         end

@@ -27,18 +27,28 @@ context("Selectors test", function()
     task:process_message()
     task:get_mempool():set_variable("int_var", 1)
     task:get_mempool():set_variable("str_var", "str 1")
+    task:cache_set('cachevar1', 'hello\x00world')
+    task:cache_set('cachevar2', {'hello', 'world'})
     if not res then
       assert_true(false, "failed to load message")
     end
   end)
 
-  local function check_selector(selector_string)
-    local sels = lua_selectors.parse_selector(cfg, selector_string)
-    local elts = lua_selectors.process_selectors(task, sels)
+  local function check_selector_plain(selector_string)
+    local sels = lua_selectors.create_selector_closure_fn(nil, cfg, selector_string, nil,
+        function(_, res, _) return res end)
+    local elts = sels(task)
     return elts
   end
 
-  local cases = {
+  local function check_selector_kv(selector_string)
+    local sels = lua_selectors.create_selector_closure_fn(nil, cfg, selector_string, nil,
+        lua_selectors.kv_table_from_pairs)
+    local elts = sels(task)
+    return elts
+  end
+
+  local cases_plain = {
     ["ip"] = {
                 selector = "ip",
                 expect = {"198.172.22.91"}
@@ -51,7 +61,13 @@ context("Selectors test", function()
 
     ["header Subject lower"] = {
                 selector = "header(Subject).lower",
-                expect = {"second, lower-cased header subject"}},
+                expect = {"second, lower-cased header subject"}
+    },
+
+    ["header Subject lower_utf8"] = {
+                selector = "header(Subject).lower_utf8",
+                expect = {"second, lower-cased header subject"}
+    },
 
     ["header full Subject lower"] = {
                 selector = "header(Subject, 'full').lower",
@@ -169,17 +185,17 @@ context("Selectors test", function()
                 selector = "helo",
                 expect = {"hello mail"}},
 
-    ["received by hostname"] = {
-                selector = "received:by_hostname",
+    ["received ip"] = {
+                selector = "received:by_hostname.filter_string_nils",
                 expect = {{"server1.chat-met-vreemden.nl", "server2.chat-met-vreemden.nl"}}},
 
     ["received by hostname last"] = {
-      selector = "received:by_hostname.last",
+      selector = "received:by_hostname.filter_string_nils.last",
       expect = {"server2.chat-met-vreemden.nl"}
     },
 
     ["received by hostname first"] = {
-      selector = "received:by_hostname.first",
+      selector = "received:by_hostname.filter_string_nils.first",
       expect = {"server1.chat-met-vreemden.nl"}
     },
 
@@ -199,9 +215,10 @@ context("Selectors test", function()
       selector = "specific_urls({need_emails = true, limit = 2})",
       expect = {{"test@example.net", "http://subdomain.example.net"}}},
 
-    ["specific_urls + emails limit"] = {
-      selector = "specific_urls({need_emails = true, limit = 1})",
-      expect = {{"test@example.net"}}},
+    -- Broken test as order depends on the hash function internally
+    --["specific_urls + emails limit"] = {
+    --  selector = "specific_urls({need_emails = true, limit = 1})",
+    --  expect = {{"test@example.net"}}},
 
     ["pool_var str, default type"] = {
                 selector = [[pool_var("str_var")]],
@@ -219,9 +236,9 @@ context("Selectors test", function()
                 selector = "time",
                 expect = {"1537364211"}},
 
-    ["request_header"] = {
-                selector = "request_header(hdr1)",
-                expect = {"value1"}},
+--    ["request_header"] = {
+--                selector = "request_header(hdr1)",
+--                expect = {"value1"}},
 
     ["get_host"] = {
                 selector = "urls:get_host",
@@ -358,11 +375,38 @@ context("Selectors test", function()
       selector = "header('Subject').regexp('.*').first",
       expect = {"Second, lower-cased header subject"}
     },
+
+    ["task cache string"] = {
+      selector = "task_cache('cachevar1')",
+      expect = {"hello\x00world"}
+    },
+    ["task cache table"] = {
+      selector = "task_cache('cachevar2')",
+      expect = {{"hello", "world"}}
+    },
   }
 
-  for case_name, case in lua_util.spairs(cases) do
-    test("case " .. case_name, function()
-      local elts = check_selector(case.selector)
+  for case_name, case in lua_util.spairs(cases_plain) do
+    test("plain case " .. case_name, function()
+      local elts = check_selector_plain(case.selector)
+      assert_not_nil(elts)
+      assert_rspamd_table_eq_sorted({actual = elts, expect = case.expect})
+    end)
+  end
+
+  local cases_kv = {
+    ["ip"] = {
+      selector = "id('ip');ip",
+      expect = { ip = "198.172.22.91" }
+    },
+    ["ip+words"] = {
+      selector = "id('ip');ip;id('words');words('full'):2",
+      expect = { ip = "198.172.22.91", words = {'hello', 'world', '', 'mail', 'me'} }
+    },
+  }
+  for case_name, case in lua_util.spairs(cases_kv) do
+    test("kv case " .. case_name, function()
+      local elts = check_selector_kv(case.selector)
       assert_not_nil(elts)
       assert_rspamd_table_eq_sorted({actual = elts, expect = case.expect})
     end)

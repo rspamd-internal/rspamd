@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ local function kaspersky_config(opts)
   return nil
 end
 
-local function kaspersky_check(task, content, digest, rule)
+local function kaspersky_check(task, content, digest, rule, maybe_part)
   local function kaspersky_check_uncached ()
     local upstream = rule.upstreams:get_upstream_round_robin()
     local addr = upstream:get_addr()
@@ -107,11 +107,8 @@ local function kaspersky_check(task, content, digest, rule)
       rspamd_util.close_file(message_fd)
     end)
 
-
     local function kaspersky_callback(err, data)
       if err then
-        -- set current upstream to fail because an error occurred
-        upstream:fail()
 
         -- retry with another upstream until retransmits exceeds
         if retransmits > 0 then
@@ -129,6 +126,7 @@ local function kaspersky_check(task, content, digest, rule)
             task = task,
             host = addr:to_string(),
             port = addr:get_port(),
+            upstream = upstream,
             timeout = rule['timeout'],
             callback = kaspersky_callback,
             data = { clamav_compat_cmd },
@@ -138,11 +136,12 @@ local function kaspersky_check(task, content, digest, rule)
           rspamd_logger.errx(task,
               '%s [%s]: failed to scan, maximum retransmits exceed',
               rule['symbol'], rule['type'])
-          common.yield_result(task, rule, 'failed to scan and retransmits exceed', 0.0, 'fail')
+          common.yield_result(task, rule,
+              'failed to scan and retransmits exceed', 0.0, 'fail',
+              maybe_part)
         end
 
       else
-        upstream:ok()
         data = tostring(data)
         local cached
         lua_util.debugm(rule.name, task,
@@ -154,15 +153,16 @@ local function kaspersky_check(task, content, digest, rule)
         else
           local vname = string.match(data, ': (.+) FOUND')
           if vname then
-            common.yield_result(task, rule, vname)
+            common.yield_result(task, rule, vname, 1.0, nil, maybe_part)
             cached = vname
           else
             rspamd_logger.errx(task, 'unhandled response: %s', data)
-            common.yield_result(task, rule, 'unhandled response', 0.0, 'fail')
+            common.yield_result(task, rule, 'unhandled response',
+                0.0, 'fail', maybe_part)
           end
         end
         if cached then
-          common.save_cache(task, digest, rule, cached)
+          common.save_cache(task, digest, rule, cached, 1.0, maybe_part)
         end
       end
     end
@@ -171,6 +171,7 @@ local function kaspersky_check(task, content, digest, rule)
       task = task,
       host = addr:to_string(),
       port = addr:get_port(),
+      upstream = upstream,
       timeout = rule['timeout'],
       callback = kaspersky_callback,
       data = { clamav_compat_cmd },
@@ -178,7 +179,8 @@ local function kaspersky_check(task, content, digest, rule)
     })
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, kaspersky_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      kaspersky_check_uncached, maybe_part) then
     return
   else
     kaspersky_check_uncached()

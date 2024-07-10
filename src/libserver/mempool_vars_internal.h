@@ -1,11 +1,11 @@
-/*-
- * Copyright 2016 Vsevolod Stakhov
+/*
+ * Copyright 2023 Vsevolod Stakhov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -40,5 +40,8 @@
 #define RSPAMD_MEMPOOL_FUZZY_RESULT "fuzzy_hashes"
 #define RSPAMD_MEMPOOL_SPAM_LEARNS "spam_learns"
 #define RSPAMD_MEMPOOL_HAM_LEARNS "ham_learns"
+#define RSPAMD_MEMPOOL_RE_MAPS_CACHE "re_maps_cache"
+#define RSPAMD_MEMPOOL_HTTP_STAT_BACKEND_RUNTIME "stat_http_runtime"
+#define RSPAMD_MEMPOOL_FUZZY_STAT "fuzzy_stat"
 
 #endif

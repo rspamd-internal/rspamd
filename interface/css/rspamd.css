@@ -23,10 +23,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
-/* bootstrap 4 overrides */
+/* stylelint-disable selector-id-pattern */
+
 :root {
     font-size: 14px;
+
+    /* Tweak bootstrap 5 colors for better accessibility */
+    --bs-danger-rgb: 221, 0, 0;
+    --bs-success-rgb: 40, 139, 69;
 }
+
+/* bootstrap 4 overrides */
 body {
     font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
@@ -44,9 +51,7 @@ small,
     padding-top: 0;
     padding-bottom: 0;
     margin-bottom: 20px;
-    border-bottom-color: rgb(231, 231, 231);
-    border-bottom-style: solid;
-    border-bottom-width: 1px;
+    border-bottom: 1px solid rgb(231 231 231);
 }
 .nav-pills .nav-link.active {
     background-color: #e7e7e7;
@@ -60,6 +65,21 @@ small,
 td.warning {
     background-color: #fff8e6;
 }
+@media (max-width: 1199px) {
+    .navbar-collapse.order-3 {
+        border-top: 1px solid #dee2e6 !important;
+    }
+    /* Avoid navbar toggler hiding on navbar collapse */
+    .navbar-toggler {
+        display: block !important;
+    }
+}
+
+/* Tweak FooTable for Bootstrap 5 */
+.footable .btn,
+.footable .form-control {
+    border-radius: 0.375rem;
+}
 
 /* bootstrap 4 additionals */
 .btn-group-xs > .btn,
@@ -72,10 +92,19 @@ td.warning {
 .btn.disabled,
 .btn[disabled],
 fieldset[disabled] .btn {
+    pointer-events: auto;
     cursor: not-allowed;
 }
 .w-1 {
     width: 1%;
+}
+
+a {
+    outline: none;
+}
+textarea {
+    font-family: "Courier New", Courier, monospace;
+    resize: vertical;
 }
 
 /* Tweak FooTable for Bootstrap 4 */
@@ -83,7 +112,7 @@ fieldset[disabled] .btn {
     content: none;
 }
 .footable .btn-outline-secondary {
-    border-color: rgb(108, 117, 125);
+    border-color: rgb(108 117 125);
 }
 .footable .btn-group > .btn:not(:first-child),
 .footable .btn-group > .btn-group:not(:first-child) > .btn {
@@ -97,13 +126,9 @@ fieldset[disabled] .btn {
 .footable-header .fooicon {
     font-size: 12px;
 }
-
-a {
-    outline: none;
-}
-textarea {
-    font-family: "Courier New", Courier, monospace;
-    resize: vertical;
+.footable .pagination > li:last-child > a {
+    border-top-right-radius:4px;
+    border-bottom-right-radius:4px
 }
 
 /* local overrides */
@@ -117,7 +142,8 @@ textarea {
 
 input.form-control[type="number"] {
     width: 4em;
-    padding: 2px 0;
+    padding-left: 0;
+    padding-right: 0;
     text-align: center;
 }
 input.action-scores {
@@ -179,37 +205,19 @@ table#symbolsTable input[type="number"] {
 .alert-info h4 {
     color: #3a87ad;
 }
-.alert-block .close {
-    right: -1px;
-}
-.alert-block > p,
-.alert-block > ul {
-    margin-bottom: 0;
-}
 
-.pager li > a,
-.pager li > span {
-    display: inline-block;
-    padding: 5px 14px;
-    background-color: #fff;
-    border: 1px solid #ddd;
-    -webkit-border-radius: 0;
-    -moz-border-radius: 0;
-    border-radius: 0;
+#authInvalidCharFeedback,
+#authUnauthorizedFeedback {
+    position: unset;
+    padding-top: 0.1rem;
+    padding-bottom: 0.1rem;
 }
 
 /* widget */
 .card-header,
 .modal-header {
-    background-color: #efefef;
-    background-image: -webkit-gradient(linear, 0 0%, 0 100%, from(#fdfdfd), to(#eaeaea));
-    background-image: -webkit-linear-gradient(top, #fdfdfd 0%, #eaeaea 100%);
-    background-image: -moz-linear-gradient(top, #fdfdfd 0%, #eaeaea 100%);
-    background-image: -ms-linear-gradient(top, #fdfdfd 0%, #eaeaea 100%);
-    background-image: -o-linear-gradient(top, #fdfdfd 0%, #eaeaea 100%);
-    background-image: -linear-gradient(top, #fdfdfd 0%, #eaeaea 100%);
-    /* stylelint-disable-next-line function-name-case */
-    filter: progid:DXImageTransform.Microsoft.gradient(startColorstr='#fdfdfd', endColorstr='#eaeaea', GradientType=0); /* IE6-9 */
+    background-color: #f3f3f3;
+    background-image: linear-gradient(to bottom, #fdfdfd, #eaeaea);
 }
 .card-header > .icon > svg {
     vertical-align: middle;
@@ -219,15 +227,11 @@ table#symbolsTable input[type="number"] {
 }
 
 .stat-box {
-    background-image: -webkit-gradient(linear, 0 0%, 0 100%, from(#f9f9f9), to(#ededed));
-    background-image: -webkit-linear-gradient(top, #f9f9f9 0%, #ededed 100%);
-    background-image: -moz-linear-gradient(top, #f9f9f9 0%, #ededed 100%);
-    background-image: -ms-linear-gradient(top, #f9f9f9 0%, #ededed 100%);
-    background-image: -o-linear-gradient(top, #f9f9f9 0%, #ededed 100%);
-    background-image: linear-gradient(to bottom, #f9f9f9 0%, #ededed 100%);
+    background-color: #f3f3f3;
+    background-image: linear-gradient(to bottom, #f9f9f9, #ededed);
     line-height: 1;
 }
-.stat-box:not(.float-right) {
+.stat-box:not(.float-end) {
     min-width: 90px;
 }
 .stat-box .widget {
@@ -246,10 +250,10 @@ table#symbolsTable input[type="number"] {
 .symbol-default:hover {
     background-color: #e6e6e6;
 }
-.symbol-negative {
+.symbol-negative.symbol-negative {
     background-color: #eef9e7;
 }
-.symbol-positive {
+.symbol-positive.symbol-positive {
     background-color: #fbe9e5;
 }
 .symbol-special {
@@ -277,7 +281,7 @@ table#symbolsTable input[type="number"] {
 }
 
 /* Font Awesome icons size */
-.svg-inline--fa {
+.svg-inline--fa { /* stylelint-disable-line selector-class-pattern */
     font-size: 16px;
 }
 /* Increase refresh button spinner speed */
@@ -299,6 +303,10 @@ table#symbolsTable input[type="number"] {
 }
 .status-table thead th:last-child {
     border-right: none;
+}
+.footable-header,
+.footable tr:not(.footable-detail-row) > td {
+    font-size: 11px;
 }
 .status-table tr:last-child td:first-child {
     border-radius: 0 0 0 calc(.25rem - 1px);
@@ -338,6 +346,7 @@ table#symbolsTable input[type="number"] {
     z-index: 100;
 }
 #rrd-table td {
+    color: inherit;
     padding-top: 2px;
     padding-bottom: 2px;
 }
@@ -370,6 +379,15 @@ table#symbolsTable input[type="number"] {
 #historyTable_history > thead > tr > th {
     padding-right: 20px;
 }
+@media (min-width: 576px) and (max-width: 1199px) {
+    .history-col-time {
+        /* Avoid taking multiple lines in every row when one of rows has long ID */
+        white-space: nowrap;
+    }
+}
+.footable-filtering-search .dropdown-menu .sym-order-toggle {
+    display: none;
+}
 
 #history_page_size {
     width: 6em !important;
@@ -377,10 +395,10 @@ table#symbolsTable input[type="number"] {
 }
 
 .scorebar-spam {
-    background-color: rgba(240, 0, 0, 0.1) !important;
+    background-color: rgba(240 0 0 / 0.1) !important;
 }
 .scorebar-ham {
-    background: rgba(100, 230, 80, 0.1) !important;
+    background: rgba(100 230 80 / 0.1) !important;
 }
 
 .danger .icon {
@@ -390,17 +408,17 @@ table#symbolsTable input[type="number"] {
     color: #468847;
 }
 
+#learnServers {
+    display: flex;
+}
+
 #nprogress .bar {
     height: 1px;
 }
 
-#row-main {
-    margin-left: -17.5px;
-    margin-right: -17.5px;
-}
 @media (min-width: 992px) {
     #selectors > .card {
-        height: calc(100vh - 91px);
+        height: calc(100vh - 96px);
     }
     #row-main {
         /* necessary to hide collapsed sidebar */
@@ -438,6 +456,10 @@ table#symbolsTable input[type="number"] {
     }
 }
 
+#selectors > .card > .card-body {
+    min-height: 0;
+}
+
 .sidebar-nav {
     width: 20px;
 }
@@ -465,8 +487,7 @@ table#symbolsTable input[type="number"] {
         border-bottom-right-radius: 3.5px;
     }
     .sidebar-nav {
-        margin-left: -1px;
-        margin-right: -1px;
+        padding-right: 0;
         display: block;
     }
     #content {
@@ -486,10 +507,6 @@ table#symbolsTable input[type="number"] {
     #sidebar-right {
         border-bottom-left-radius: 3.5px;
         border-bottom-right-radius: 3.5px;
-    }
-    .sidebar-nav {
-        margin-top: -1px;
-        margin-bottom: -1px;
     }
     #content {
         border-top: 1px solid #ddd;
@@ -528,18 +545,22 @@ table#symbolsTable input[type="number"] {
 .codejar-wrap,
 #editor.map-textarea,
 #editor.map-textarea:focus {
-    background: rgb(0, 47, 79);
+    background: rgb(0 47 79);
     color: silver;
 }
+.codejar-wrap {
+    /* Fix line wrapping */
+    scrollbar-width: thin;
+}
+.codejar-linenumbers-inner-wrap {
+    bottom: unset;
+}
 .codejar-linenumbers {
-    background: rgba(255, 255, 255, 0.07) !important;
-    bottom: unset !important;
-    color: rgba(120, 120, 120, 1) !important;
-    height: inherit;
-    mix-blend-mode: unset !important;
+    background: rgba(255 255 255 / 0.07) !important;
+}
+.codejar-linenumber {
+    color: rgba(120 120 120 / 1) !important;
     text-align: right;
-    overflow: unset !important;
-    user-select: none;
 }
 .editor {
     font-family: monospace;

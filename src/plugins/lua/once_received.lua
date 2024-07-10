@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2015, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,10 +41,10 @@ local check_authed = false
 local function check_quantity_received (task)
   local recvh = task:get_received_headers()
 
-  local nreceived = fun.reduce(function(acc, rcvd)
+  local nreceived = fun.reduce(function(acc, _)
     return acc + 1
   end, 0, fun.filter(function(h)
-    return not h['artificial']
+    return not h['flags']['artificial']
   end, recvh))
 
   local function recv_dns_cb(_, to_resolve, results, err)
@@ -56,7 +56,10 @@ local function check_quantity_received (task)
     if not results then
       if nreceived <= 1 then
         task:insert_result(symbol, 1)
-        task:insert_result(symbol_strict, 1)
+        -- Avoid strict symbol inserting as the remaining symbols have already
+        -- quote a significant weight, so a message could be rejected by just
+        -- this property.
+        --task:insert_result(symbol_strict, 1)
         -- Check for MUAs
         local ua = task:get_header('User-Agent')
         local xm = task:get_header('X-Mailer')
@@ -68,11 +71,11 @@ local function check_quantity_received (task)
     else
       rspamd_logger.infox(task, 'source hostname has not been passed to Rspamd from MTA, ' ..
           'but we could resolve source IP address PTR %s as "%s"',
-        to_resolve, results[1])
+          to_resolve, results[1])
       task:set_hostname(results[1])
 
       if good_hosts then
-        for _,gh in ipairs(good_hosts) do
+        for _, gh in ipairs(good_hosts) do
           if string.find(results[1], gh) then
             return
           end
@@ -81,7 +84,7 @@ local function check_quantity_received (task)
 
       if nreceived <= 1 then
         task:insert_result(symbol, 1)
-        for _,h in ipairs(bad_hosts) do
+        for _, h in ipairs(bad_hosts) do
           if string.find(results[1], h) then
 
             task:insert_result(symbol_strict, 1, h)
@@ -101,17 +104,17 @@ local function check_quantity_received (task)
   end
   if whitelist and task_ip and whitelist:get_key(task_ip) then
     rspamd_logger.infox(task, 'whitelisted mail from %s',
-      task_ip:to_string())
+        task_ip:to_string())
     return
   end
 
   local hn = task:get_hostname()
   -- Here we don't care about received
   if (not hn) and task_ip and task_ip:is_valid() then
-    task:get_resolver():resolve_ptr({task = task,
-      name = task_ip:to_string(),
-      callback = recv_dns_cb,
-      forced = true
+    task:get_resolver():resolve_ptr({ task = task,
+                                      name = task_ip:to_string(),
+                                      callback = recv_dns_cb,
+                                      forced = true
     })
     return
   end
@@ -128,7 +131,7 @@ local function check_quantity_received (task)
       local rhn = string.lower(r['real_hostname'])
       -- Check for good hostname
       if rhn and good_hosts then
-        for _,gh in ipairs(good_hosts) do
+        for _, gh in ipairs(good_hosts) do
           if string.find(rhn, gh) then
             ret = false
             break
@@ -143,8 +146,10 @@ local function check_quantity_received (task)
         -- Unresolved host
         task:insert_result(symbol, 1)
 
-        if not hn then return end
-        for _,h in ipairs(bad_hosts) do
+        if not hn then
+          return
+        end
+        for _, h in ipairs(bad_hosts) do
           if string.find(hn, h) then
             task:insert_result(symbol_strict, 1, h)
             return
@@ -173,7 +178,7 @@ if opts then
       callback = check_quantity_received,
     })
 
-    for n,v in pairs(opts) do
+    for n, v in pairs(opts) do
       if n == 'symbol_strict' then
         symbol_strict = v
       elseif n == 'symbol_rdns' then
@@ -193,8 +198,9 @@ if opts then
           good_hosts = v
         end
       elseif n == 'whitelist' then
-        whitelist = rspamd_map_add('once_received', 'whitelist', 'radix',
-          'once received whitelist')
+        local lua_maps = require "lua_maps"
+        whitelist = lua_maps.map_add('once_received', 'whitelist', 'radix',
+            'once received whitelist')
       elseif n == 'symbol_mx' then
         symbol_mx = v
       end
@@ -210,7 +216,7 @@ if opts then
       type = 'virtual',
       parent = id
     })
-      rspamd_config:register_symbol({
+    rspamd_config:register_symbol({
       name = symbol_strict,
       type = 'virtual',
       parent = id

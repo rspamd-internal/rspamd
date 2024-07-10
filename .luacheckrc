@@ -10,8 +10,6 @@ exclude_files = {
 }
 
 globals = {
-  'check_header_delimiter_empty',
-  'check_header_delimiter_tab',
   'classifiers',
   'config',
   'confighelp',
@@ -26,7 +24,6 @@ globals = {
   'rspamd_redis_make_request',
   'rspamd_str_split',
   'rspamd_version',
-  'rspamd_map_add',
   'rspamd_maps',
   'rspamd_plugins_state',
   'rspamadm',
@@ -36,6 +33,7 @@ globals = {
   'rspamadm_dns_resolver',
   'jit',
   'table.unpack',
+  'table.clear',
   'unpack',
 }
 
@@ -62,6 +60,13 @@ files['/**/lualib/lua_redis.lua'].globals = {
   'rspamadm_ev_base',
 }
 
+files['/**/lualib/redis_scripts/**'].globals = {
+  'redis',
+  'KEYS',
+  'cjson',
+  'cmsgpack',
+}
+
 files['/**/src/rspamadm/*'].globals = {
   'ansicolors',
   'getopt',
@@ -76,3 +81,4 @@ files['/**/test/functional/'].ignore = {'631'}
 
 max_string_line_length = 500
 max_comment_line_length = 500
+max_line_length = 140

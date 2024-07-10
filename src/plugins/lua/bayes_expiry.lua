@@ -1,6 +1,6 @@
 --[[
 Copyright (c) 2017, Andrew Lewis <nerf@judo.za.org>
-Copyright (c) 2017, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -72,9 +72,9 @@ local function check_redis_classifier(cls, cfg)
 
     local statfiles = cls.statfile
     if statfiles[1] then
-      for _,stf in ipairs(statfiles) do
+      for _, stf in ipairs(statfiles) do
         if not stf.symbol then
-          for k,v in pairs(stf) do
+          for k, v in pairs(stf) do
             check_statfile_table(v, k)
           end
         else
@@ -82,7 +82,7 @@ local function check_redis_classifier(cls, cfg)
         end
       end
     else
-      for stn,stf in pairs(statfiles) do
+      for stn, stf in pairs(statfiles) do
         check_statfile_table(stf, stn)
       end
     end
@@ -132,8 +132,10 @@ local classifier = obj.classifier
 
 if classifier then
   if classifier[1] then
-    for _,cls in ipairs(classifier) do
-      if cls.bayes then cls = cls.bayes end
+    for _, cls in ipairs(classifier) do
+      if cls.bayes then
+        cls = cls.bayes
+      end
       if cls.backend and cls.backend == 'redis' then
         check_redis_classifier(cls, obj)
       end
@@ -143,7 +145,7 @@ if classifier then
 
       classifier = classifier.bayes
       if classifier[1] then
-        for _,cls in ipairs(classifier) do
+        for _, cls in ipairs(classifier) do
           if cls.backend and cls.backend == 'redis' then
             check_redis_classifier(cls, obj)
           end
@@ -157,11 +159,10 @@ if classifier then
   end
 end
 
-
 local opts = rspamd_config:get_all_opt(N)
 
 if opts then
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     settings[k] = v
   end
 end
@@ -171,11 +172,13 @@ end
 if settings.cluster_nodes == 0 then
   local neighbours = obj.neighbours or {}
   local n_neighbours = 0
-  for _,_ in pairs(neighbours) do n_neighbours = n_neighbours + 1 end
+  for _, _ in pairs(neighbours) do
+    n_neighbours = n_neighbours + 1
+  end
   settings.cluster_nodes = n_neighbours
 end
 
-  -- Fill template
+-- Fill template
 template.count = settings.count
 template.threshold = settings.threshold
 template.common_ttl = settings.common_ttl
@@ -184,7 +187,7 @@ template.significant_factor = settings.significant_factor
 template.expire_step = settings.interval
 template.hostname = rspamd_util.get_hostname()
 
-for k,v in pairs(template) do
+for k, v in pairs(template) do
   template[k] = tostring(v)
 end
 
@@ -247,7 +250,7 @@ local expiry_script = [[
   local tokens = {}
 
   -- Tokens occurrences distribution counters
-  local occurr = {
+  local occur = {
     ham = {},
     spam = {},
     total = {}
@@ -277,7 +280,7 @@ local expiry_script = [[
 
       for k,v in pairs({['ham']=ham, ['spam']=spam, ['total']=total}) do
         if tonumber(v) > 19 then v = 20 end
-        occurr[k][v] = occurr[k][v] and occurr[k][v] + 1 or 1
+        occur[k][v] = occur[k][v] and occur[k][v] + 1 or 1
       end
     end
   end
@@ -359,33 +362,33 @@ local expiry_script = [[
 
   local occ_distr = {}
   for _,cl in pairs({'ham', 'spam', 'total'}) do
-    local occurr_key = pattern_sha1 .. '_occurrence_' .. cl
+    local occur_key = pattern_sha1 .. '_occurrence_' .. cl
 
     if cursor ~= 0 then
       local n
-      for i,v in ipairs(redis.call('HGETALL', occurr_key)) do
+      for i,v in ipairs(redis.call('HGETALL', occur_key)) do
         if i % 2 == 1 then
           n = tonumber(v)
         else
-          occurr[cl][n] = occurr[cl][n] and occurr[cl][n] + v or v
+          occur[cl][n] = occur[cl][n] and occur[cl][n] + v or v
         end
       end
 
       local str = ''
-      if occurr[cl][0] ~= nil then
-        str = '0:' .. occurr[cl][0] .. ','
+      if occur[cl][0] ~= nil then
+        str = '0:' .. occur[cl][0] .. ','
       end
-      for k,v in ipairs(occurr[cl]) do
+      for k,v in ipairs(occur[cl]) do
         if k == 20 then k = '>19' end
         str = str .. k .. ':' .. v .. ','
       end
       table.insert(occ_distr, str)
     else
-      redis.call('DEL', occurr_key)
+      redis.call('DEL', occur_key)
     end
 
-    if next(occurr[cl]) ~= nil then
-      redis.call('HMSET', occurr_key, unpack_function(hash2list(occurr[cl])))
+    if next(occur[cl]) ~= nil then
+      redis.call('HMSET', occur_key, unpack_function(hash2list(occur[cl])))
     end
   end
 
@@ -438,12 +441,12 @@ local function expire_step(cls, ev_base, worker)
           data[5]
         }
         logger.infox(rspamd_config,
-                'finished expiry %s: %s items checked, %s significant (%s %s), ' ..
-                    '%s insignificant (%s %s), %s common (%s discriminated), ' ..
-                    '%s infrequent (%s %s), %s mean, %s std',
-                lutil.unpack(d))
+            'finished expiry %s: %s items checked, %s significant (%s %s), ' ..
+                '%s insignificant (%s %s), %s common (%s discriminated), ' ..
+                '%s infrequent (%s %s), %s mean, %s std',
+            lutil.unpack(d))
         if cycle then
-          for i,cl in ipairs({'in ham', 'in spam', 'total'}) do
+          for i, cl in ipairs({ 'in ham', 'in spam', 'total' }) do
             logger.infox(rspamd_config, 'tokens occurrences, %s: {%s}', cl, occ_distr[i])
           end
         end
@@ -457,29 +460,31 @@ local function expire_step(cls, ev_base, worker)
     end
   end
   lredis.exec_redis_script(cls.script,
-      {ev_base = ev_base, is_write = true},
+      { ev_base = ev_base, is_write = true },
       redis_step_cb,
-      {'RS*_*', cls.expiry}
+      { 'RS*_*', cls.expiry }
   )
 end
 
-rspamd_config:add_on_load(function (_, ev_base, worker)
+rspamd_config:add_on_load(function(_, ev_base, worker)
   -- Exit unless we're the first 'controller' worker
-  if not worker:is_primary_controller() then return end
+  if not worker:is_primary_controller() then
+    return
+  end
 
   local unique_redis_params = {}
   -- Push redis script to all unique redis servers
-  for _,cls in ipairs(settings.classifiers) do
+  for _, cls in ipairs(settings.classifiers) do
     if not unique_redis_params[cls.redis_params.hash] then
       unique_redis_params[cls.redis_params.hash] = cls.redis_params
     end
   end
 
-  for h,rp in pairs(unique_redis_params) do
+  for h, rp in pairs(unique_redis_params) do
     local script_id = lredis.add_redis_script(lutil.template(expiry_script,
         template), rp)
 
-    for _,cls in ipairs(settings.classifiers) do
+    for _, cls in ipairs(settings.classifiers) do
       if cls.redis_params.hash == h then
         cls.script = script_id
       end
@@ -487,10 +492,10 @@ rspamd_config:add_on_load(function (_, ev_base, worker)
   end
 
   -- Expire tokens at regular intervals
-  for _,cls in ipairs(settings.classifiers) do
+  for _, cls in ipairs(settings.classifiers) do
     rspamd_config:add_periodic(ev_base,
         settings['interval'],
-        function ()
+        function()
           expire_step(cls, ev_base, worker)
           return true
         end, true)

@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,13 +31,13 @@ local fun = require "fun"
 local lua_util = require "lua_util"
 local rspamd_logger = require "rspamd_logger"
 
-local function register_settings_cb()
+local function register_settings_cb(from_postload)
   if not post_init_performed then
     all_symbols = rspamd_config:get_symbols()
 
     default_symbols = fun.totable(fun.filter(function(_, v)
       return not v.allowed_ids or #v.allowed_ids == 0 or v.flags.explicit_disable
-    end,all_symbols))
+    end, all_symbols))
 
     local explicit_symbols = lua_util.keys(fun.filter(function(k, v)
       return v.flags.explicit_disable
@@ -45,7 +45,7 @@ local function register_settings_cb()
 
     local symnames = lua_util.list_to_hash(lua_util.keys(all_symbols))
 
-    for _,set in pairs(known_ids) do
+    for _, set in pairs(known_ids) do
       local s = set.settings.apply or {}
       set.symbols = lua_util.shallowcopy(symnames)
       local enabled_symbols = {}
@@ -58,18 +58,18 @@ local function register_settings_cb()
         -- Remove all symbols from set.symbols aside of explicit_disable symbols
         set.symbols = lua_util.list_to_hash(explicit_symbols)
         seen_enabled = true
-        for _,sym in ipairs(s.symbols_enabled) do
+        for _, sym in ipairs(s.symbols_enabled) do
           enabled_symbols[sym] = true
           set.symbols[sym] = true
         end
       end
       if s.groups_enabled then
         seen_enabled = true
-        for _,gr in ipairs(s.groups_enabled) do
+        for _, gr in ipairs(s.groups_enabled) do
           local syms = rspamd_config:get_group_symbols(gr)
 
           if syms then
-            for _,sym in ipairs(syms) do
+            for _, sym in ipairs(syms) do
               enabled_symbols[sym] = true
               set.symbols[sym] = true
             end
@@ -80,18 +80,18 @@ local function register_settings_cb()
       -- Disabled map
       if s.symbols_disabled then
         seen_disabled = true
-        for _,sym in ipairs(s.symbols_disabled) do
+        for _, sym in ipairs(s.symbols_disabled) do
           disabled_symbols[sym] = true
           set.symbols[sym] = false
         end
       end
       if s.groups_disabled then
         seen_disabled = true
-        for _,gr in ipairs(s.groups_disabled) do
+        for _, gr in ipairs(s.groups_disabled) do
           local syms = rspamd_config:get_group_symbols(gr)
 
           if syms then
-            for _,sym in ipairs(syms) do
+            for _, sym in ipairs(syms) do
               disabled_symbols[sym] = true
               set.symbols[sym] = false
             end
@@ -100,8 +100,12 @@ local function register_settings_cb()
       end
 
       -- Deal with complexity to avoid mess in C
-      if not seen_enabled then enabled_symbols = nil end
-      if not seen_disabled then disabled_symbols = nil end
+      if not seen_enabled then
+        enabled_symbols = nil
+      end
+      if not seen_disabled then
+        disabled_symbols = nil
+      end
 
       if enabled_symbols or disabled_symbols then
         -- Specify what symbols are really enabled for this settings id
@@ -118,9 +122,9 @@ local function register_settings_cb()
     end
 
     -- We now iterate over all symbols and check for allowed_ids/forbidden_ids
-    for k,v in pairs(all_symbols) do
+    for k, v in pairs(all_symbols) do
       if v.allowed_ids and not v.flags.explicit_disable then
-        for _,id in ipairs(v.allowed_ids) do
+        for _, id in ipairs(v.allowed_ids) do
           if known_ids[id] then
             local set = known_ids[id]
             if not set.has_specific_symbols then
@@ -134,7 +138,7 @@ local function register_settings_cb()
         end
       end
       if v.forbidden_ids then
-        for _,id in ipairs(v.forbidden_ids) do
+        for _, id in ipairs(v.forbidden_ids) do
           if known_ids[id] then
             local set = known_ids[id]
             if not set.has_specific_symbols then
@@ -150,8 +154,10 @@ local function register_settings_cb()
     end
 
     -- Now we create lists of symbols for each settings and digest
-    for _,set in pairs(known_ids) do
-      set.symbols = lua_util.keys(fun.filter(function(_, v) return v end, set.symbols))
+    for _, set in pairs(known_ids) do
+      set.symbols = lua_util.keys(fun.filter(function(_, v)
+        return v
+      end, set.symbols))
       table.sort(set.symbols)
       set.digest = lua_util.table_digest(set.symbols)
     end
@@ -188,7 +194,7 @@ local function transform_settings_maybe(settings, name)
         if not apply.scores then
           apply.scores = {}
         end
-        for k,v in pairs(senabled) do
+        for k, v in pairs(senabled) do
           if tonumber(v) then
             -- Move to symbols as well
             apply.scores[k] = tonumber(v)
@@ -205,7 +211,7 @@ local function transform_settings_maybe(settings, name)
 
       if apply.symbols then
         -- Check if added symbols are enabled
-        for k,v in pairs(apply.symbols) do
+        for k, v in pairs(apply.symbols) do
           local s
           -- Check if we have ["sym1", "sym2" ...] or {"sym1": xx, "sym2": yy}
           if type(k) == 'string' then
@@ -226,7 +232,7 @@ local function transform_settings_maybe(settings, name)
   return settings
 end
 
-local function register_settings_id(str, settings)
+local function register_settings_id(str, settings, from_postload)
   local numeric_id = numeric_settings_id(str)
 
   if known_ids[numeric_id] then
@@ -248,8 +254,12 @@ local function register_settings_id(str, settings)
     }
   end
 
-  if not post_init_added then
-    rspamd_config:add_post_init(register_settings_cb)
+  if not from_postload and not post_init_added then
+    -- Use high priority to ensure that settings are initialised early but not before all
+    -- plugins are loaded
+    rspamd_config:add_post_init(function()
+      register_settings_cb(true)
+    end, 150)
     rspamd_config:add_config_unload(function()
       if post_init_added then
         known_ids = {}
@@ -266,34 +276,34 @@ end
 
 exports.register_settings_id = register_settings_id
 
-
 local function settings_by_id(id)
   if not post_init_performed then
-    register_settings_cb()
+    register_settings_cb(false)
   end
   return known_ids[id]
 end
 
-
 exports.settings_by_id = settings_by_id
 exports.all_settings = function()
   if not post_init_performed then
-    register_settings_cb()
+    register_settings_cb(false)
   end
   return known_ids
 end
 exports.all_symbols = function()
   if not post_init_performed then
-    register_settings_cb()
+    register_settings_cb(false)
   end
   return all_symbols
 end
 -- What is enabled when no settings are there
 exports.default_symbols = function()
   if not post_init_performed then
-    register_settings_cb()
+    register_settings_cb(false)
   end
   return default_symbols
 end
+
+exports.load_all_settings = register_settings_cb
 
 return exports

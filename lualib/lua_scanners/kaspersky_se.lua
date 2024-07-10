@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,6 +48,8 @@ local function kaspersky_se_config(opts)
     scan_mime_parts = true,
     scan_text_mime = false,
     scan_image_mime = false,
+    keepalive = true,
+    auth_string = nil
   }
 
   default_conf = lua_util.override_defaults(default_conf, opts)
@@ -88,7 +90,7 @@ local function kaspersky_se_config(opts)
   return nil
 end
 
-local function kaspersky_se_check(task, content, digest, rule)
+local function kaspersky_se_check(task, content, digest, rule, maybe_part)
   local function kaspersky_se_check_uncached()
     local function make_url(addr)
       local url
@@ -118,6 +120,15 @@ local function kaspersky_se_check(task, content, digest, rule)
       ['X-KAV-Timeout'] = tostring(rule.timeout * 1000),
     }
 
+    local ip = task:get_from_ip()
+    if ip and ip:is_valid() then
+      hdrs['X-KAV-HostIP'] = tostring(ip)
+    end
+
+    if rule.auth_string then
+      hdrs['Authorization'] = rule.auth_string
+    end
+
     if task:has_from() then
       hdrs['X-KAV-ObjectURL'] = string.format('[from:%s]', task:get_from()[1].addr)
     end
@@ -125,7 +136,7 @@ local function kaspersky_se_check(task, content, digest, rule)
     local req_body
 
     if rule.use_files then
-      local fname =  string.format('%s/%s.tmp',
+      local fname = string.format('%s/%s.tmp',
           rule.tmpdir, rspamd_util.random_hex(32))
       local message_fd = rspamd_util.create_file(fname)
 
@@ -158,6 +169,7 @@ local function kaspersky_se_check(task, content, digest, rule)
       body = req_body,
       headers = hdrs,
       timeout = rule.timeout,
+      keepalive = rule.keepalive,
     }
 
     local function kas_callback(http_err, code, body, headers)
@@ -183,12 +195,13 @@ local function kaspersky_se_check(task, content, digest, rule)
           lua_util.debugm(rule.name, task, '%s: retry IP: %s:%s',
               rule.log_prefix, addr, addr:get_port())
           request_data.url = url
+          request_data.upstream = upstream
 
           http.request(request_data)
         else
-          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits '..
+          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits ' ..
               'exceed', rule.log_prefix)
-          task:insert_result(rule['symbol_fail'], 0.0, 'failed to scan and '..
+          task:insert_result(rule['symbol_fail'], 0.0, 'failed to scan and ' ..
               'retransmits exceed')
         end
       end
@@ -197,7 +210,9 @@ local function kaspersky_se_check(task, content, digest, rule)
         requery()
       else
         -- Parse the response
-        if upstream then upstream:ok() end
+        if upstream then
+          upstream:ok()
+        end
         if code ~= 200 then
           rspamd_logger.errx(task, 'invalid HTTP code: %s, body: %s, headers: %s', code, body, headers)
           task:insert_result(rule.symbol_fail, 1.0, 'Bad HTTP code: ' .. code)
@@ -220,38 +235,42 @@ local function kaspersky_se_check(task, content, digest, rule)
                   rule.log_prefix)
             end
           elseif data == 'CLEAN AND CONTAINS OFFICE MACRO' then
-            common.yield_result(task, rule, 'File contains macros', 0.0, 'encrypted')
+            common.yield_result(task, rule, 'File contains macros',
+                0.0, 'macro', maybe_part)
             cached = 'MACRO'
           else
             rspamd_logger.errx(task, '%s: unhandled clean response: %s', rule.log_prefix, data)
-            common.yield_result(task, rule, 'unhandled response:' .. data, 0.0, 'fail')
+            common.yield_result(task, rule, 'unhandled response:' .. data,
+                0.0, 'fail', maybe_part)
           end
         elseif data == 'SERVER_ERROR' then
           rspamd_logger.errx(task, '%s: error: %s', rule.log_prefix, data)
           common.yield_result(task, rule, 'error:' .. data,
-              0.0, 'fail')
+              0.0, 'fail', maybe_part)
         elseif string.match(data, 'DETECT (.+)') then
           local vname = string.match(data, 'DETECT (.+)')
-          common.yield_result(task, rule, vname)
+          common.yield_result(task, rule, vname, 1.0, nil, maybe_part)
           cached = vname
         elseif string.match(data, 'NON_SCANNED %((.+)%)') then
           local why = string.match(data, 'NON_SCANNED %((.+)%)')
 
           if why == 'PASSWORD PROTECTED' then
             rspamd_logger.errx(task, '%s: File is encrypted', rule.log_prefix)
-            common.yield_result(task, rule, 'File is encrypted: '.. why,
-                0.0, 'encrypted')
+            common.yield_result(task, rule, 'File is encrypted: ' .. why,
+                0.0, 'encrypted', maybe_part)
             cached = 'ENCRYPTED'
           else
-            common.yield_result(task, rule, 'unhandled response:' .. data, 0.0, 'fail')
+            common.yield_result(task, rule, 'unhandled response:' .. data,
+                0.0, 'fail', maybe_part)
           end
         else
           rspamd_logger.errx(task, '%s: unhandled response: %s', rule.log_prefix, data)
-          common.yield_result(task, rule, 'unhandled response:' .. data, 0.0, 'fail')
+          common.yield_result(task, rule, 'unhandled response:' .. data,
+              0.0, 'fail', maybe_part)
         end
 
         if cached then
-          common.save_cache(task, digest, rule, cached)
+          common.save_cache(task, digest, rule, cached, 1.0, maybe_part)
         end
 
       end
@@ -262,7 +281,7 @@ local function kaspersky_se_check(task, content, digest, rule)
   end
 
   if common.condition_check_and_continue(task, content, rule, digest,
-      kaspersky_se_check_uncached) then
+      kaspersky_se_check_uncached, maybe_part) then
     return
   else
 

@@ -7,7 +7,7 @@ context("RSA signature verification test", function()
   local rsa = require "rspamd_rsa"
   local hash = require "rspamd_cryptobox_hash"
   local pubkey = 'testkey.pub'
-  local privkey = 'testkey'
+  local privkey = 'testkey.sec'
   local data = 'test.data'
   local signature = 'test.sig'
   local test_dir = string.gsub(debug.getinfo(1).source, "^@(.+/)[^/]+$", "%1")
@@ -36,5 +36,15 @@ context("RSA signature verification test", function()
     rsa_sig = rsa_signature.load(string.format('%s/%s', test_dir, signature))
     assert_not_nil(rsa_sig)
     assert_true(rsa.verify_memory(rsa_key, rsa_sig, h:bin()))
+  end)
+
+  test("RSA keypair + sign + verify", function()
+    local sk, pk = rsa.keypair()
+    local sig = rsa.sign_memory(sk, "test")
+    assert_true(rsa.verify_memory(pk, sig, "test"))
+    assert_false(rsa.verify_memory(pk, sig, "test1"))
+    -- Overwrite
+    sk, pk = rsa.keypair()
+    assert_false(rsa.verify_memory(pk, sig, "test"))
   end)
 end)

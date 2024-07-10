@@ -161,7 +161,7 @@ my $as_info = {};
 # first 7 fields for this two formats are same
 use constant {
   F_REGISTRY => 0,  # {afrinic,apnic,arin,iana,lacnic,ripencc}
-  F_CC       => 1,  # ISO 3166 2-letter contry code
+  F_CC       => 1,  # ISO 3166 2-letter country code
   F_TYPE     => 2,  # {asn,ipv4,ipv6}
   F_START    => 3,
   F_VALUE    => 4,
@@ -210,7 +210,7 @@ if ($v4) {
         my $country = $as_info->{$asn}{'country'} || $unknown_placeholder;
         my $rir     = $as_info->{$asn}{'rir'}     || $unknown_placeholder;
 
-        # "15169|8.8.8.0/24|US|arin|" for 8.8.8.8
+        # "8.8.8.0/24 15169|8.8.8.0/24|US|arin|" for 8.8.8.8
         printf $v4_fh "%s %s|%s|%s|%s|\n", $net, $asn, $net, $country, $rir;
     }
 

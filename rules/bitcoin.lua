@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ local off = 0
 local base58_dec = fun.tomap(fun.map(
     function(c)
       off = off + 1
-      return c,(off - 1)
+      return c, (off - 1)
     end,
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"))
 
@@ -34,11 +34,13 @@ local function is_traditional_btc_address(word)
   local hash = require "rspamd_cryptobox_hash"
 
   local bytes = {}
-  for i=1,25 do bytes[i] = 0 end
+  for i = 1, 25 do
+    bytes[i] = 0
+  end
   -- Base58 decode loop
   fun.each(function(ch)
     local acc = base58_dec[ch] or 0
-    for i=25,1,-1 do
+    for i = 25, 1, -1 do
       acc = acc + (58 * bytes[i]);
       bytes[i] = acc % 256
       acc = math.floor(acc / 256);
@@ -46,14 +48,14 @@ local function is_traditional_btc_address(word)
   end, word)
   -- Now create a validation tag
   local sha256 = hash.create_specific('sha256')
-  for i=1,21 do
+  for i = 1, 21 do
     sha256:update(string.char(bytes[i]))
   end
   sha256 = hash.create_specific('sha256', sha256:bin()):bin()
 
   -- Compare tags
   local valid = true
-  for i=1,4 do
+  for i = 1, 4 do
     if string.sub(sha256, i, i) ~= string.char(bytes[21 + i]) then
       valid = false
     end
@@ -65,13 +67,13 @@ end
 -- Beach32 checksum combiner
 local function polymod(...)
   local chk = 1;
-  local gen = {0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3};
-  for _,t in ipairs({...}) do
-    for _,v in ipairs(t) do
+  local gen = { 0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3 };
+  for _, t in ipairs({ ... }) do
+    for _, v in ipairs(t) do
       local top = bit.rshift(chk, 25)
 
       chk = bit.bxor(bit.lshift(bit.band(chk, 0x1ffffff), 5), v)
-      for i=1,5 do
+      for i = 1, 5 do
         if bit.band(bit.rshift(top, i - 1), 0x1) ~= 0 then
           chk = bit.bxor(chk, gen[i])
         end
@@ -99,7 +101,6 @@ end
 local function verify_beach32_cksum(hrp, elts)
   return polymod(hrpExpand(hrp), elts) == 1
 end
-
 
 local function gen_bleach32_table(input)
   local d = {}
@@ -167,7 +168,9 @@ local function is_segwit_bech32_address(task, word)
       -- For semicolon
       table.insert(polymod_tbl, 0)
 
-      fun.each(function(byte) table.insert(polymod_tbl, byte) end, decoded)
+      fun.each(function(byte)
+        table.insert(polymod_tbl, byte)
+      end, decoded)
       lua_util.debugm(N, task, 'final polymod table: %s', polymod_tbl)
 
       return rspamd_util.btc_polymod(polymod_tbl)
@@ -176,14 +179,16 @@ local function is_segwit_bech32_address(task, word)
 end
 
 local normal_wallet_re = [[/\b[13LM][1-9A-Za-z]{25,34}\b/AL{sa_body}]]
-local btc_bleach_re = [[/\b(?:[a-zA-Z]\w+:)?[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{14,}\b/AL{sa_body}]]
+local btc_bleach_re = [[/\b(?:(?:[a-zA-Z]\w+:)|(?:bc1))?[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{14,}\b/AL{sa_body}]]
 
 config.regexp['BITCOIN_ADDR'] = {
   description = 'Message has a valid bitcoin wallet address',
-  re = string.format('(%s) || (%s)', normal_wallet_re, btc_bleach_re),
+  -- Use + operator to ensure that each expression is always evaluated
+  re = string.format('(%s) + (%s) > 0', normal_wallet_re, btc_bleach_re),
   re_conditions = {
     [normal_wallet_re] = function(task, txt, s, e)
-      if e - s <= 2 then
+      local len = e - s
+      if len <= 2 or len > 1024 then
         return false
       end
 
@@ -204,7 +209,8 @@ config.regexp['BITCOIN_ADDR'] = {
       end
     end,
     [btc_bleach_re] = function(task, txt, s, e)
-      if e - s <= 2 then
+      local len = e - s
+      if len <= 2 or len > 1024 then
         return false
       end
 

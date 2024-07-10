@@ -497,10 +497,10 @@
 
 #if EV_USE_IOURING
 # include <sys/syscall.h>
-# if !SYS_io_uring_setup && __linux && !__alpha
+# if !SYS_io_uring_register && __linux && !__alpha
 #  define SYS_io_uring_setup     425
 #  define SYS_io_uring_enter     426
-#  define SYS_io_uring_wregister 427
+#  define SYS_io_uring_register  427
 # endif
 # if SYS_io_uring_setup && EV_USE_EPOLL /* iouring backend requires epoll backend */
 #  define EV_NEED_SYSCALL 1
@@ -843,6 +843,8 @@ struct signalfd_siginfo
       #define ECB_MEMORY_FENCE         __asm__ __volatile__ ("tb1 0,%%r0,128" : : : "memory")
     #elif defined __sh__
       #define ECB_MEMORY_FENCE         __asm__ __volatile__ (""         : : : "memory")
+    #elif defined __loongarch__ || __loongarch64
+      #define ECB_MEMORY_FENCE         __asm__ __volatile__ ("dbar %0 ": : "I"(0) : "memory")
     #endif
   #endif
 #endif
@@ -1870,7 +1872,7 @@ static EV_ATOMIC_T have_realtime; /* did clock_gettime (CLOCK_REALTIME) work? */
 
 #if EV_USE_MONOTONIC
 static EV_ATOMIC_T have_monotonic; /* did clock_gettime (CLOCK_MONOTONIC) work? */
-static EV_ATOMIC_T monotinic_clock_id;
+static EV_ATOMIC_T monotonic_clock_id;
 #endif
 static EV_ATOMIC_T have_cheap_timer = 0;
 
@@ -2201,7 +2203,7 @@ get_clock (void)
   if (ecb_expect_true (have_monotonic))
     {
       struct timespec ts;
-      clock_gettime (monotinic_clock_id, &ts);
+      clock_gettime (monotonic_clock_id, &ts);
       return ((ev_tstamp)ts.tv_sec) + ts.tv_nsec * 1e-9;
     }
 #endif
@@ -3279,12 +3281,12 @@ loop_init (EV_P_ unsigned int flags) EV_NOEXCEPT
 
           if (!clock_gettime (CLOCK_MONOTONIC, &ts)) {
             have_monotonic = 1;
-            monotinic_clock_id = CLOCK_MONOTONIC;
+			  monotonic_clock_id = CLOCK_MONOTONIC;
 #define CHECK_CLOCK_SOURCE(id) do { \
   if (!clock_gettime ((id), &ts) && \
     !clock_getres ((id), &ts)) { \
     if (ts.tv_sec == 0 && ts.tv_nsec < 10ULL * 1000000) { \
-      monotinic_clock_id = (id); \
+      monotonic_clock_id = (id); \
       have_cheap_timer = 1; \
     } \
   } \
@@ -4130,19 +4132,21 @@ ev_run (EV_P_ int flags)
         if (ecb_expect_true (!(flags & EVRUN_NOWAIT || idleall || !activecnt || pipe_write_skipped)))
           {
             waittime = EV_TS_CONST (MAX_BLOCKTIME);
-
+#if EV_USE_MONOTONIC
+            if (ecb_expect_true (have_monotonic)) {
 #if EV_USE_TIMERFD
             /* sleep a lot longer when we can reliably detect timejumps */
-            if (ecb_expect_true (timerfd >= 0))
-              waittime = EV_TS_CONST (MAX_BLOCKTIME2);
+              if (ecb_expect_true (timerfd != -1))
+                waittime = EV_TS_CONST (MAX_BLOCKTIME2);
 #endif
 #if !EV_PERIODIC_ENABLE
             /* without periodics but with monotonic clock there is no need */
             /* for any time jump detection, so sleep longer */
-            if (ecb_expect_true (have_monotonic))
+
               waittime = EV_TS_CONST (MAX_BLOCKTIME2);
 #endif
-
+            }
+#endif /* EV_USE_MONOTONIC */
             if (timercnt)
               {
                 ev_tstamp to = ANHE_at (timers [HEAP0]) - mn_now;
@@ -5034,7 +5038,7 @@ stat_timer_cb (EV_P_ ev_timer *w_, int revents)
     || prev.st_gid   != w->attr.st_gid
     || prev.st_rdev  != w->attr.st_rdev
     || prev.st_size  != w->attr.st_size
-    || prev.st_atime != w->attr.st_atime
+    /*   || prev.st_atime != w->attr.st_atime */ /* Rspamd: to avoid constant maps reload */
     || prev.st_mtime != w->attr.st_mtime
     || prev.st_ctime != w->attr.st_ctime
   ) {

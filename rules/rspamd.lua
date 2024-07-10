@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2015, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 -- This is main lua config file for rspamd
 
-require "global_functions" ()
+require "global_functions"()
 
 config['regexp'] = {}
 rspamd_maps = {} -- Global maps
@@ -33,9 +33,9 @@ dofile(local_rules .. '/html.lua')
 dofile(local_rules .. '/headers_checks.lua')
 dofile(local_rules .. '/subject_checks.lua')
 dofile(local_rules .. '/misc.lua')
-dofile(local_rules .. '/http_headers.lua')
 dofile(local_rules .. '/forwarding.lua')
 dofile(local_rules .. '/mid.lua')
+dofile(local_rules .. '/parts.lua')
 dofile(local_rules .. '/bitcoin.lua')
 dofile(local_rules .. '/bounce.lua')
 dofile(local_rules .. '/content.lua')
@@ -54,11 +54,13 @@ if rspamd_util.file_exists(local_conf .. '/local.d/rspamd.lua') then
   dofile(local_conf .. '/local.d/rspamd.lua')
 end
 
-local rmaps =  rspamd_config:get_all_opt("lua_maps")
+local rmaps = rspamd_config:get_all_opt("lua_maps")
 if rmaps and type(rmaps) == 'table' then
   local rspamd_logger = require "rspamd_logger"
-  for k,v in pairs(rmaps) do
-    local status,map_or_err = pcall(rspamd_config:add_map(v))
+  for k, v in pairs(rmaps) do
+    local status, map_or_err = pcall(function()
+      return rspamd_config:add_map(v)
+    end)
 
     if not status then
       rspamd_logger.errx(rspamd_config, "cannot add map %s: %s", k, map_or_err)

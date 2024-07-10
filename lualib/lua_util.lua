@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2017, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2023, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,10 +27,41 @@ local lupa = require "lupa"
 
 local split_grammar = {}
 local spaces_split_grammar
-local space = lpeg.S' \t\n\v\f\r'
+local space = lpeg.S ' \t\n\v\f\r'
 local nospace = 1 - space
-local ptrim = space^0 * lpeg.C((space^0 * nospace^1)^0)
+local ptrim = space ^ 0 * lpeg.C((space ^ 0 * nospace ^ 1) ^ 0)
 local match = lpeg.match
+
+local function shallowcopy(orig)
+  local orig_type = type(orig)
+  local copy
+  if orig_type == 'table' then
+    copy = {}
+    for orig_key, orig_value in pairs(orig) do
+      copy[orig_key] = orig_value
+    end
+  else
+    copy = orig
+  end
+  return copy
+end
+local function deepcopy(orig)
+  local orig_type = type(orig)
+  local copy
+  if orig_type == 'table' then
+    copy = {}
+    for orig_key, orig_value in next, orig, nil do
+      copy[deepcopy(orig_key)] = deepcopy(orig_value)
+    end
+    if getmetatable(orig) then
+      setmetatable(copy, deepcopy(getmetatable(orig)))
+    end
+  else
+    -- number, string, boolean, etc
+    copy = orig
+  end
+  return copy
+end
 
 lupa.configure('{%', '%}', '{=', '=}', '{#', '#}', {
   keep_trailing_newline = true,
@@ -42,13 +73,17 @@ lupa.filters.pbkdf = function(s)
   return cr.pbkdf(s)
 end
 
+-- Dirty hacks to avoid shared state
+package.loaded['lupa'] = nil
+local lupa_orig = require "lupa"
+
 local function rspamd_str_split(s, sep)
   local gr
   if not sep then
     if not spaces_split_grammar then
       local _sep = space
-      local elem = lpeg.C((1 - _sep)^0)
-      local p = lpeg.Ct(elem * (_sep * elem)^0)
+      local elem = lpeg.C((1 - _sep) ^ 0)
+      local p = lpeg.Ct(elem * (_sep * elem) ^ 0)
       spaces_split_grammar = p
     end
 
@@ -63,8 +98,8 @@ local function rspamd_str_split(s, sep)
       else
         _sep = sep -- Assume lpeg object
       end
-      local elem = lpeg.C((1 - _sep)^0)
-      local p = lpeg.Ct(elem * (_sep * elem)^0)
+      local elem = lpeg.C((1 - _sep) ^ 0)
+      local p = lpeg.Ct(elem * (_sep * elem) ^ 0)
       gr = p
       split_grammar[sep] = gr
     end
@@ -74,10 +109,10 @@ local function rspamd_str_split(s, sep)
 end
 
 --[[[
--- @function lua_util.str_split(text, deliminator)
--- Splits text into a numeric table by deliminator
--- @param {string} text deliminated text
--- @param {string} deliminator the deliminator
+-- @function lua_util.str_split(text, delimiter)
+-- Splits text into a numeric table by delimiter
+-- @param {string} text delimited text
+-- @param {string} delimiter the delimiter
 -- @return {table} numeric table containing string parts
 --]]
 
@@ -113,7 +148,7 @@ end
 -- @return {boolean} true if text ends with the specified suffix, false otherwise
 --]]
 exports.str_endswith = function(s, suffix)
-  return s:sub(-suffix:len()) == suffix
+  return s:find(suffix, -suffix:len(), true) ~= nil
 end
 
 --[[[
@@ -126,7 +161,7 @@ end
 
 -- modified version from Robert Jay Gould http://lua-users.org/wiki/SimpleRound
 exports.round = function(num, numDecimalPlaces)
-  local mult = 10^(numDecimalPlaces or 0)
+  local mult = 10 ^ (numDecimalPlaces or 0)
   if num >= 0 then
     return math.floor(num * mult + 0.5) / mult
   else
@@ -148,57 +183,97 @@ end
 
 exports.template = function(tmpl, keys)
   local var_lit = lpeg.P { lpeg.R("az") + lpeg.R("AZ") + lpeg.R("09") + "_" }
-  local var = lpeg.P { (lpeg.P("$") / "") * ((var_lit^1) / keys) }
-  local var_braced = lpeg.P { (lpeg.P("${") / "") * ((var_lit^1) / keys) * (lpeg.P("}") / "") }
+  local var = lpeg.P { (lpeg.P("$") / "") * ((var_lit ^ 1) / keys) }
+  local var_braced = lpeg.P { (lpeg.P("${") / "") * ((var_lit ^ 1) / keys) * (lpeg.P("}") / "") }
 
-  local template_grammar = lpeg.Cs((var + var_braced + 1)^0)
+  local template_grammar = lpeg.Cs((var + var_braced + 1) ^ 0)
 
   return lpeg.match(template_grammar, tmpl)
 end
 
 local function enrich_template_with_globals(env)
-  local newenv = exports.shallowcopy(env)
+  local newenv = shallowcopy(env)
   newenv.paths = rspamd_paths
   newenv.env = rspamd_env
 
   return newenv
 end
 --[[[
--- @function lua_util.jinja_template(text, env[, skip_global_env])
+-- @function lua_util.jinja_template(text, env[, skip_global_env][, is_orig][, custom_filters])
 -- Replaces values in a text template according to jinja2 syntax
 -- @param {string} text text containing variables
 -- @param {table} replacements key/value pairs for replacements
 -- @param {boolean} skip_global_env don't export Rspamd superglobals
+-- @param {boolean} is_orig use the original lupa configuration with `{{` for variables
+-- @param {table} custom_filters custom filters to use (or nil if not needed)
 -- @return {string} string containing replaced values
 -- @example
--- lua_util.jinja_template("HELLO {{FOO}} {{BAR}}!", {['FOO'] = 'LUA', ['BAR'] = 'WORLD'})
+-- lua_util.jinja_template("HELLO {=FOO=} {=BAR=}!", {['FOO'] = 'LUA', ['BAR'] = 'WORLD'})
 -- "HELLO LUA WORLD!"
 --]]
-exports.jinja_template = function(text, env, skip_global_env)
+exports.jinja_template = function(text, env, skip_global_env, is_orig, custom_filters)
+  local lupa_to_use = is_orig and lupa_orig or lupa
   if not skip_global_env then
     env = enrich_template_with_globals(env)
   end
 
-  return lupa.expand(text, env)
+  local orig_filters = {}
+  if type(custom_filters) == 'table' then
+    for k, v in pairs(custom_filters) do
+      orig_filters[k] = lupa_to_use.filters[k]
+      lupa_to_use.filters[k] = v
+    end
+  end
+
+  local result = lupa_to_use.expand(text, env)
+
+  -- Restore custom filters
+  if type(custom_filters) == 'table' then
+    for k, _ in pairs(custom_filters) do
+      lupa_to_use.filters[k] = orig_filters[k]
+    end
+  end
+
+  return result
 end
 
 --[[[
--- @function lua_util.jinja_file(filename, env[, skip_global_env])
+-- @function lua_util.jinja_file(filename, env[, skip_global_env][, is_orig][, custom_filters])
 -- Replaces values in a text template according to jinja2 syntax
 -- @param {string} filename name of file to expand
 -- @param {table} replacements key/value pairs for replacements
 -- @param {boolean} skip_global_env don't export Rspamd superglobals
+-- @param {boolean} is_orig use the original lupa configuration with `{{` for variables
+-- @param {table} custom_filters custom filters to use (or nil if not needed)
 -- @return {string} string containing replaced values
 -- @example
--- lua_util.jinja_template("HELLO {{FOO}} {{BAR}}!", {['FOO'] = 'LUA', ['BAR'] = 'WORLD'})
+-- lua_util.jinja_template("HELLO {=FOO=} {=BAR=}!", {['FOO'] = 'LUA', ['BAR'] = 'WORLD'})
 -- "HELLO LUA WORLD!"
 --]]
-exports.jinja_template_file = function(filename, env, skip_global_env)
+exports.jinja_template_file = function(filename, env, skip_global_env, is_orig, custom_filters)
+  local lupa_to_use = is_orig and lupa_orig or lupa
   if not skip_global_env then
     env = enrich_template_with_globals(env)
   end
 
-  return lupa.expand_file(filename, env)
+  local orig_filters = {}
+  if type(custom_filters) == 'table' then
+    for k, v in pairs(custom_filters) do
+      orig_filters[k] = lupa_to_use.filters[k]
+      lupa_to_use.filters[k] = v
+    end
+  end
+
+  local result = lupa_to_use.expand_file(filename, env)
+
+  -- Restore custom filters
+  if type(custom_filters) == 'table' then
+    for k, _ in pairs(custom_filters) do
+      lupa_to_use.filters[k] = orig_filters[k]
+    end
+  end
+
+  return result
 end
 
 exports.remove_email_aliases = function(email_addr)
@@ -209,7 +284,7 @@ exports.remove_email_aliases = function(email_addr)
     if cap then
       return cap, rspamd_str_split(pluses, '+'), nil
     elseif no_dots_user ~= addr.user then
-      return no_dots_user,{},nil
+      return no_dots_user, {}, nil
     end
 
     return nil
@@ -298,7 +373,9 @@ exports.is_rspamc_or_controller = function(task)
   local ua = task:get_request_header('User-Agent') or ''
   local pwd = task:get_request_header('Password')
   local is_rspamc = false
-  if tostring(ua) == 'rspamc' or pwd then is_rspamc = true end
+  if tostring(ua) == 'rspamc' or pwd then
+    is_rspamc = true
+  end
 
   return is_rspamc
 end
@@ -324,8 +401,8 @@ end
 --]]
 exports.flatten = function(t)
   local res = {}
-  for _,e in fun.iter(t) do
-    for _,v in fun.iter(e) do
+  for _, e in fun.iter(t) do
+    for _, v in fun.iter(e) do
       res[#res + 1] = v
     end
   end
@@ -350,12 +427,16 @@ end
 local function spairs(t, order, lim)
   -- collect the keys
   local keys = {}
-  for k in pairs(t) do keys[#keys+1] = k end
+  for k in pairs(t) do
+    keys[#keys + 1] = k
+  end
 
   -- if order function given, sort by it by passing the table and keys a, b,
   -- otherwise just sort the keys
   if order then
-    table.sort(keys, function(a,b) return order(t, a, b) end)
+    table.sort(keys, function(a, b)
+      return order(t, a, b)
+    end)
   else
     table.sort(keys)
   end
@@ -374,30 +455,10 @@ end
 
 exports.spairs = spairs
 
---[[[
--- @function lua_util.disable_module(modname, how)
--- Disables a plugin
--- @param {string} modname name of plugin to disable
--- @param {string} how 'redis' to disable redis, 'config' to disable startup
---]]
+local lua_cfg_utils = require "lua_cfg_utils"
 
-local function disable_module(modname, how)
-  if rspamd_plugins_state.enabled[modname] then
-    rspamd_plugins_state.enabled[modname] = nil
-  end
-
-  if how == 'redis' then
-    rspamd_plugins_state.disabled_redis[modname] = {}
-  elseif how == 'config' then
-    rspamd_plugins_state.disabled_unconfigured[modname] = {}
-  elseif how == 'experimental' then
-    rspamd_plugins_state.disabled_experimental[modname] = {}
-  else
-    rspamd_plugins_state.disabled_failed[modname] = {}
-  end
-end
-
-exports.disable_module = disable_module
+exports.config_utils = lua_cfg_utils
+exports.disable_module = lua_cfg_utils.disable_module
 
 --[[[
 -- @function lua_util.disable_module(modname)
@@ -409,7 +470,7 @@ local function check_experimental(modname)
   if rspamd_config:experimental_enabled() then
     return true
   else
-    disable_module(modname, 'experimental')
+    lua_cfg_utils.disable_module(modname, 'experimental')
   end
 
   return false
@@ -461,9 +522,13 @@ exports.list_to_hash = list_to_hash
 local function nkeys(gen, param, state)
   local n = 0
   if not param then
-    for _,_ in pairs(gen) do n = n + 1 end
+    for _, _ in pairs(gen) do
+      n = n + 1
+    end
   else
-    for _,_ in fun.iter(gen, param, state) do n = n + 1 end
+    for _, _ in fun.iter(gen, param, state) do
+      n = n + 1
+    end
   end
   return n
 end
@@ -497,20 +562,19 @@ local function parse_time_interval(str)
 
   local digit = lpeg.R("09")
   local parser = {}
-  parser.integer =
-  (lpeg.S("+-") ^ -1) *
-      (digit   ^  1)
-  parser.fractional =
-  (lpeg.P(".")   ) *
+  parser.integer = (lpeg.S("+-") ^ -1) *
       (digit ^ 1)
-  parser.number =
-  (parser.integer *
+  parser.fractional = (lpeg.P(".")) *
+      (digit ^ 1)
+  parser.number = (parser.integer *
       (parser.fractional ^ -1)) +
       (lpeg.S("+-") * parser.fractional)
   parser.time = lpeg.Cf(lpeg.Cc(1) *
       (parser.number / tonumber) *
       ((lpeg.S("smhdwy") / parse_time_suffix) ^ -1),
-    function (acc, val) return acc * val end)
+      function(acc, val)
+        return acc * val
+      end)
 
   local t = lpeg.match(parser.time, str)
 
@@ -546,20 +610,19 @@ local function dehumanize_number(str)
 
   local digit = lpeg.R("09")
   local parser = {}
-  parser.integer =
-  (lpeg.S("+-") ^ -1) *
-      (digit   ^  1)
-  parser.fractional =
-  (lpeg.P(".")   ) *
+  parser.integer = (lpeg.S("+-") ^ -1) *
       (digit ^ 1)
-  parser.number =
-  (parser.integer *
+  parser.fractional = (lpeg.P(".")) *
+      (digit ^ 1)
+  parser.number = (parser.integer *
       (parser.fractional ^ -1)) +
       (lpeg.S("+-") * parser.fractional)
   parser.humanized_number = lpeg.Cf(lpeg.Cc(1) *
       (parser.number / tonumber) *
       (((lpeg.S("kmg") * (lpeg.P("b") ^ -1)) / parse_suffix) ^ -1),
-      function (acc, val) return acc * val end)
+      function(acc, val)
+        return acc * val
+      end)
 
   local t = lpeg.match(parser.humanized_number, str)
 
@@ -575,16 +638,24 @@ exports.dehumanize_number = dehumanize_number
 local function table_cmp(table1, table2)
   local avoid_loops = {}
   local function recurse(t1, t2)
-    if type(t1) ~= type(t2) then return false end
-    if type(t1) ~= "table" then return t1 == t2 end
+    if type(t1) ~= type(t2) then
+      return false
+    end
+    if type(t1) ~= "table" then
+      return t1 == t2
+    end
 
-    if avoid_loops[t1] then return avoid_loops[t1] == t2 end
+    if avoid_loops[t1] then
+      return avoid_loops[t1] == t2
+    end
     avoid_loops[t1] = t2
     -- Copy keys from t2
     local t2keys = {}
     local t2tablekeys = {}
     for k, _ in pairs(t2) do
-      if type(k) == "table" then table.insert(t2tablekeys, k) end
+      if type(k) == "table" then
+        table.insert(t2tablekeys, k)
+      end
       t2keys[k] = true
     end
     -- Let's iterate keys from t1
@@ -601,22 +672,56 @@ local function table_cmp(table1, table2)
             break
           end
         end
-        if not ok then return false end
+        if not ok then
+          return false
+        end
       else
         -- t1 has a key which t2 doesn't have, fail.
-        if v2 == nil then return false end
+        if v2 == nil then
+          return false
+        end
         t2keys[k1] = nil
-        if not recurse(v1, v2) then return false end
+        if not recurse(v1, v2) then
+          return false
+        end
       end
     end
     -- if t2 has a key which t1 doesn't have, fail.
-    if next(t2keys) then return false end
+    if next(t2keys) then
+      return false
+    end
     return true
   end
   return recurse(table1, table2)
 end
 
 exports.table_cmp = table_cmp
+
+--[[[
+-- @function lua_util.table_merge(t1, t2)
+-- Merge two tables
+--]]
+local function table_merge(t1, t2)
+  local res = {}
+  local nidx = 1 -- for numeric indicies
+  local it_func = function(k, v)
+    if type(k) == 'number' then
+      res[nidx] = v
+      nidx = nidx + 1
+    else
+      res[k] = v
+    end
+  end
+  for k, v in pairs(t1) do
+    it_func(k, v)
+  end
+  for k, v in pairs(t2) do
+    it_func(k, v)
+  end
+  return res
+end
+
+exports.table_merge = table_merge
 
 --[[[
 -- @function lua_util.table_cmp(task, name, value, stop_chars)
@@ -650,7 +755,7 @@ local function override_defaults(def, override)
 
   local res = {}
 
-  for k,v in pairs(override) do
+  for k, v in pairs(override) do
     if type(v) == 'table' then
       if def[k] and type(def[k]) == 'table' then
         -- Recursively override elements
@@ -663,7 +768,7 @@ local function override_defaults(def, override)
     end
   end
 
-  for k,v in pairs(def) do
+  for k, v in pairs(def) do
     if type(res[k]) == 'nil' then
       res[k] = v
     end
@@ -689,7 +794,7 @@ exports.override_defaults = override_defaults
 -- tries its best to extract specific number of urls from a task based on
 -- their characteristics
 --]]
-exports.filter_specific_urls = function (urls, params)
+exports.filter_specific_urls = function(urls, params)
   local cache_key
 
   if params.task and not params.no_cache then
@@ -708,9 +813,13 @@ exports.filter_specific_urls = function (urls, params)
     end
   end
 
-  if not urls then return {} end
+  if not urls then
+    return {}
+  end
 
-  if params.filter then urls = fun.totable(fun.filter(params.filter, urls)) end
+  if params.filter then
+    urls = fun.totable(fun.filter(params.filter, urls))
+  end
 
   -- Filter by tld:
   local tlds = {}
@@ -781,11 +890,11 @@ exports.filter_specific_urls = function (urls, params)
       end
 
       if not eslds[esld] then
-        eslds[esld] = {{str_hash, u, priority}}
+        eslds[esld] = { { str_hash, u, priority } }
         neslds = neslds + 1
       else
         if #eslds[esld] < params.esld_limit then
-          table.insert(eslds[esld], {str_hash, u, priority})
+          table.insert(eslds[esld], { str_hash, u, priority })
         end
       end
 
@@ -795,21 +904,23 @@ exports.filter_specific_urls = function (urls, params)
       local tld = table.concat(fun.totable(fun.tail(parts)), '.')
 
       if not tlds[tld] then
-        tlds[tld] = {{str_hash, u, priority}}
+        tlds[tld] = { { str_hash, u, priority } }
         ntlds = ntlds + 1
       else
-        table.insert(tlds[tld], {str_hash, u, priority})
+        table.insert(tlds[tld], { str_hash, u, priority })
       end
     end
   end
 
-  for _,u in ipairs(urls) do
+  for _, u in ipairs(urls) do
     process_single_url(u)
   end
 
   local limit = params.limit
   limit = limit - nres
-  if limit < 0 then limit = 0 end
+  if limit < 0 then
+    limit = 0
+  end
 
   if limit == 0 then
     res = exports.values(res)
@@ -852,7 +963,7 @@ exports.filter_specific_urls = function (urls, params)
     repeat
       local item_found = false
 
-      for _,lurls in ipairs(eslds) do
+      for _, lurls in ipairs(eslds) do
         if #lurls > 0 then
           local last = table.remove(lurls)
           insert_url(last[1], last[2])
@@ -875,13 +986,15 @@ exports.filter_specific_urls = function (urls, params)
 
   -- Number of tlds < limit
   while limit > 0 do
-    for _,lurls in ipairs(tlds) do
+    for _, lurls in ipairs(tlds) do
       if #lurls > 0 then
         local last = table.remove(lurls)
         insert_url(last[1], last[2])
         limit = limit - 1
       end
-      if limit == 0 then break end
+      if limit == 0 then
+        break
+      end
     end
   end
 
@@ -938,8 +1051,10 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
       prefix = prefix
     }
   end
-  for k,v in pairs(default_params) do
-    if type(params[k]) == 'nil' and v ~= nil then params[k] = v end
+  for k, v in pairs(default_params) do
+    if type(params[k]) == 'nil' and v ~= nil then
+      params[k] = v
+    end
   end
   local url_params = {
     emails = params.need_emails,
@@ -960,9 +1075,9 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
         cache_key_suffix = table.concat(params.flags) .. (params.flags_mode or '')
       else
         cache_key_suffix = string.format('%s%s%s',
-          tostring(params.need_emails or false),
-          tostring(params.need_images or false),
-          tostring(params.need_content or false))
+            tostring(params.need_emails or false),
+            tostring(params.need_images or false),
+            tostring(params.need_content or false))
       end
       cache_key = string.format('sp_urls_%d%s', params.limit, cache_key_suffix)
     end
@@ -979,6 +1094,7 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
   return exports.filter_specific_urls(urls, params)
 end
 
+
 --[[[
 -- @function lua_util.deepcopy(table)
 -- params: {
@@ -986,23 +1102,6 @@ end
 -- }
 -- Performs deep copy of the table. Including metatables
 --]]
-local function deepcopy(orig)
-  local orig_type = type(orig)
-  local copy
-  if orig_type == 'table' then
-    copy = {}
-    for orig_key, orig_value in next, orig, nil do
-      copy[deepcopy(orig_key)] = deepcopy(orig_value)
-    end
-    if getmetatable(orig) then
-      setmetatable(copy, deepcopy(getmetatable(orig)))
-    end
-  else -- number, string, boolean, etc
-    copy = orig
-  end
-  return copy
-end
-
 exports.deepcopy = deepcopy
 
 --[[[
@@ -1012,10 +1111,18 @@ exports.deepcopy = deepcopy
 -- }
 -- Performs recursive in-place sort of a table
 --]]
+local function default_sort_cmp(e1, e2)
+  if type(e1) == type(e2) then
+    return e1 < e2
+  else
+    return type(e1) < type(e2)
+  end
+end
+
 local function deepsort(tbl, sort_func)
   local orig_type = type(tbl)
   if orig_type == 'table' then
-    table.sort(tbl, sort_func)
+    table.sort(tbl, sort_func or default_sort_cmp)
     for _, orig_value in next, tbl, nil do
       deepsort(orig_value)
     end
@@ -1028,49 +1135,36 @@ exports.deepsort = deepsort
 -- @function lua_util.shallowcopy(tbl)
 -- Performs shallow (and fast) copy of a table or another Lua type
 --]]
-exports.shallowcopy = function(orig)
-  local orig_type = type(orig)
-  local copy
-  if orig_type == 'table' then
-    copy = {}
-    for orig_key, orig_value in pairs(orig) do
-      copy[orig_key] = orig_value
-    end
-  else
-    copy = orig
-  end
-  return copy
-end
+exports.shallowcopy = shallowcopy
 
 -- Debugging support
-local unconditional_debug = false
+local logger = require "rspamd_logger"
+local unconditional_debug = logger.log_level() == 'debug'
 local debug_modules = {}
 local debug_aliases = {}
 local log_level = 384 -- debug + forced (1 << 7 | 1 << 8)
 
 
 exports.init_debug_logging = function(config)
-  local logger = require "rspamd_logger"
   -- Fill debug modules from the config
-  local logging = config:get_all_opt('logging')
-  if logging then
-    local log_level_str = logging.level
-    if log_level_str then
-      if log_level_str == 'debug' then
-        unconditional_debug = true
+  if not unconditional_debug then
+    local log_config = config:get_all_opt('logging')
+    if log_config then
+      local log_level_str = log_config.level
+      if log_level_str then
+        if log_level_str == 'debug' then
+          unconditional_debug = true
+        end
       end
-    end
-
-    if not unconditional_debug then
-      if logging.debug_modules then
-        for _,m in ipairs(logging.debug_modules) do
+      if log_config.debug_modules then
+        for _, m in ipairs(log_config.debug_modules) do
           debug_modules[m] = true
           logger.infox(config, 'enable debug for Lua module %s', m)
         end
       end
 
       if #debug_aliases > 0 then
-        for alias,mod in pairs(debug_aliases) do
+        for alias, mod in pairs(debug_aliases) do
           if debug_modules[mod] then
             debug_modules[alias] = true
             logger.infox(config, 'enable debug for Lua module %s (%s aliased)',
@@ -1086,6 +1180,12 @@ exports.enable_debug_logging = function()
   unconditional_debug = true
 end
 
+exports.enable_debug_modules = function(...)
+  for _, m in ipairs({ ... }) do
+    debug_modules[m] = true
+  end
+end
+
 exports.disable_debug_logging = function()
   unconditional_debug = false
 end
@@ -1095,7 +1195,6 @@ end
 -- Performs fast debug log for a specific module
 --]]
 exports.debugm = function(mod, obj_or_fmt, fmt_or_something, ...)
-  local logger = require "rspamd_logger"
   if unconditional_debug or debug_modules[mod] then
     if type(obj_or_fmt) == 'string' then
       logger.logx(log_level, mod, '', 2, obj_or_fmt, fmt_or_something, ...)
@@ -1110,7 +1209,6 @@ end
 -- Add debugging alias so logging to `alias` will be treated as logging to `mod`
 --]]
 exports.add_debug_alias = function(mod, alias)
-  local logger = require "rspamd_logger"
   debug_aliases[alias] = mod
 
   if debug_modules[mod] then
@@ -1183,7 +1281,7 @@ exports.callback_from_string = function(s)
   local loadstring = loadstring or load
 
   if not s or #s == 0 then
-    return false,'invalid or empty string'
+    return false, 'invalid or empty string'
   end
 
   s = exports.rspamd_str_trim(s)
@@ -1202,10 +1300,10 @@ exports.callback_from_string = function(s)
   local ret, res_or_err = pcall(loadstring(inp))
 
   if not ret or type(res_or_err) ~= 'function' then
-    return false,res_or_err
+    return false, res_or_err
   end
 
-  return ret,res_or_err
+  return ret, res_or_err
 end
 
 ---[[[
@@ -1219,12 +1317,12 @@ exports.keys = function(gen, param, state)
   local i = 1
 
   if param then
-    for k,_ in fun.iter(gen, param, state) do
+    for k, _ in fun.iter(gen, param, state) do
       rawset(keys, i, k)
       i = i + 1
     end
   else
-    for k,_ in pairs(gen) do
+    for k, _ in pairs(gen) do
       rawset(keys, i, k)
       i = i + 1
     end
@@ -1244,12 +1342,12 @@ exports.values = function(gen, param, state)
   local i = 1
 
   if param then
-    for _,v in fun.iter(gen, param, state) do
+    for _, v in fun.iter(gen, param, state) do
       rawset(values, i, v)
       i = i + 1
     end
   else
-    for _,v in pairs(gen) do
+    for _, v in pairs(gen) do
       rawset(values, i, v)
       i = i + 1
     end
@@ -1268,13 +1366,13 @@ end
 exports.distance_sorted = function(t1, t2)
   local ncomp = #t1
   local ndiff = 0
-  local i,j = 1,1
+  local i, j = 1, 1
 
   if ncomp < #t2 then
     ncomp = #t2
   end
 
-  for _=1,ncomp do
+  for _ = 1, ncomp do
     if j > #t2 then
       ndiff = ndiff + ncomp - #t2
       if i > j then
@@ -1315,7 +1413,7 @@ local function table_digest(t)
   local h = cr.create()
 
   if t[1] then
-    for _,e in ipairs(t) do
+    for _, e in ipairs(t) do
       if type(e) == 'table' then
         h:update(table_digest(e))
       else
@@ -1323,7 +1421,7 @@ local function table_digest(t)
       end
     end
   else
-    for k,v in pairs(t) do
+    for k, v in pairs(t) do
       h:update(tostring(k))
 
       if type(v) == 'string' then
@@ -1333,7 +1431,7 @@ local function table_digest(t)
       end
     end
   end
- return h:base32()
+  return h:base32()
 end
 
 exports.table_digest = table_digest
@@ -1364,12 +1462,12 @@ exports.toboolean = function(v)
     elseif false_t[v] == false then
       return false;
     else
-      return false, string.format( 'cannot convert %q to boolean', v);
+      return false, string.format('cannot convert %q to boolean', v);
     end
   elseif type(v) == 'number' then
-    return (not (v == 0))
+    return v ~= 0
   else
-    return false, string.format( 'cannot convert %q to boolean', v);
+    return false, string.format('cannot convert %q to boolean', v);
   end
 end
 
@@ -1405,7 +1503,7 @@ exports.config_check_local_or_authed = function(rspamd_config, modname, def_loca
     try_section('options')
   end
 
-  return {check_local, check_authed}
+  return { check_local, check_authed }
 end
 
 ---[[[
@@ -1421,7 +1519,7 @@ exports.is_skip_local_or_authed = function(task, conf, ip)
     ip = task:get_from_ip()
   end
   if not conf then
-    conf = {false, false}
+    conf = { false, false }
   end
   if ((not conf[2] and task:get_user()) or
       (not conf[1] and type(ip) == 'userdata' and ip:is_local())) then
@@ -1437,8 +1535,8 @@ end
 -- @param {string} str input string
 -- @return {string} original or quoted string
 --]]]
-local tspecial = lpeg.S"()<>,;:\\\"/[]?= \t\v"
-local special_match = lpeg.P((1 - tspecial)^0 * tspecial^1)
+local tspecial = lpeg.S "()<>,;:\\\"/[]?= \t\v"
+local special_match = lpeg.P((1 - tspecial) ^ 0 * tspecial ^ 1)
 exports.maybe_smtp_quote_value = function(str)
   if special_match:match(str) then
     return string.format('"%s"', str:gsub('"', '\\"'))
@@ -1446,5 +1544,142 @@ exports.maybe_smtp_quote_value = function(str)
 
   return str
 end
+
+---[[[
+-- @function lua_util.shuffle(table)
+-- Performs in-place shuffling of a table
+-- @param {table} tbl table to shuffle
+-- @return {table} same table
+--]]]
+exports.shuffle = function(tbl)
+  local size = #tbl
+  for i = size, 1, -1 do
+    local rand = math.random(size)
+    tbl[i], tbl[rand] = tbl[rand], tbl[i]
+  end
+  return tbl
+end
+
+--
+local hex_table = {}
+for idx = 0, 255 do
+  hex_table[("%02X"):format(idx)] = string.char(idx)
+  hex_table[("%02x"):format(idx)] = string.char(idx)
+end
+
+---[[[
+-- @function lua_util.unhex(str)
+-- Decode hex encoded string
+-- @param {string} str string to decode
+-- @return {string} hex decoded string (valid hex pairs are decoded, everything else is printed as is)
+--]]]
+exports.unhex = function(str)
+  return str:gsub('(..)', hex_table)
+end
+
+local http_upstream_lists = {}
+local function http_upstreams_by_url(pool, url)
+  local rspamd_url = require "rspamd_url"
+
+  local cached = http_upstream_lists[url]
+  if cached then
+    return cached
+  end
+
+  local real_url = rspamd_url.create(pool, url)
+
+  if not real_url then
+    return nil
+  end
+
+  local host = real_url:get_host()
+  local proto = real_url:get_protocol() or 'http'
+  local port = real_url:get_port() or (proto == 'https' and 443 or 80)
+  local upstream_list = require "rspamd_upstream_list"
+  local upstreams = upstream_list.create(host, port)
+
+  if upstreams then
+    http_upstream_lists[url] = upstreams
+    return upstreams
+  end
+
+  return nil
+end
+---[[[
+-- @function lua_util.http_upstreams_by_url(pool, url)
+-- Returns a cached or new upstreams list that corresponds to the specific url
+-- @param {mempool} pool memory pool to use (typically static pool from rspamd_config)
+-- @param {string} url full url
+-- @return {upstreams_list} object to get upstream from an url
+--]]]
+exports.http_upstreams_by_url = http_upstreams_by_url
+
+---[[[
+-- @function lua_util.dns_timeout_augmentation(cfg)
+-- Returns an augmentation suitable to define DNS timeout for a module
+-- @return {string} a string in format 'timeout=x' where `x` is a number of seconds for DNS timeout
+--]]]
+local function dns_timeout_augmentation(cfg)
+  return string.format('timeout=%f', cfg:get_dns_timeout() or 0.0)
+end
+
+exports.dns_timeout_augmentation = dns_timeout_augmentation
+
+---[[[
+--- @function lua_util.strip_lua_comments(lua_code)
+-- Strips single-line and multi-line comments from a given Lua code string and removes
+-- any extra spaces or newlines.
+--
+-- @param lua_code The Lua code string to strip comments from.
+-- @return The resulting Lua code string with comments and extra spaces removed.
+--
+---]]]
+local function strip_lua_comments(lua_code)
+  -- Remove single-line comments
+  lua_code = lua_code:gsub("%-%-[^\r\n]*", "")
+
+  -- Remove multi-line comments
+  lua_code = lua_code:gsub("%-%-%[%[.-%]%]", "")
+
+  -- Remove extra spaces and newlines
+  lua_code = lua_code:gsub("%s+", " ")
+
+  return lua_code
+end
+
+exports.strip_lua_comments = strip_lua_comments
+
+---[[[
+-- @function lua_util.join_path(...)
+-- Joins path components into a single path string using the appropriate separator
+-- for the current operating system.
+--
+-- @param ... Any number of path components to join together.
+-- @return A single path string, with components separated by the appropriate separator.
+--
+---]]]
+local path_sep = package.config:sub(1, 1) or '/'
+local function join_path(...)
+  local components = { ... }
+
+  -- Join components using separator
+  return table.concat(components, path_sep)
+end
+exports.join_path = join_path
+
+-- Short unit test for sanity
+if path_sep == '/' then
+  assert(join_path('/path', 'to', 'file') == '/path/to/file')
+else
+  assert(join_path('C:', 'path', 'to', 'file') == 'C:\\path\\to\\file')
+end
+
+-- Defines symbols priorities for common usage in prefilters/postfilters
+exports.symbols_priorities = {
+  top = 10, -- Symbols must be executed first (or last), such as settings
+  high = 9, -- Example: asn
+  medium = 5, -- Everything should use this as default
+  low = 0,
+}
 
 return exports

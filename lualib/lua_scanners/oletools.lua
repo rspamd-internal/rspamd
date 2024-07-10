@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2018, Carsten Rosenberg <c.rosenberg@heinlein-support.de>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,7 +87,7 @@ local function oletools_config(opts)
   return nil
 end
 
-local function oletools_check(task, content, digest, rule)
+local function oletools_check(task, content, digest, rule, maybe_part)
   local function oletools_check_uncached ()
     local upstream = rule.upstreams:get_upstream_round_robin()
     local addr = upstream:get_addr()
@@ -98,8 +98,6 @@ local function oletools_check(task, content, digest, rule)
     local function oletools_callback(err, data, conn)
 
       local function oletools_requery(error)
-        -- set current upstream to fail because an error occurred
-        upstream:fail()
 
         -- retry with another upstream until retransmits exceeds
         if retransmits > 0 then
@@ -117,15 +115,18 @@ local function oletools_check(task, content, digest, rule)
             task = task,
             host = addr:to_string(),
             port = addr:get_port(),
+            upstream = upstream,
             timeout = rule.timeout,
             shutdown = true,
             data = { protocol, content },
             callback = oletools_callback,
           })
         else
-          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits '..
+          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits ' ..
               'exceed - err: %s', rule.log_prefix, error)
-          common.yield_result(task, rule, 'failed to scan, maximum retransmits exceed - err: ' .. error, 0.0, 'fail')
+          common.yield_result(task, rule,
+              'failed to scan, maximum retransmits exceed - err: ' .. error,
+              0.0, 'fail', maybe_part)
         end
       end
 
@@ -134,14 +135,11 @@ local function oletools_check(task, content, digest, rule)
         oletools_requery(err)
 
       else
-        -- Parse the response
-        if upstream then upstream:ok() end
-
         json_response = json_response .. tostring(data)
 
-	      if not string.find(json_response, '\t\n\n\t') and #data == 8192 then
+        if not string.find(json_response, '\t\n\n\t') and #data == 8192 then
           lua_util.debugm(rule.name, task, '%s: no stop word: add_read - #json: %s / current packet: %s',
-            rule.log_prefix, #json_response, #data)
+              rule.log_prefix, #json_response, #data)
           conn:add_read(oletools_callback)
 
         else
@@ -191,7 +189,7 @@ local function oletools_check(task, content, digest, rule)
               rspamd_logger.errx(task, '%s: ERROR found: %s', rule.log_prefix,
                   v.error)
               if v.error == 'File too small' then
-                common.save_cache(task, digest, rule, 'OK')
+                common.save_cache(task, digest, rule, 'OK', 1.0, maybe_part)
                 common.log_clean(task, rule, 'File too small to be scanned for macros')
                 return
               else
@@ -210,20 +208,26 @@ local function oletools_check(task, content, digest, rule)
               local oletools_rc_code = tonumber(v.return_code)
               if oletools_rc_code == 9 then
                 rspamd_logger.warnx(task, '%s: File is encrypted.', rule.log_prefix)
-                common.yield_result(task, rule, 'failed - err: ' .. oletools_rc[oletools_rc_code], 0.0, 'encrypted')
-                common.save_cache(task, digest, rule, 'encrypted')
+                common.yield_result(task, rule,
+                    'failed - err: ' .. oletools_rc[oletools_rc_code],
+                    0.0, 'encrypted', maybe_part)
+                common.save_cache(task, digest, rule, 'encrypted', 1.0, maybe_part)
                 return
               elseif oletools_rc_code == 5 then
                 rspamd_logger.warnx(task, '%s: olefy could not open the file - error: %s', rule.log_prefix,
                     result[2]['message'])
-                common.yield_result(task, rule, 'failed - err: ' .. oletools_rc[oletools_rc_code], 0.0, 'fail')
+                common.yield_result(task, rule,
+                    'failed - err: ' .. oletools_rc[oletools_rc_code],
+                    0.0, 'fail', maybe_part)
                 return
               elseif oletools_rc_code > 6 then
                 rspamd_logger.errx(task, '%s: MetaInfo section error code: %s',
                     rule.log_prefix, oletools_rc[oletools_rc_code])
                 rspamd_logger.errx(task, '%s: MetaInfo section message: %s',
                     rule.log_prefix, result[2]['message'])
-                common.yield_result(task, rule, 'failed - err: ' .. oletools_rc[oletools_rc_code], 0.0, 'fail')
+                common.yield_result(task, rule,
+                    'failed - err: ' .. oletools_rc[oletools_rc_code],
+                    0.0, 'fail', maybe_part)
                 return
               elseif oletools_rc_code > 1 then
                 rspamd_logger.errx(task, '%s: Error message: %s',
@@ -239,7 +243,7 @@ local function oletools_check(task, content, digest, rule)
                   rule.log_prefix, v.message)
               --common.yield_result(task, rule, 'failed - err: ' .. v.error, 0.0, 'fail')
 
-            elseif type(v.analysis) == 'table' and type(v.macros) == 'table'  then
+            elseif type(v.analysis) == 'table' and type(v.macros) == 'table' then
               -- analysis + macro found - evaluate response
 
               if type(v.analysis) == 'table' and #v.analysis == 0 and #v.macros == 0 then
@@ -255,20 +259,20 @@ local function oletools_check(task, content, digest, rule)
                 lua_util.debugm(rule.name, task,
                     '%s: type: %s', rule.log_prefix, result[2]['type'])
 
-                for _,m in ipairs(v.macros) do
-                  lua_util.debugm(rule.name, task, '%s: macros found - code: %s, ole_stream: %s, '..
+                for _, m in ipairs(v.macros) do
+                  lua_util.debugm(rule.name, task, '%s: macros found - code: %s, ole_stream: %s, ' ..
                       'vba_filename: %s', rule.log_prefix, m.code, m.ole_stream, m.vba_filename)
                 end
 
-                for _,a in ipairs(v.analysis) do
-                  lua_util.debugm(rule.name, task, '%s: threat found - type: %s, keyword: %s, '..
+                for _, a in ipairs(v.analysis) do
+                  lua_util.debugm(rule.name, task, '%s: threat found - type: %s, keyword: %s, ' ..
                       'description: %s', rule.log_prefix, a.type, a.keyword, a.description)
                   if a.type == 'AutoExec' then
                     analysis_cat_table.autoexec = 'A'
                     table.insert(analysis_keyword_table, a.keyword)
                   elseif a.type == 'Suspicious' then
                     if rule.extended == true or
-                      (a.keyword ~= 'Base64 Strings' and a.keyword ~= 'Hex Strings')
+                        (a.keyword ~= 'Base64 Strings' and a.keyword ~= 'Hex Strings')
                     then
                       analysis_cat_table.suspicious = 'S'
                       table.insert(analysis_keyword_table, a.keyword)
@@ -296,27 +300,38 @@ local function oletools_check(task, content, digest, rule)
             -- use single string as virus name
             local threat = 'AutoExec + Suspicious (' .. table.concat(analysis_keyword_table, ',') .. ')'
             lua_util.debugm(rule.name, task, '%s: threat result: %s', rule.log_prefix, threat)
-            common.yield_result(task, rule, threat, rule.default_score)
-            common.save_cache(task, digest, rule, threat, rule.default_score)
+            common.yield_result(task, rule, threat, rule.default_score, nil, maybe_part)
+            common.save_cache(task, digest, rule, threat, rule.default_score, maybe_part)
 
           elseif rule.extended == true and #analysis_keyword_table > 0 then
             -- report any flags (types) and any most keywords as individual virus name
-            local analysis_cat_table_values = lua_util.values(analysis_cat_table)
-            table.sort(analysis_cat_table_values)
-            table.insert(analysis_keyword_table, 1, table.concat(analysis_cat_table_values))
+            local analysis_cat_table_values_sorted = {}
+
+            -- see https://github.com/rspamd/rspamd/commit/6bd3e2b9f49d1de3ab882aeca9c30bc7d526ac9d#commitcomment-40130493
+            -- for details
+            local analysis_cat_table_keys_sorted = lua_util.keys(analysis_cat_table)
+            table.sort(analysis_cat_table_keys_sorted)
+
+            for _, v in ipairs(analysis_cat_table_keys_sorted) do
+              table.insert(analysis_cat_table_values_sorted, analysis_cat_table[v])
+            end
+
+            table.insert(analysis_keyword_table, 1, table.concat(analysis_cat_table_values_sorted))
 
             lua_util.debugm(rule.name, task, '%s: extended threat result: %s',
                 rule.log_prefix, table.concat(analysis_keyword_table, ','))
 
-            common.yield_result(task, rule, analysis_keyword_table, rule.default_score)
-            common.save_cache(task, digest, rule, analysis_keyword_table, rule.default_score)
+            common.yield_result(task, rule, analysis_keyword_table,
+                rule.default_score, nil, maybe_part)
+            common.save_cache(task, digest, rule, analysis_keyword_table,
+                rule.default_score, maybe_part)
 
           elseif analysis_cat_table.macro_exist == '-' and #analysis_keyword_table == 0 then
-            common.save_cache(task, digest, rule, 'OK')
+            common.save_cache(task, digest, rule, 'OK', 1.0, maybe_part)
             common.log_clean(task, rule, 'No macro found')
 
           else
-            common.save_cache(task, digest, rule, 'OK')
+            common.save_cache(task, digest, rule, 'OK', 1.0, maybe_part)
             common.log_clean(task, rule, 'Scanned Macro is OK')
           end
         end
@@ -327,6 +342,7 @@ local function oletools_check(task, content, digest, rule)
       task = task,
       host = addr:to_string(),
       port = addr:get_port(),
+      upstream = upstream,
       timeout = rule.timeout,
       shutdown = true,
       data = { protocol, content },
@@ -335,7 +351,8 @@ local function oletools_check(task, content, digest, rule)
 
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, oletools_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      oletools_check_uncached, maybe_part) then
     return
   else
     oletools_check_uncached()
@@ -344,7 +361,7 @@ local function oletools_check(task, content, digest, rule)
 end
 
 return {
-  type = {N, 'attachment scanner', 'hash', 'scanner'},
+  type = { N, 'attachment scanner', 'hash', 'scanner' },
   description = 'oletools office macro scanner',
   configure = oletools_config,
   check = oletools_check,

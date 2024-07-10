@@ -18,7 +18,7 @@
 
 #include "config.h"
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -32,10 +32,12 @@ enum rspamd_archive_type {
 enum rspamd_archive_flags {
 	RSPAMD_ARCHIVE_ENCRYPTED = (1u << 0u),
 	RSPAMD_ARCHIVE_CANNOT_READ = (1u << 1u),
+	RSPAMD_ARCHIVE_HAS_OBFUSCATED_FILES = (1u << 2u),
 };
 
 enum rspamd_archive_file_flags {
 	RSPAMD_ARCHIVE_FILE_ENCRYPTED = (1u << 0u),
+	RSPAMD_ARCHIVE_FILE_OBFUSCATED = (1u << 1u),
 };
 
 struct rspamd_archive_file {
@@ -56,14 +58,14 @@ struct rspamd_archive {
 /**
  * Process archives from a worker task
  */
-void rspamd_archives_process (struct rspamd_task *task);
+void rspamd_archives_process(struct rspamd_task *task);
 
 /**
  * Get textual representation of an archive's type
  */
-const gchar *rspamd_archive_type_str (enum rspamd_archive_type type);
+const gchar *rspamd_archive_type_str(enum rspamd_archive_type type);
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 }
 #endif
 

@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ if type(jit) == 'table' then
     return o ~= NULL
   end
 else
-  local ret,result_or_err = pcall(require, 'ffi')
+  local ret, result_or_err = pcall(require, 'ffi')
 
   if not ret then
     return {}
@@ -51,7 +51,7 @@ exports.dkim = require "lua_ffi/dkim"
 exports.spf = require "lua_ffi/spf"
 exports.linalg = require "lua_ffi/linalg"
 
-for k,v in pairs(ffi) do
+for k, v in pairs(ffi) do
   -- Preserve all stuff to use lua_ffi as ffi itself
   exports[k] = v
 end

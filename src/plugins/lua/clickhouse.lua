@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ local nrows = 0
 local used_memory = 0
 local last_collection = 0
 local final_call = false -- If the final collection has been started
-local schema_version = 8 -- Current schema version
+local schema_version = 9 -- Current schema version
 
 local settings = {
   limits = { -- Collection limits
@@ -41,29 +41,29 @@ local settings = {
     max_memory = 50 * 1024 * 1024, -- How many memory should be occupied before sending collection
     max_interval = 60, -- Maximum collection interval
   },
-  collect_garbage = false, -- Peform GC collection after sending the data
+  collect_garbage = false, -- Perform GC collection after sending the data
   check_timeout = 10.0, -- Periodic timeout
   timeout = 5.0,
-  bayes_spam_symbols = {'BAYES_SPAM'},
-  bayes_ham_symbols = {'BAYES_HAM'},
-  ann_symbols_spam = {'NEURAL_SPAM'},
-  ann_symbols_ham = {'NEURAL_HAM'},
-  fuzzy_symbols = {'FUZZY_DENIED'},
-  whitelist_symbols = {'WHITELIST_DKIM', 'WHITELIST_SPF_DKIM', 'WHITELIST_DMARC'},
-  dkim_allow_symbols = {'R_DKIM_ALLOW'},
-  dkim_reject_symbols = {'R_DKIM_REJECT'},
-  dkim_dnsfail_symbols = {'R_DKIM_TEMPFAIL', 'R_DKIM_PERMFAIL'},
-  dkim_na_symbols = {'R_DKIM_NA'},
-  dmarc_allow_symbols = {'DMARC_POLICY_ALLOW'},
-  dmarc_reject_symbols = {'DMARC_POLICY_REJECT'},
-  dmarc_quarantine_symbols = {'DMARC_POLICY_QUARANTINE'},
-  dmarc_softfail_symbols = {'DMARC_POLICY_SOFTFAIL'},
-  dmarc_na_symbols = {'DMARC_NA'},
-  spf_allow_symbols = {'R_SPF_ALLOW'},
-  spf_reject_symbols = {'R_SPF_FAIL'},
-  spf_dnsfail_symbols = {'R_SPF_DNSFAIL', 'R_SPF_PERMFAIL'},
-  spf_neutral_symbols = {'R_DKIM_TEMPFAIL', 'R_DKIM_PERMFAIL'},
-  spf_na_symbols = {'R_SPF_NA'},
+  bayes_spam_symbols = { 'BAYES_SPAM' },
+  bayes_ham_symbols = { 'BAYES_HAM' },
+  ann_symbols_spam = { 'NEURAL_SPAM' },
+  ann_symbols_ham = { 'NEURAL_HAM' },
+  fuzzy_symbols = { 'FUZZY_DENIED' },
+  whitelist_symbols = { 'WHITELIST_DKIM', 'WHITELIST_SPF_DKIM', 'WHITELIST_DMARC' },
+  dkim_allow_symbols = { 'R_DKIM_ALLOW' },
+  dkim_reject_symbols = { 'R_DKIM_REJECT' },
+  dkim_dnsfail_symbols = { 'R_DKIM_TEMPFAIL', 'R_DKIM_PERMFAIL' },
+  dkim_na_symbols = { 'R_DKIM_NA' },
+  dmarc_allow_symbols = { 'DMARC_POLICY_ALLOW' },
+  dmarc_reject_symbols = { 'DMARC_POLICY_REJECT' },
+  dmarc_quarantine_symbols = { 'DMARC_POLICY_QUARANTINE' },
+  dmarc_softfail_symbols = { 'DMARC_POLICY_SOFTFAIL' },
+  dmarc_na_symbols = { 'DMARC_NA' },
+  spf_allow_symbols = { 'R_SPF_ALLOW' },
+  spf_reject_symbols = { 'R_SPF_FAIL' },
+  spf_dnsfail_symbols = { 'R_SPF_DNSFAIL', 'R_SPF_PERMFAIL' },
+  spf_neutral_symbols = { 'R_DKIM_TEMPFAIL', 'R_DKIM_PERMFAIL' },
+  spf_na_symbols = { 'R_SPF_NA' },
   stop_symbols = {},
   ipmask = 19,
   ipmask6 = 48,
@@ -96,7 +96,7 @@ local settings = {
 }
 
 --- @language SQL
-local clickhouse_schema = {[[
+local clickhouse_schema = { [[
 CREATE TABLE IF NOT EXISTS rspamd
 (
     Date Date COMMENT 'Date (used for partitioning)',
@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS rspamd
     `Attachments.Digest` Array(FixedString(16)) COMMENT 'First 16 characters of hash returned by mime_part:get_digest()',
     `Urls.Tld` Array(String) COMMENT 'Effective second level domain part of the URL host',
     `Urls.Url` Array(String) COMMENT 'Full URL if `full_urls` module option enabled, host part of URL otherwise',
+    `Urls.Flags` Array(UInt32) COMMENT 'Corresponding url flags, see `enum rspamd_url_flags` in libserver/url.h for details',
     Emails Array(String) COMMENT 'List of emails extracted from the message',
     ASN UInt32 COMMENT 'BGP AS number for SMTP client IP (returned by asn.rspamd.com or asn6.rspamd.com)',
     Country FixedString(2) COMMENT 'Country for SMTP client IP (returned by asn.rspamd.com or asn6.rspamd.com)',
@@ -155,8 +156,8 @@ CREATE TABLE IF NOT EXISTS rspamd
 PARTITION BY toMonday(Date)
 ORDER BY TS
 ]],
-[[CREATE TABLE IF NOT EXISTS rspamd_version ( Version UInt32) ENGINE = TinyLog]],
-{[[INSERT INTO rspamd_version (Version) Values (${SCHEMA_VERSION})]], true},
+                            [[CREATE TABLE IF NOT EXISTS rspamd_version ( Version UInt32) ENGINE = TinyLog]],
+                            { [[INSERT INTO rspamd_version (Version) Values (${SCHEMA_VERSION})]], true },
 }
 
 -- This describes SQL queries to migrate between versions
@@ -246,6 +247,14 @@ local migrations = {
     -- New version
     [[INSERT INTO rspamd_version (Version) Values (8)]],
   },
+  [8] = {
+    -- Add new columns
+    [[ALTER TABLE rspamd
+      ADD COLUMN IF NOT EXISTS `Urls.Flags` Array(UInt32) AFTER `Urls.Url`
+    ]],
+    -- New version
+    [[INSERT INTO rspamd_version (Version) Values (9)]],
+  },
 }
 
 local predefined_actions = {
@@ -296,7 +305,9 @@ local function clickhouse_main_row(res)
     'SettingsId',
   }
 
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_attachments_row(res)
@@ -307,22 +318,29 @@ local function clickhouse_attachments_row(res)
     'Attachments.Digest',
   }
 
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_urls_row(res)
   local fields = {
     'Urls.Tld',
     'Urls.Url',
+    'Urls.Flags',
   }
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_emails_row(res)
   local fields = {
     'Emails',
   }
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_symbols_row(res)
@@ -331,7 +349,9 @@ local function clickhouse_symbols_row(res)
     'Symbols.Scores',
     'Symbols.Options',
   }
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_groups_row(res)
@@ -339,7 +359,9 @@ local function clickhouse_groups_row(res)
     'Groups.Names',
     'Groups.Scores',
   }
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_asn_row(res)
@@ -348,11 +370,15 @@ local function clickhouse_asn_row(res)
     'Country',
     'IPNet',
   }
-  for _,v in ipairs(fields) do table.insert(res, v) end
+  for _, v in ipairs(fields) do
+    table.insert(res, v)
+  end
 end
 
 local function clickhouse_extra_columns(res)
-  for _,v in ipairs(settings.extra_columns) do table.insert(res, v.name) end
+  for _, v in ipairs(settings.extra_columns) do
+    table.insert(res, v.name)
+  end
 end
 
 local function today(ts)
@@ -361,7 +387,7 @@ end
 
 local function clickhouse_check_symbol(task, settings_field_name, fields_table,
                                        field_name, value, value_negative)
-  for _,s in ipairs(settings[settings_field_name] or {}) do
+  for _, s in ipairs(settings[settings_field_name] or {}) do
     if task:has_symbol(s) then
       if value_negative then
         local sym = task:get_symbol(s)[1]
@@ -389,7 +415,7 @@ local function clickhouse_send_data(task, ev_base, why, gen_rows, cust_rows)
       #gen_rows + #cust_rows, ip_addr, why)
 
   local function gen_success_cb(what, how_many)
-    return function (_, _)
+    return function(_, _)
       rspamd_logger.messagex(log_object, "sent %s rows of %s to clickhouse server %s; started as %s",
           how_many, what, ip_addr, why)
       upstream:ok()
@@ -397,7 +423,7 @@ local function clickhouse_send_data(task, ev_base, why, gen_rows, cust_rows)
   end
 
   local function gen_fail_cb(what, how_many)
-    return function (_, err)
+    return function(_, err)
       rspamd_logger.errx(log_object, "cannot send %s rows of %s data to clickhouse server %s: %s; started as %s",
           how_many, what, ip_addr, err, why)
       upstream:fail()
@@ -443,9 +469,9 @@ local function clickhouse_send_data(task, ev_base, why, gen_rows, cust_rows)
       string.format('INSERT INTO rspamd (%s)',
           table.concat(fields, ',')))
 
-  for k,crows in pairs(cust_rows) do
+  for k, crows in pairs(cust_rows) do
     if #crows > 1 then
-      send_data('custom data ('..k..')', crows,
+      send_data('custom data (' .. k .. ')', crows,
           settings.custom_rules[k].first_row())
     end
   end
@@ -460,7 +486,7 @@ local function clickhouse_collect(task)
     return
   end
 
-  for _,sym in ipairs(settings.stop_symbols) do
+  for _, sym in ipairs(settings.stop_symbols) do
     if task:has_symbol(sym) then
       rspamd_logger.infox(task, 'skip Clickhouse storage for message: symbol %s has fired', sym)
       return
@@ -468,7 +494,7 @@ local function clickhouse_collect(task)
   end
 
   if settings.exceptions then
-    local excepted,trace = settings.exceptions:process(task)
+    local excepted, trace = settings.exceptions:process(task)
     if excepted then
       rspamd_logger.infox(task, 'skipped Clickhouse storage for message: excepted (%s)',
           trace)
@@ -480,7 +506,7 @@ local function clickhouse_collect(task)
   local from_domain = ''
   local from_user = ''
   if task:has_from('smtp') then
-    local from = task:get_from('smtp')[1]
+    local from = task:get_from({ 'smtp', 'orig' })[1]
 
     if from then
       from_domain = from['domain']:lower()
@@ -491,7 +517,7 @@ local function clickhouse_collect(task)
   local mime_domain = ''
   local mime_user = ''
   if task:has_from('mime') then
-    local from = task:get_from({'mime','orig'})[1]
+    local from = task:get_from({ 'mime', 'orig' })[1]
     if from then
       mime_domain = from['domain']:lower()
       mime_user = from['user']
@@ -500,7 +526,7 @@ local function clickhouse_collect(task)
 
   local mime_recipients = {}
   if task:has_recipients('mime') then
-    local recipients = task:get_recipients({'mime','orig'})
+    local recipients = task:get_recipients({ 'mime', 'orig' })
     for _, rcpt in ipairs(recipients) do
       table.insert(mime_recipients, rcpt['user'] .. '@' .. rcpt['domain']:lower())
     end
@@ -538,7 +564,7 @@ local function clickhouse_collect(task)
   local message_id = lua_util.maybe_obfuscate_string(task:get_message_id() or '',
       settings, 'mid')
 
-  local score = task:get_metric_score('default')[1];
+  local score = task:get_metric_score()[1];
   local fields = {
     bayes = 'unknown',
     fuzzy = 'unknown',
@@ -551,79 +577,76 @@ local function clickhouse_collect(task)
 
   local ret
 
-  ret = clickhouse_check_symbol(task,'bayes_spam_symbols', fields,
+  ret = clickhouse_check_symbol(task, 'bayes_spam_symbols', fields,
       'bayes', 'spam')
   if not ret then
-    clickhouse_check_symbol(task,'bayes_ham_symbols', fields,
+    clickhouse_check_symbol(task, 'bayes_ham_symbols', fields,
         'bayes', 'ham')
   end
 
-  clickhouse_check_symbol(task,'ann_symbols_spam', fields,
+  clickhouse_check_symbol(task, 'ann_symbols_spam', fields,
       'ann', 'spam')
   if not ret then
-    clickhouse_check_symbol(task,'ann_symbols_ham', fields,
+    clickhouse_check_symbol(task, 'ann_symbols_ham', fields,
         'ann', 'ham')
   end
 
-  clickhouse_check_symbol(task,'whitelist_symbols', fields,
+  clickhouse_check_symbol(task, 'whitelist_symbols', fields,
       'whitelist', 'blacklist', 'whitelist')
 
-  clickhouse_check_symbol(task,'fuzzy_symbols', fields,
+  clickhouse_check_symbol(task, 'fuzzy_symbols', fields,
       'fuzzy', 'deny')
 
-
-  ret = clickhouse_check_symbol(task,'dkim_allow_symbols', fields,
+  ret = clickhouse_check_symbol(task, 'dkim_allow_symbols', fields,
       'dkim', 'allow')
   if not ret then
-    ret = clickhouse_check_symbol(task,'dkim_reject_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'dkim_reject_symbols', fields,
         'dkim', 'reject')
   end
   if not ret then
-    ret = clickhouse_check_symbol(task,'dkim_dnsfail_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'dkim_dnsfail_symbols', fields,
         'dkim', 'dnsfail')
   end
   if not ret then
-    clickhouse_check_symbol(task,'dkim_na_symbols', fields,
+    clickhouse_check_symbol(task, 'dkim_na_symbols', fields,
         'dkim', 'na')
   end
 
-
-  ret = clickhouse_check_symbol(task,'dmarc_allow_symbols', fields,
+  ret = clickhouse_check_symbol(task, 'dmarc_allow_symbols', fields,
       'dmarc', 'allow')
   if not ret then
-    ret = clickhouse_check_symbol(task,'dmarc_reject_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'dmarc_reject_symbols', fields,
         'dmarc', 'reject')
   end
   if not ret then
-    ret = clickhouse_check_symbol(task,'dmarc_quarantine_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'dmarc_quarantine_symbols', fields,
         'dmarc', 'quarantine')
   end
   if not ret then
-    ret = clickhouse_check_symbol(task,'dmarc_softfail_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'dmarc_softfail_symbols', fields,
         'dmarc', 'softfail')
   end
   if not ret then
-    clickhouse_check_symbol(task,'dmarc_na_symbols', fields,
+    clickhouse_check_symbol(task, 'dmarc_na_symbols', fields,
         'dmarc', 'na')
   end
 
-
-  ret = clickhouse_check_symbol(task,'spf_allow_symbols', fields,
+  ret = clickhouse_check_symbol(task, 'spf_allow_symbols', fields,
       'spf', 'allow')
   if not ret then
-    ret = clickhouse_check_symbol(task,'spf_reject_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'spf_reject_symbols', fields,
         'spf', 'reject')
   end
   if not ret then
-    ret = clickhouse_check_symbol(task,'spf_neutral_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'spf_neutral_symbols', fields,
         'spf', 'neutral')
   end
   if not ret then
-    ret = clickhouse_check_symbol(task,'spf_dnsfail_symbols', fields,
+    ret = clickhouse_check_symbol(task, 'spf_dnsfail_symbols', fields,
         'spf', 'dnsfail')
   end
   if not ret then
-    clickhouse_check_symbol(task,'spf_na_symbols', fields,
+    clickhouse_check_symbol(task, 'spf_na_symbols', fields,
         'spf', 'na')
   end
 
@@ -633,7 +656,12 @@ local function clickhouse_collect(task)
   end
 
   local nurls = 0
-  local task_urls = task:get_urls(false) or {}
+  local task_urls = task:get_urls({
+    content = true,
+    images = true,
+    emails = false,
+    sort = true,
+  }) or {}
 
   nurls = #task_urls
 
@@ -642,7 +670,7 @@ local function clickhouse_collect(task)
     gmt = true, -- The only sane way to sync stuff with different timezones
   }))
 
-  local action = task:get_metric_action('default')
+  local action = task:get_metric_action()
   local custom_action = ''
 
   if not predefined_actions[action] then
@@ -738,9 +766,9 @@ local function clickhouse_collect(task)
 
   if #attachments_fnames > 0 then
     table.insert(row, attachments_fnames)
-    table.insert(row,  attachments_ctypes)
-    table.insert(row,  attachments_lengths)
-    table.insert(row,   attachments_digests)
+    table.insert(row, attachments_ctypes)
+    table.insert(row, attachments_lengths)
+    table.insert(row, attachments_digests)
   else
     table.insert(row, {})
     table.insert(row, {})
@@ -748,34 +776,75 @@ local function clickhouse_collect(task)
     table.insert(row, {})
   end
 
-  local flatten_urls = function(f, ...)
-    return fun.totable(fun.map(function(k,v) return f(k,v) end, ...))
-  end
-
   -- Urls step
   local urls_urls = {}
+  local urls_tlds = {}
+  local urls_flags = {}
 
-  for _,u in ipairs(task_urls) do
-    if settings['full_urls'] then
-      urls_urls[u:get_text()] = u
-    else
-      urls_urls[u:get_host()] = u
+  if settings.full_urls then
+    for i, u in ipairs(task_urls) do
+      urls_urls[i] = u:get_text()
+      urls_tlds[i] = u:get_tld() or u:get_host()
+      urls_flags[i] = u:get_flags_num()
+    end
+  else
+    -- We need to store unique
+    local mt = {
+      ord_tbl = {}, -- ordered list of urls
+      idx_tbl = {}, -- indexed by host + flags, reference to an index in ord_tbl
+      __newindex = function(t, k, v)
+        local idx = getmetatable(t).idx_tbl
+        local ord = getmetatable(t).ord_tbl
+        local key = k:get_host() .. tostring(k:get_flags_num())
+        if idx[key] then
+          ord[idx[key]] = v -- replace
+        else
+          ord[#ord + 1] = v
+          idx[key] = #ord
+        end
+      end,
+      __index = function(t, k)
+        local ord = getmetatable(t).ord_tbl
+        if type(k) == 'number' then
+          return ord[k]
+        else
+          local idx = getmetatable(t).idx_tbl
+          local key = k:get_host() .. tostring(k:get_flags_num())
+          if idx[key] then
+            return ord[idx[key]]
+          end
+        end
+      end,
+    }
+    -- Extra index needed for making this unique
+    local urls_idx = {}
+    setmetatable(urls_idx, mt)
+    for _, u in ipairs(task_urls) do
+      if not urls_idx[u] then
+        urls_idx[u] = u
+        urls_urls[#urls_urls + 1] = u:get_host()
+        urls_tlds[#urls_tlds + 1] = u:get_tld() or u:get_host()
+        urls_flags[#urls_flags + 1] = u:get_flags_num()
+      end
     end
   end
 
+
   -- Get tlds
-  table.insert(row, flatten_urls(function(_, u)
-    return u:get_tld() or u:get_host()
-  end, urls_urls))
+  table.insert(row, urls_tlds)
   -- Get hosts/full urls
-  table.insert(row, flatten_urls(function(k, _) return k end, urls_urls))
+  table.insert(row, urls_urls)
+  -- Numeric flags
+  table.insert(row, urls_flags)
 
   -- Emails step
   if task:has_urls(true) then
-    table.insert(row, flatten_urls(function(k, _) return k end,
-        fun.map(function(u)
-          return string.format('%s@%s', u:get_user(), u:get_host()),true
-        end, task:get_emails())))
+    local emails = task:get_emails() or {}
+    local emails_formatted = {}
+    for i, u in ipairs(emails) do
+      emails_formatted[i] = string.format('%s@%s', u:get_user(), u:get_host())
+    end
+    table.insert(row, emails_formatted)
   else
     table.insert(row, {})
   end
@@ -806,7 +875,7 @@ local function clickhouse_collect(task)
     local scores_tab = {}
     local options_tab = {}
 
-    for _,s in ipairs(symbols) do
+    for _, s in ipairs(symbols) do
       table.insert(syms_tab, s.name or '')
       table.insert(scores_tab, s.score)
 
@@ -824,7 +893,7 @@ local function clickhouse_collect(task)
     local groups = task:get_groups()
     local groups_tab = {}
     local gr_scores_tab = {}
-    for gr,sc in pairs(groups) do
+    for gr, sc in pairs(groups) do
       table.insert(groups_tab, gr)
       table.insert(gr_scores_tab, sc)
     end
@@ -834,7 +903,7 @@ local function clickhouse_collect(task)
 
   -- Extra columns
   if #settings.extra_columns > 0 then
-    for _,col in ipairs(settings.extra_columns) do
+    for _, col in ipairs(settings.extra_columns) do
       local elts = col.real_selector(task)
 
       if elts then
@@ -846,15 +915,17 @@ local function clickhouse_collect(task)
   end
 
   -- Custom data
-  for k,rule in pairs(settings.custom_rules) do
-    if not custom_rows[k] then custom_rows[k] = {} end
+  for k, rule in pairs(settings.custom_rules) do
+    if not custom_rows[k] then
+      custom_rows[k] = {}
+    end
     table.insert(custom_rows[k], lua_clickhouse.row_to_tsv(rule.get_row(task)))
   end
 
-  nrows = nrows + 1
   local tsv_row = lua_clickhouse.row_to_tsv(row)
   used_memory = used_memory + #tsv_row
   data_rows[#data_rows + 1] = tsv_row
+  nrows = nrows + 1
   lua_util.debugm(N, task,
       "add clickhouse row %s / %s; used memory: %s / %s",
       nrows, settings.limits.max_rows,
@@ -867,9 +938,9 @@ local function do_remove_partition(ev_base, cfg, table_name, partition)
   local remove_partition_sql = "ALTER TABLE ${table_name} ${remove_method} PARTITION '${partition}'"
   local remove_method = (settings.retention.method == 'drop') and 'DROP' or 'DETACH'
   local sql_params = {
-    ['table_name']     = table_name,
-    ['remove_method']  = remove_method,
-    ['partition']   = partition
+    ['table_name'] = table_name,
+    ['remove_method'] = remove_method,
+    ['partition'] = partition
   }
 
   local sql = lua_util.template(remove_partition_sql, sql_params)
@@ -883,9 +954,9 @@ local function do_remove_partition(ev_base, cfg, table_name, partition)
   local err, _ = lua_clickhouse.generic_sync(upstream, settings, ch_params, sql)
   if err then
     rspamd_logger.errx(rspamd_config,
-      "cannot detach partition %s:%s from server %s: %s",
-      table_name, partition,
-      settings['server'], err)
+        "cannot detach partition %s:%s from server %s: %s",
+        table_name, partition,
+        settings['server'], err)
     return
   end
 
@@ -902,21 +973,11 @@ end
 ]]
 local function get_last_removal_ago()
   local ts_file = string.format('%s/%s', rspamd_paths['DBDIR'], 'clickhouse_retention_run')
-  local f, err = io.open(ts_file, 'r')
-  local write_file
   local last_ts
-
-  if err then
-    lua_util.debugm(N, rspamd_config, 'Failed to open %s: %s', ts_file, err)
-  else
-    last_ts = tonumber(f:read('*number'))
-    f:close()
-  end
-
   local current_ts = os.time()
 
-  if last_ts == nil or (last_ts + settings.retention.period) <= current_ts then
-    write_file, err = io.open(ts_file, 'w')
+  local function write_ts_to_file()
+    local write_file, err = io.open(ts_file, 'w')
     if err then
       rspamd_logger.errx(rspamd_config, 'Failed to open %s, will not perform retention: %s', ts_file, err)
       return nil
@@ -925,11 +986,33 @@ local function get_last_removal_ago()
     local res
     res, err = write_file:write(tostring(current_ts))
     if err or res == nil then
+      write_file:close()
       rspamd_logger.errx(rspamd_config, 'Failed to write %s, will not perform retention: %s', ts_file, err)
       return nil
     end
     write_file:close()
-    return 0
+
+    return true
+  end
+
+  local f, err = io.open(ts_file, 'r')
+  if err then
+    lua_util.debugm(N, rspamd_config, 'Failed to open %s: %s', ts_file, err)
+  else
+    last_ts = tonumber(f:read('*number'))
+    f:close()
+  end
+
+  if last_ts == nil or (last_ts + settings.retention.period) <= current_ts then
+    return write_ts_to_file() and 0
+  end
+
+  if last_ts > current_ts then
+    -- Clock skew detected, overwrite last_ts with current_ts and wait for the next
+    -- retention period
+    rspamd_logger.errx(rspamd_config, 'Last collection time is in future: %s; overwrite it with %s in %s',
+        last_ts, current_ts, ts_file)
+    return write_ts_to_file() and -1
   end
 
   return (last_ts + settings.retention.period) - current_ts
@@ -989,7 +1072,7 @@ local function clickhouse_maybe_send_data_periodic(cfg, ev_base, now)
 
     clickhouse_send_data(nil, ev_base, reason, saved_rows, saved_custom)
 
-    if settings.collect_garbadge then
+    if settings.collect_garbage then
       collectgarbage()
     end
   end
@@ -1012,14 +1095,13 @@ local function clickhouse_remove_old_partitions(cfg, ev_base)
       "GROUP BY partition, table " ..
       "HAVING max(max_date) < toDate(now() - interval ${month} month)"
 
-  local table_names = {'rspamd'}
+  local table_names = { 'rspamd' }
   local tables = table.concat(table_names, "', '")
   local sql_params = {
     tables = tables,
-    month  = settings.retention.period_months,
+    month = settings.retention.period_months,
   }
   local sql = lua_util.template(partition_to_remove_sql, sql_params)
-
 
   local ch_params = {
     ev_base = ev_base,
@@ -1028,8 +1110,8 @@ local function clickhouse_remove_old_partitions(cfg, ev_base)
   local err, rows = lua_clickhouse.select_sync(upstream, settings, ch_params, sql)
   if err then
     rspamd_logger.errx(rspamd_config,
-      "cannot send data to clickhouse server %s: %s",
-      settings['server'], err)
+        "cannot send data to clickhouse server %s: %s",
+        settings['server'], err)
   else
     fun.each(function(row)
       do_remove_partition(ev_base, cfg, row.table, row.partition)
@@ -1071,11 +1153,11 @@ local function upload_clickhouse_schema(upstream, ev_base, cfg, initial)
   -- Process element and return nil if statement should be skipped
   local function preprocess_schema_elt(v)
     if type(v) == 'string' then
-      return lua_util.template(v, {SCHEMA_VERSION = tostring(schema_version)})
+      return lua_util.template(v, { SCHEMA_VERSION = tostring(schema_version) })
     elseif type(v) == 'table' then
       -- Pair of statement + boolean
       if initial == v[2] then
-        return lua_util.template(v[1], {SCHEMA_VERSION = tostring(schema_version)})
+        return lua_util.template(v[1], { SCHEMA_VERSION = tostring(schema_version) })
       else
         rspamd_logger.debugm(N, rspamd_config, 'skip clickhouse schema element %s: schema already exists',
             v)
@@ -1087,12 +1169,14 @@ local function upload_clickhouse_schema(upstream, ev_base, cfg, initial)
 
   -- Apply schema elements sequentially, users additions are concatenated to the tail
   fun.each(upload_schema_elt,
-    -- Also template schema version
-    fun.filter(function(v) return v ~= nil end,
-      fun.map(preprocess_schema_elt,
-        fun.chain(clickhouse_schema, settings.schema_additions)
+  -- Also template schema version
+      fun.filter(function(v)
+        return v ~= nil
+      end,
+          fun.map(preprocess_schema_elt,
+              fun.chain(clickhouse_schema, settings.schema_additions)
+          )
       )
-    )
   )
 end
 
@@ -1103,7 +1187,7 @@ local function maybe_apply_migrations(upstream, ev_base, cfg, version)
   }
   -- Apply migrations sequentially
   local function migration_recursor(i)
-    if i < schema_version  then
+    if i < schema_version then
       if migrations[i] then
         -- We also need to apply statements sequentially
         local function sql_recursor(j)
@@ -1121,7 +1205,7 @@ local function maybe_apply_migrations(upstream, ev_base, cfg, version)
                     -- Apply the next statement
                     sql_recursor(j + 1)
                   end
-                end ,
+                end,
                 function(_, err)
                   rspamd_logger.errx(rspamd_config,
                       "cannot apply migration %s: '%s' on clickhouse server %s: %s",
@@ -1153,7 +1237,7 @@ local function add_extra_columns(upstream, ev_base, cfg)
   }
   -- Apply migrations sequentially
   local function columns_recursor(i)
-    if i <= #settings.extra_columns  then
+    if i <= #settings.extra_columns then
       local col = settings.extra_columns[i]
       local prev_column
       if i == 1 then
@@ -1174,7 +1258,7 @@ local function add_extra_columns(upstream, ev_base, cfg)
                 col.name, col.type, prev_column)
             -- Apply the next statement
             columns_recursor(i + 1)
-          end ,
+          end,
           function(_, err)
             rspamd_logger.errx(rspamd_config,
                 "cannot apply add column alter %s: '%s' on clickhouse server %s: %s",
@@ -1200,7 +1284,7 @@ local function check_rspamd_table(upstream, ev_base, cfg)
   local err, rows = lua_clickhouse.select_sync(upstream, settings, ch_params, sql)
   if err then
     rspamd_logger.errx(rspamd_config, "cannot check rspamd table in clickhouse server %s: %s",
-      upstream:get_addr():to_string(true), err)
+        upstream:get_addr():to_string(true), err)
     return
   end
 
@@ -1222,20 +1306,19 @@ local function check_rspamd_table(upstream, ev_base, cfg)
   end
 end
 
-
 local function check_clickhouse_upstream(upstream, ev_base, cfg)
   local ch_params = {
     ev_base = ev_base,
     config = cfg,
   }
   -- If we have some custom rules, we just send its schema to the upstream
-  for k,rule in pairs(settings.custom_rules) do
+  for k, rule in pairs(settings.custom_rules) do
     if rule.schema then
       local sql = lua_util.template(rule.schema, settings)
       local err, _ = lua_clickhouse.generic_sync(upstream, settings, ch_params, sql)
       if err then
         rspamd_logger.errx(rspamd_config, 'cannot send custom schema %s to clickhouse server %s: ' ..
-        'cannot make request (%s)',
+            'cannot make request (%s)',
             k, upstream:get_addr():to_string(true), err)
       end
     end
@@ -1252,7 +1335,7 @@ local function check_clickhouse_upstream(upstream, ev_base, cfg)
     else
       rspamd_logger.errx(rspamd_config,
           "cannot get version on clickhouse server %s: %s",
-        upstream:get_addr():to_string(true), err)
+          upstream:get_addr():to_string(true), err)
     end
   else
     upload_clickhouse_schema(upstream, ev_base, cfg, false)
@@ -1271,13 +1354,13 @@ if opts then
   if opts.limit and not opts.limits then
     settings.limits.max_rows = opts.limit
   end
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     if k == 'custom_rules' then
       if not v[1] then
-        v = {v}
+        v = { v }
       end
 
-      for i,rule in ipairs(v) do
+      for i, rule in ipairs(v) do
         if rule.schema and rule.first_row and rule.get_row then
           local first_row, get_row
           local loadstring = loadstring or load
@@ -1321,7 +1404,8 @@ if opts then
     rspamd_logger.infox(rspamd_config, 'no servers are specified, disabling module')
     lua_util.disable_module(N, "config")
   else
-    settings['from_map'] = rspamd_map_add('clickhouse', 'from_tables',
+    local lua_maps = require "lua_maps"
+    settings['from_map'] = lua_maps.map_add('clickhouse', 'from_tables',
         'regexp', 'clickhouse specific domains')
 
     settings.upstream = upstream_list.create(rspamd_config,
@@ -1349,9 +1433,11 @@ if opts then
       -- Select traverse function depending on what we have
       local iter_func = settings.extra_columns[1] and ipairs or pairs
 
-      for col_name,col_data in iter_func(settings.extra_columns) do
+      for col_name, col_data in iter_func(settings.extra_columns) do
         -- Array based extra columns
-        if col_data.name then col_name = col_data.name end
+        if col_data.name then
+          col_name = col_data.name
+        end
         if not col_data.selector or not col_data.type then
           rspamd_logger.errx(rspamd_config, 'cannot add clickhouse extra row %s: no type or no selector',
               col_name)
@@ -1390,7 +1476,9 @@ if opts then
       -- preserve strict order when doing altering
       if need_sort then
         rspamd_logger.infox(rspamd_config, 'sort extra columns as they are not configured as an array')
-        table.sort(columns_transformed, function(c1, c2) return c1.name < c2.name end)
+        table.sort(columns_transformed, function(c1, c2)
+          return c1.name < c2.name
+        end)
       end
       settings.extra_columns = columns_transformed
     end
@@ -1399,8 +1487,8 @@ if opts then
       name = 'CLICKHOUSE_COLLECT',
       type = 'idempotent',
       callback = clickhouse_collect,
-      priority = 10,
       flags = 'empty,explicit_disable,ignore_passthrough',
+      augmentations = { string.format("timeout=%f", settings.timeout) },
     })
     rspamd_config:register_finish_script(function(task)
       if nrows > 0 then
@@ -1416,7 +1504,7 @@ if opts then
         clickhouse_send_data(task, nil, 'final collection',
             saved_rows, saved_custom)
 
-        if settings.collect_garbadge then
+        if settings.collect_garbage then
           collectgarbage()
         end
       end
@@ -1430,7 +1518,7 @@ if opts then
       if worker:is_primary_controller() then
         local upstreams = settings.upstream:all_upstreams()
 
-        for _,up in ipairs(upstreams) do
+        for _, up in ipairs(upstreams) do
           check_clickhouse_upstream(up, ev_base, cfg)
         end
 

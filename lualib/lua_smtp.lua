@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ local function sendmail(opts, message, callback)
       wantcode = wantcode or '2'
       if merr then
         callback(false, string.format('error on stage %s: %s',
-          stage, merr))
+            stage, merr))
         if conn then
           conn:close()
         end
@@ -59,7 +59,7 @@ local function sendmail(opts, message, callback)
           mdata = tostring(mdata)
         end
         if string.sub(mdata, 1, 1) ~= wantcode then
-          callback(false, string.format('bad smtp responce on stage %s: "%s" when "%s" expected',
+          callback(false, string.format('bad smtp response on stage %s: "%s" when "%s" expected',
               stage, mdata, wantcode))
           if conn then
             conn:close()
@@ -108,9 +108,9 @@ local function sendmail(opts, message, callback)
     local function data_done_cb(merr, mdata)
       if no_error_read(merr, mdata, '3') then
         if type(message) == 'string' or type(message) == 'userdata' then
-          conn:add_write(pre_quit_cb, {message, CRLF.. '.' .. CRLF})
+          conn:add_write(pre_quit_cb, { message, CRLF .. '.' .. CRLF })
         else
-          table.insert(message, CRLF.. '.' .. CRLF)
+          table.insert(message, CRLF .. '.' .. CRLF)
           conn:add_write(pre_quit_cb, message)
         end
       end
@@ -124,7 +124,7 @@ local function sendmail(opts, message, callback)
     -- RCPT phase
     local next_recipient
     local function rcpt_done_cb_gen(i)
-      return function (merr, mdata)
+      return function(merr, mdata)
         if no_error_read(merr, mdata) then
           if i == #opts.recipients then
             conn:add_write(data_cb, 'DATA' .. CRLF)
@@ -136,7 +136,7 @@ local function sendmail(opts, message, callback)
     end
 
     local function rcpt_cb_gen(i)
-      return function (merr, _)
+      return function(merr, _)
         if no_error_write(merr, '2') then
           conn:add_read(rcpt_done_cb_gen(i), CRLF)
         end
@@ -169,7 +169,7 @@ local function sendmail(opts, message, callback)
       end
     end
 
-    -- HELLO stage
+    -- HELO stage
     local function hello_cb(merr)
       if no_error_write(merr) then
         conn:add_read(hello_done_cb, CRLF)
@@ -178,12 +178,12 @@ local function sendmail(opts, message, callback)
     if no_error_read(err, data) then
       stage = 'helo'
       conn:add_write(hello_cb, string.format('HELO %s%s',
-        opts.helo, CRLF))
+          opts.helo, CRLF))
     end
   end
 
   if type(opts.recipients) == 'string' then
-    opts.recipients = {opts.recipients}
+    opts.recipients = { opts.recipients }
   end
 
   local tcp_opts = lua_util.shallowcopy(opts)

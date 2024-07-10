@@ -68,11 +68,15 @@ IF (ENABLE_CLANG_PLUGIN MATCHES "ON")
 		FOREACH(_lib ${CLANG_EXTRA_PLUGINS_LIBS})
 			SET(CMAKE_C_FLAGS
 					"${CMAKE_C_FLAGS} -Xclang -load -Xclang ${_lib}")
+			SET(CMAKE_CXX_FLAGS
+					"${CMAKE_CXX_FLAGS} -Xclang -load -Xclang ${_lib}")
 		ENDFOREACH()
 	ENDIF()
 	IF(CLANG_EXTRA_PLUGINS)
 		FOREACH(_plug ${CLANG_EXTRA_PLUGINS})
 			SET(CMAKE_C_FLAGS
+					"${CMAKE_C_FLAGS} -Xclang -add-plugin -Xclang ${_plug}")
+			SET(CMAKE_CXX_FLAGS
 					"${CMAKE_C_FLAGS} -Xclang -add-plugin -Xclang ${_plug}")
 		ENDFOREACH()
 	ENDIF()
@@ -94,7 +98,7 @@ SET(RSPAMDSRC	controller.c
 				rspamd_proxy.c)
 
 SET(PLUGINSSRC  plugins/regexp.c
-				plugins/chartable.c
+		plugins/chartable.cxx
 				plugins/fuzzy_check.c
 				plugins/dkim_check.c
 				libserver/rspamd_control.c)
@@ -139,6 +143,10 @@ RAGEL_TARGET(ragel_smtp_ip
 	DEPENDS ${RAGEL_DEPENDS}
 	COMPILE_FLAGS -G2
 	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ip_parser.rl.c)
+# Fucking cmake...
+FOREACH(_GEN ${LIBSERVER_GENERATED})
+	set_source_files_properties(${_GEN} PROPERTIES GENERATED TRUE)
+ENDFOREACH()
 ######################### LINK SECTION ###############################
 
 IF(ENABLE_STATIC MATCHES "ON")
@@ -157,7 +165,8 @@ IF(ENABLE_STATIC MATCHES "ON")
 			"${RAGEL_ragel_content_disposition_OUTPUTS}"
 			"${RAGEL_ragel_rfc2047_OUTPUTS}"
 			"${RAGEL_ragel_smtp_date_OUTPUTS}"
-			"${RAGEL_ragel_smtp_ip_OUTPUTS}")
+			"${RAGEL_ragel_smtp_ip_OUTPUTS}"
+			${BACKWARD_ENABLE})
 ELSE()
 	ADD_LIBRARY(rspamd-server SHARED
 			${RSPAMD_CRYPTOBOX}
@@ -174,15 +183,24 @@ ELSE()
 			"${RAGEL_ragel_content_disposition_OUTPUTS}"
 			"${RAGEL_ragel_rfc2047_OUTPUTS}"
 			"${RAGEL_ragel_smtp_date_OUTPUTS}"
-			"${RAGEL_ragel_smtp_ip_OUTPUTS}")
+			"${RAGEL_ragel_smtp_ip_OUTPUTS}"
+			${BACKWARD_ENABLE})
 ENDIF()
+
+FOREACH(_DEP ${LIBSERVER_DEPENDS})
+	ADD_DEPENDENCIES(rspamd-server "${_DEP}")
+ENDFOREACH()
 
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-http-parser)
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-fpconv)
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-cdb)
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-lpeg)
 TARGET_LINK_LIBRARIES(rspamd-server lcbtrie)
-TARGET_LINK_LIBRARIES(rspamd-server rspamd-zstd)
+IF(SYSTEM_ZSTD MATCHES "OFF")
+	TARGET_LINK_LIBRARIES(rspamd-server rspamd-zstd)
+ELSE()
+	TARGET_LINK_LIBRARIES(rspamd-server zstd)
+ENDIF()
 TARGET_LINK_LIBRARIES(rspamd-server rspamd-fastutf8)
 
 IF (ENABLE_CLANG_PLUGIN MATCHES "ON")
@@ -211,14 +229,12 @@ IF(WITH_BLAS)
 ENDIF()
 
 TARGET_LINK_LIBRARIES(rspamd-server ${RSPAMD_REQUIRED_LIBRARIES})
+ADD_BACKWARD(rspamd-server)
 
-ADD_EXECUTABLE(rspamd ${RSPAMDSRC} ${CMAKE_CURRENT_BINARY_DIR}/workers.c)
-SET_TARGET_PROPERTIES(rspamd PROPERTIES LINKER_LANGUAGE C)
-SET_TARGET_PROPERTIES(rspamd PROPERTIES COMPILE_FLAGS "-DRSPAMD_MAIN")
-IF(USE_CXX_LINKER)
-	SET_TARGET_PROPERTIES(rspamd PROPERTIES LINKER_LANGUAGE CXX)
-	SET_TARGET_PROPERTIES(rspamd-server PROPERTIES LINKER_LANGUAGE CXX)
-ENDIF()
+ADD_EXECUTABLE(rspamd ${RSPAMDSRC} ${CMAKE_CURRENT_BINARY_DIR}/workers.c ${CMAKE_CURRENT_BINARY_DIR}/config.h)
+ADD_BACKWARD(rspamd)
+SET_TARGET_PROPERTIES(rspamd PROPERTIES LINKER_LANGUAGE CXX)
+SET_TARGET_PROPERTIES(rspamd-server PROPERTIES LINKER_LANGUAGE CXX)
 IF(NOT DEBIAN_BUILD)
 	SET_TARGET_PROPERTIES(rspamd PROPERTIES VERSION ${RSPAMD_VERSION})
 ENDIF(NOT DEBIAN_BUILD)

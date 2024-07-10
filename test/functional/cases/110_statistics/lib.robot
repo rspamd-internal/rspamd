@@ -1,56 +1,69 @@
 *** Settings ***
-Library         ${TESTDIR}/lib/rspamd.py
-Resource        ${TESTDIR}/lib/rspamd.robot
-Variables       ${TESTDIR}/lib/vars.py
+Library         ${RSPAMD_TESTDIR}/lib/rspamd.py
+Resource        ${RSPAMD_TESTDIR}/lib/rspamd.robot
+Variables       ${RSPAMD_TESTDIR}/lib/vars.py
 
 *** Variables ***
-${CONFIG}       ${TESTDIR}/configs/stats.conf
-${MESSAGE_SPAM}      ${TESTDIR}/messages/spam_message.eml
-${MESSAGE_HAM}      ${TESTDIR}/messages/ham.eml
-${REDIS_SCOPE}  Suite
-${REDIS_SERVER}  ${EMPTY}
-${RSPAMD_SCOPE}  Suite
-${STATS_HASH}   ${EMPTY}
-${STATS_KEY}    ${EMPTY}
+${CONFIG}                 ${RSPAMD_TESTDIR}/configs/stats.conf
+${MESSAGE_HAM}            ${RSPAMD_TESTDIR}/messages/ham.eml
+${MESSAGE_SPAM}           ${RSPAMD_TESTDIR}/messages/spam_message.eml
+${REDIS_SCOPE}            Suite
+${RSPAMD_REDIS_SERVER}    null
+${RSPAMD_SCOPE}           Suite
+${RSPAMD_STATS_BACKEND}   redis
+${RSPAMD_STATS_HASH}      null
+${RSPAMD_STATS_KEY}       null
+${RSPAMD_STATS_PER_USER}  ${EMPTY}
 
 *** Keywords ***
 Broken Learn Test
-  ${result} =  Run Rspamc  -h  ${LOCAL_ADDR}:${PORT_CONTROLLER}  learn_spam  ${MESSAGE_SPAM}
+  ${result} =  Run Rspamc  -h  ${RSPAMD_LOCAL_ADDR}:${RSPAMD_PORT_CONTROLLER}  learn_spam  ${MESSAGE_SPAM}
   Check Rspamc  ${result}  Unknown statistics error
 
 Empty Part Test
-  Set Test Variable  ${MESSAGE}  ${TESTDIR}/messages/empty_part.eml
-  ${result} =  Run Rspamc  -h  ${LOCAL_ADDR}:${PORT_CONTROLLER}  learn_spam  ${MESSAGE}
+  Set Test Variable  ${MESSAGE}  ${RSPAMD_TESTDIR}/messages/empty_part.eml
+  ${result} =  Run Rspamc  -h  ${RSPAMD_LOCAL_ADDR}:${RSPAMD_PORT_CONTROLLER}  learn_spam  ${MESSAGE}
   Check Rspamc  ${result}
   Scan File  ${MESSAGE}
   Expect Symbol  BAYES_SPAM
 
-Learn Test
-  Set Suite Variable  ${RSPAMD_STATS_LEARNTEST}  0
-  ${result} =  Run Rspamc  -h  ${LOCAL_ADDR}:${PORT_CONTROLLER}  learn_spam  ${MESSAGE_SPAM}
-  ${result} =  Run Rspamc  -h  ${LOCAL_ADDR}:${PORT_CONTROLLER}  learn_ham  ${MESSAGE_HAM}
+Learn
+  [Arguments]  ${user}  ${class}  ${message}
+  IF  "${user}"
+    ${result} =  Run Rspamc  -d  ${user}  -h  ${RSPAMD_LOCAL_ADDR}:${RSPAMD_PORT_CONTROLLER}  learn_${class}  ${message}
+  ELSE
+    ${result} =  Run Rspamc  -h  ${RSPAMD_LOCAL_ADDR}:${RSPAMD_PORT_CONTROLLER}  learn_${class}  ${message}
+  END
   Check Rspamc  ${result}
-  Scan File  ${MESSAGE_SPAM}
+
+Learn Test
+  [Arguments]  ${user}=${EMPTY}
+  Set Suite Variable  ${RSPAMD_STATS_LEARNTEST}  0
+  Set Test Variable  ${kwargs}  &{EMPTY}
+  IF  "${user}"
+    Set To Dictionary  ${kwargs}  Deliver-To=${user}
+  END
+  Learn  ${user}  spam  ${MESSAGE_SPAM}
+  Learn  ${user}  ham  ${MESSAGE_HAM}
+  Scan File  ${MESSAGE_SPAM}  &{kwargs}
   Expect Symbol  BAYES_SPAM
-  Scan File  ${MESSAGE_HAM}
+  Scan File  ${MESSAGE_HAM}  &{kwargs}
   Expect Symbol  BAYES_HAM
   Set Suite Variable  ${RSPAMD_STATS_LEARNTEST}  1
 
 Relearn Test
-  Run Keyword If  ${RSPAMD_STATS_LEARNTEST} == 0  Fail  "Learn test was not run"
-  ${result} =  Run Rspamc  -h  ${LOCAL_ADDR}:${PORT_CONTROLLER}  learn_ham  ${MESSAGE_SPAM}
-  Check Rspamc  ${result}
-  Scan File  ${MESSAGE_SPAM}
+  [Arguments]  ${user}=${EMPTY}
+  IF  ${RSPAMD_STATS_LEARNTEST} == 0
+    Fail  "Learn test was not run"
+  END
+  Learn  ${user}  ham  ${MESSAGE_SPAM}
+  Set Test Variable  ${kwargs}  &{EMPTY}
+  IF  "${user}"
+    Set To Dictionary  ${kwargs}  Deliver-To=${user}
+  END
+  Scan File  ${MESSAGE_SPAM}  &{kwargs}
   ${pass} =  Run Keyword And Return Status  Expect Symbol  BAYES_HAM
-  Run Keyword If  ${pass}  Pass Execution  What Me Worry
+  IF  ${pass}
+    Pass Execution  What Me Worry
+  END
   Do Not Expect Symbol  BAYES_SPAM
-
-Redis Statistics Setup
-  ${tmpdir} =  Make Temporary Directory
-  Set Suite Variable  ${TMPDIR}  ${tmpdir}
-  Run Redis
-  Generic Setup  TMPDIR=${tmpdir}
-
-Redis Statistics Teardown
-  Normal Teardown
-  Shutdown Process With Children  ${REDIS_PID}

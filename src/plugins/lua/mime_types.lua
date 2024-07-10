@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ local logger = require "rspamd_logger"
 local lua_util = require "lua_util"
 local rspamd_util = require "rspamd_util"
 local lua_maps = require "lua_maps"
-local lua_mime = require "lua_mime"
+local lua_mime_types = require "lua_mime_types"
 local lua_magic_types = require "lua_magic/types"
 local fun = require "fun"
 
@@ -35,6 +35,7 @@ local settings = {
   symbol_good = 'MIME_GOOD',
   symbol_attachment = 'MIME_BAD_ATTACHMENT',
   symbol_encrypted_archive = 'MIME_ENCRYPTED_ARCHIVE',
+  symbol_obfuscated_archive = 'MIME_OBFUSCATED_ARCHIVE',
   symbol_exe_in_gen_split_rar = 'MIME_EXE_IN_GEN_SPLIT_RAR',
   symbol_archive_in_archive = 'MIME_ARCHIVE_IN_ARCHIVE',
   symbol_double_extension = 'MIME_DOUBLE_BAD_EXTENSION',
@@ -44,153 +45,192 @@ local settings = {
   extension_map = { -- extension -> mime_type
     html = 'text/html',
     htm = 'text/html',
-    txt = 'text/plain',
-    pdf = 'application/pdf'
+    pdf = 'application/pdf',
+    shtm = 'text/html',
+    shtml = 'text/html',
+    txt = 'text/plain'
   },
 
   bad_extensions = {
-    bat = 2,
-    com = 2,
+    cue = 2,
     exe = 1,
     iso = 4,
     jar = 2,
-    lnk = 4,
-    scr = 4,
+    zpaq = 2,
+    -- In contrast to HTML MIME parts, dedicated HTML attachments are considered harmful
+    htm = 1,
+    html = 1,
+    shtm = 1,
+    shtml = 1,
     -- Have you ever seen that in legit email?
     ace = 4,
     arj = 2,
+    aspx = 1,
+    asx = 2,
     cab = 3,
+    dll = 4,
+    dqy = 2,
+    iqy = 2,
+    mht = 2,
+    mhtml = 2,
+    oqy = 2,
+    rqy = 2,
+    sfx = 2,
+    slk = 2,
+    vst = 2,
+    vss = 2,
+    wim = 2,
     -- Additional bad extensions from Gmail
-    ade = 2,
-    adp = 2,
-    chm = 2,
-    cmd = 2,
-    cpl = 2,
-    ins = 2,
-    isp = 2,
-    js = 2,
-    jse = 2,
-    lib = 2,
-    mde = 2,
-    msc = 2,
-    msi = 2,
-    msp = 2,
-    mst = 2,
-    nsh = 2,
-    pif = 2,
-    sct = 2,
-    shb = 2,
-    sys = 2,
-    vb = 2,
-    vbe = 2,
-    vbs = 2,
-    vxd = 2,
-    wsc = 2,
-    wsh = 2,
+    ade = 4,
+    adp = 4,
+    cmd = 4,
+    cpl = 4,
+    ins = 4,
+    isp = 4,
+    js = 4,
+    jse = 4,
+    lib = 4,
+    mde = 4,
+    msc = 4,
+    msi = 4,
+    msp = 4,
+    mst = 4,
+    nsh = 4,
+    pif = 4,
+    sct = 4,
+    shb = 4,
+    sys = 4,
+    vb = 4,
+    vbe = 4,
+    vbs = 4,
+    vxd = 4,
+    wsc = 4,
+    wsh = 4,
     -- Additional bad extensions from Outlook
-    app = 2,
-    asp = 2,
-    bas = 2,
-    cnt = 2,
-    csh = 2,
-    diagcab = 2,
-    fxp = 2,
-    gadget = 2,
-    grp = 2,
-    hlp = 2,
-    hpj = 2,
-    inf = 2,
-    its = 2,
-    jnlp = 2,
-    ksh = 2,
-    mad = 2,
-    maf = 2,
-    mag = 2,
-    mam = 2,
-    maq = 2,
-    mar = 2,
-    mas = 2,
-    mat = 2,
-    mau = 2,
-    mav = 2,
-    maw = 2,
-    mcf = 2,
-    mda = 2,
-    mdb = 2,
-    mdt = 2,
-    mdw = 2,
-    mdz = 2,
-    msh = 2,
-    msh1 = 2,
-    msh2 = 2,
-    mshxml = 2,
-    msh1xml = 2,
-    msh2xml = 2,
-    msu = 2,
-    ops = 2,
-    osd = 2,
-    pcd = 2,
-    pl = 2,
-    plg = 2,
-    prf = 2,
-    prg = 2,
-    printerexport = 2,
-    ps1 = 2,
-    ps1xml = 2,
-    ps2 = 2,
-    ps2xml = 2,
-    psc1 = 2,
-    psc2 = 2,
-    psd1 = 2,
-    psdm1 = 2,
-    pst = 2,
-    reg = 2,
-    scf = 2,
-    shs = 2,
-    theme = 2,
-    url = 2,
-    vbp = 2,
-    vsmacros = 2,
-    vsw = 2,
-    webpnp = 2,
-    website = 2,
-    ws = 2,
-    xbap = 2,
-    xll = 2,
-    xnk = 2,
+    app = 4,
+    asp = 4,
+    bas = 4,
+    bat = 4,
+    chm = 4,
+    cnt = 4,
+    com = 4,
+    csh = 4,
+    diagcab = 4,
+    fxp = 4,
+    gadget = 4,
+    grp = 4,
+    hlp = 4,
+    hpj = 4,
+    hta = 4,
+    htc = 4,
+    inf = 4,
+    its = 4,
+    jnlp = 4,
+    lnk = 4,
+    ksh = 4,
+    mad = 4,
+    maf = 4,
+    mag = 4,
+    mam = 4,
+    maq = 4,
+    mar = 4,
+    mas = 4,
+    mat = 4,
+    mau = 4,
+    mav = 4,
+    maw = 4,
+    mcf = 4,
+    mda = 4,
+    mdb = 4,
+    mdt = 4,
+    mdw = 4,
+    mdz = 4,
+    msh = 4,
+    msh1 = 4,
+    msh2 = 4,
+    mshxml = 4,
+    msh1xml = 4,
+    msh2xml = 4,
+    msu = 4,
+    ops = 4,
+    osd = 4,
+    pcd = 4,
+    pl = 4,
+    plg = 4,
+    prf = 4,
+    prg = 4,
+    printerexport = 4,
+    ps1 = 4,
+    ps1xml = 4,
+    ps2 = 4,
+    ps2xml = 4,
+    psc1 = 4,
+    psc2 = 4,
+    psd1 = 4,
+    psdm1 = 4,
+    pst = 4,
+    pyc = 4,
+    pyo = 4,
+    pyw = 4,
+    pyz = 4,
+    pyzw = 4,
+    reg = 4,
+    scf = 4,
+    scr = 4,
+    shs = 4,
+    theme = 4,
+    url = 4,
+    vbp = 4,
+    vhd = 4,
+    vhdx = 4,
+    vsmacros = 4,
+    vsw = 4,
+    webpnp = 4,
+    website = 4,
+    ws = 4,
+    wsf = 4,
+    xbap = 4,
+    xll = 4,
+    xnk = 4,
   },
 
   -- Something that should not be in archive
   bad_archive_extensions = {
-    pptx = 0.1,
     docx = 0.1,
-    xlsx = 0.1,
-    pdf = 0.1,
+    hta = 4,
     jar = 3,
     js = 0.5,
+    pdf = 0.1,
+    pptx = 0.1,
     vbs = 4,
     wsf = 4,
-    hta = 4,
+    xlsx = 0.1,
   },
 
   archive_extensions = {
-    zip = 1,
-    arj = 1,
-    rar = 1,
-    ace = 1,
     ['7z'] = 1,
+    ace = 1,
+    alz = 1,
+    arj = 1,
+    bz2 = 1,
     cab = 1,
+    egg = 1,
+    lz = 1,
+    rar = 1,
+    xz = 1,
+    zip = 1,
+    zpaq = 1,
   },
 
   -- Not really archives
   archive_exceptions = {
-    odt = true,
-    ods = true,
-    odp = true,
     docx = true,
-    xlsx = true,
+    odp = true,
+    ods = true,
+    odt = true,
     pptx = true,
     vsdx = true,
+    xlsx = true,
     -- jar = true,
   },
 
@@ -206,14 +246,16 @@ local function check_mime_type(task)
 
     local ext = {}
     for n = 1, 2 do
-        ext[n] = #parts > n and string.lower(parts[#parts + 1 - n]) or nil
+      ext[n] = #parts > n and string.lower(parts[#parts + 1 - n]) or nil
     end
 
-    return ext[1],ext[2],parts
+    return ext[1], ext[2], parts
   end
 
   local function check_filename(fname, ct, is_archive, part, detected_ext, nfiles)
 
+    lua_util.debugm(N, task, "check filename: %s, ct=%s, is_archive=%s, detected_ext=%s, nfiles=%s",
+        fname, ct, is_archive, detected_ext, nfiles)
     local has_bad_unicode, char, ch_pos = rspamd_util.has_obscured_unicode(fname)
     if has_bad_unicode then
       task:insert_result(settings.symbol_bad_unicode, 1.0,
@@ -222,7 +264,10 @@ local function check_mime_type(task)
     end
 
     -- Decode hex encoded characters
-    fname = string.gsub(fname, '%%(%x%x)', function (hex) return string.char(tonumber(hex,16)) end )
+    fname = string.gsub(fname, '%%(%x%x)',
+        function(hex)
+          return string.char(tonumber(hex, 16))
+        end)
 
     -- Replace potentially bad characters with '?'
     fname = fname:gsub('[^%s%g]', '?')
@@ -235,7 +280,7 @@ local function check_mime_type(task)
       return
     end
 
-    local ext,ext2,parts = gen_extension(fname)
+    local ext, ext2, parts = gen_extension(fname)
     -- ext is the last extension, LOWERCASED
     -- ext2 is the one before last extension LOWERCASED
 
@@ -251,10 +296,14 @@ local function check_mime_type(task)
           false, part, nil, 1)
     end
 
-    if not ext then return end
+    if not ext then
+      return
+    end
 
     local function check_extension(badness_mult, badness_mult2)
-      if not badness_mult and not badness_mult2 then return end
+      if not badness_mult and not badness_mult2 then
+        return
+      end
       if #parts > 2 then
         -- We need to ensure that next-to-last extension is an extension,
         -- so we check for its length and if it is not a number or date
@@ -296,7 +345,9 @@ local function check_mime_type(task)
         if user_settings.bad_extensions[1] then
           -- Convert to a key-value map
           extra_table = fun.tomap(
-              fun.map(function(e) return e,1.0 end,
+              fun.map(function(e)
+                return e, 1.0
+              end,
                   user_settings.bad_extensions))
         else
           extra_table = user_settings.bad_extensions
@@ -306,7 +357,9 @@ local function check_mime_type(task)
         if user_settings.bad_archive_extensions[1] then
           -- Convert to a key-value map
           extra_archive_table = fun.tomap(fun.map(
-              function(e) return e,1.0 end,
+              function(e)
+                return e, 1.0
+              end,
               user_settings.bad_archive_extensions))
         else
           extra_archive_table = user_settings.bad_archive_extensions
@@ -362,10 +415,10 @@ local function check_mime_type(task)
     end
 
     local mt = settings['extension_map'][ext]
-    if mt and ct then
+    if mt and ct and ct ~= 'application/octet-stream' then
       local found
       local mult
-      for _,v in ipairs(mt) do
+      for _, v in ipairs(mt) do
         mult = v.mult
         if ct == v.ct then
           found = true
@@ -373,8 +426,9 @@ local function check_mime_type(task)
         end
       end
 
-      if not found  then
-        task:insert_result(settings['symbol_attachment'], mult, ext)
+      if not found then
+        task:insert_result(settings['symbol_attachment'], mult, string.format('%s:%s',
+            ext, ct))
       end
     end
   end
@@ -382,10 +436,11 @@ local function check_mime_type(task)
   local parts = task:get_parts()
 
   if parts then
-    for _,p in ipairs(parts) do
-      local mtype,subtype = p:get_type()
+    for _, p in ipairs(parts) do
+      local mtype, subtype = p:get_type()
 
       if not mtype then
+        lua_util.debugm(N, task, "no content type for part: %s", p:get_id())
         task:insert_result(settings['symbol_unknown'], 1.0, 'missing content type')
         task:insert_result('MIME_TRACE', 0.0,
             string.format("%s:%s", p:get_id(), '~'))
@@ -421,6 +476,7 @@ local function check_mime_type(task)
           end
           local arch = p:get_archive()
 
+          -- TODO: migrate to flags once C part is ready
           if arch:is_encrypted() then
             task:insert_result(settings.symbol_encrypted_archive, 1.0, filename)
             task:insert_result('MIME_TRACE', 0.0,
@@ -428,6 +484,13 @@ local function check_mime_type(task)
           elseif arch:is_unreadable() then
             task:insert_result(settings.symbol_encrypted_archive, 0.5, {
               'compressed header',
+              filename,
+            })
+            task:insert_result('MIME_TRACE', 0.0,
+                string.format("%s:%s", p:get_id(), '-'))
+          elseif arch:is_obfuscated() then
+            task:insert_result(settings.symbol_obfuscated_archive, 1.0, {
+              'obfuscated archive',
               filename,
             })
             task:insert_result('MIME_TRACE', 0.0,
@@ -445,7 +508,7 @@ local function check_mime_type(task)
 
             local nfiles = #fl
 
-            for _,f in ipairs(fl) do
+            for _, f in ipairs(fl) do
               if f['encrypted'] then
                 task:insert_result(settings['symbol_encrypted_archive'],
                     1.0, f['name'])
@@ -466,7 +529,7 @@ local function check_mime_type(task)
             if nfiles == 1 and fl[1].name then
               -- We check that extension of the file inside archive is
               -- the same as double extension of the file
-              local _,ext2 = gen_extension(filename)
+              local _, ext2 = gen_extension(filename)
 
               if ext2 and #ext2 > 0 then
                 local enc_ext = gen_extension(fl[1].name)
@@ -494,7 +557,9 @@ local function check_mime_type(task)
 
           if detected_type and detected_type.ct ~= ct then
             local v_detected = map:get_key(detected_type.ct)
-            if not v or v_detected and v_detected > v then v = v_detected end
+            if not v or v_detected and v_detected > v then
+              v = v_detected
+            end
             detected_different = true
           end
           if v then
@@ -536,19 +601,19 @@ local function check_mime_type(task)
   end
 end
 
-local opts =  rspamd_config:get_all_opt('mime_types')
+local opts = rspamd_config:get_all_opt('mime_types')
 if opts then
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     settings[k] = v
   end
 
   settings.filename_whitelist = lua_maps.rspamd_map_add('mime_types', 'filename_whitelist', 'regexp',
-    'filename whitelist')
+      'filename whitelist')
 
   local function change_extension_map_entry(ext, ct, mult)
     if type(ct) == 'table' then
       local tbl = {}
-      for _,elt in ipairs(ct) do
+      for _, elt in ipairs(ct) do
         table.insert(tbl, {
           ct = elt,
           mult = mult,
@@ -564,22 +629,24 @@ if opts then
   end
 
   -- Transform extension_map
-  for ext,ct in pairs(settings.extension_map) do
+  for ext, ct in pairs(settings.extension_map) do
     change_extension_map_entry(ext, ct, 1.0)
   end
 
   -- Add all extensions
-  for _,pair in ipairs(lua_mime.full_extensions_map) do
+  for _, pair in ipairs(lua_mime_types.full_extensions_map) do
     local ext, ct = pair[1], pair[2]
     if not settings.extension_map[ext] then
-        change_extension_map_entry(ext, ct, settings.other_extensions_mult)
+      change_extension_map_entry(ext, ct, settings.other_extensions_mult)
     end
   end
 
   local map_type = 'map'
-  if settings['regexp'] then map_type = 'regexp' end
+  if settings['regexp'] then
+    map_type = 'regexp'
+  end
   map = lua_maps.rspamd_map_add('mime_types', 'file', map_type,
-    'mime types map')
+      'mime types map')
   if map then
     local id = rspamd_config:register_symbol({
       name = 'MIME_TYPES_CALLBACK',
@@ -617,6 +684,12 @@ if opts then
     rspamd_config:register_symbol({
       type = 'virtual',
       name = settings['symbol_encrypted_archive'],
+      parent = id,
+      group = 'mime_types',
+    })
+    rspamd_config:register_symbol({
+      type = 'virtual',
+      name = settings['symbol_obfuscated_archive'],
       parent = id,
       group = 'mime_types',
     })

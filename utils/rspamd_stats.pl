@@ -14,6 +14,7 @@ my @symbols_exclude;
 my @symbols_bidirectional;
 my @symbols_groups;
 my @symbols_ignored;
+my %symbols_mult;
 my %groups;
 my $reject_score   = 15.0;
 my $junk_score     = 6.0;
@@ -47,6 +48,7 @@ GetOptions(
     "ignore=s@"             => \@symbols_ignored,
     "group|g=s@"            => \@symbols_groups,
     "log|l=s"               => \$log_file,
+    "mult=s"                => \%symbols_mult,
     "alpha-score|alpha|a=f" => \$diff_alpha,
     "correlations|c"        => \$correlations,
     "nrelated=i"            => \$nrelated,
@@ -427,7 +429,7 @@ sub ProcessRelated {
         next if IsIgnored($sym_name);
 
         if ($2) {
-            $sym_score = $3 * 1.0;
+            $sym_score = $3 * ($symbols_mult{$sym_name} or 1.0);
 
             if ( abs($sym_score) < $diff_alpha ) {
                 next;
@@ -549,7 +551,7 @@ sub ProcessLog {
                         my $orig_name = $sym_name;
 
                         if ($2) {
-                            $sym_score = $3 * 1.0;
+                            $sym_score = $3 * ($symbols_mult{$sym_name} or 1.0);
 
                             if ( abs($sym_score) < $diff_alpha ) {
                                 next;
@@ -676,20 +678,20 @@ sub JsonObjectElt() {
 
 sub GetLogfilesList {
     my ($dir) = @_;
-    opendir( DIR, $dir ) or die $!;
+    opendir( my $fh, $dir ) or die $!;
 
     my $pattern = join( '|', keys %decompressor );
     my $re      = qr/\.[0-9]+(?:\.(?:$pattern))?/;
 
     # Add unnumbered logs first
     my @logs =
-      grep { -f "$dir/$_" && !/$re/ } readdir(DIR);
+      grep { -f "$dir/$_" && !/$re/ } readdir($fh);
 
     # Add numbered logs
-    rewinddir(DIR);
-    push( @logs, ( sort numeric ( grep { -f "$dir/$_" && /$re/ } readdir(DIR) ) ) );
+    rewinddir($fh);
+    push( @logs, ( sort numeric ( grep { -f "$dir/$_" && /$re/ } readdir($fh) ) ) );
 
-    closedir(DIR);
+    closedir($fh);
 
     # Select required logs and revers their order
     @logs =
@@ -868,6 +870,7 @@ rspamd_stats [options] [--symbol=SYM1 [--symbol=SYM2...]] [--log file]
    --exclude-logs=integer number of latest logs to exclude (0 by default)
    --json                 print json output instead of human readable
    --help                 brief help message
+   --mult=sym=number      multiply symbol score
    --man                  full documentation
 
 =head1 OPTIONS
@@ -931,6 +934,10 @@ supply the time.
 Select log entries before this time. Format: C<YYYY-MM-DD HH:MM:SS> (can be truncated to any desired accuracy). If used
 with B<--start> select entries between B<--start> and B<--end>. The omitted date defaults to the current date if you
 supply the time.
+
+=item B<--mult=symbol=number>
+
+Multiplies score for the named symbol by the provided multiplier.
 
 =item B<--help>
 

@@ -19,7 +19,7 @@ whitelist_ip_from = {
 --]]
 
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ local lua_maps = require "lua_maps"
 local rspamd_expression = require "rspamd_expression"
 local rspamd_logger = require "rspamd_logger"
 local fun = require "fun"
+local ts = require("tableshape").types
 
 local exports = {}
 
@@ -63,7 +64,7 @@ local function process_func(elt, task)
 
     if values then
       if type(values) == 'table' then
-        for _,val in ipairs(values) do
+        for _, val in ipairs(values) do
           if res == 0 then
             match_rule(val)
           end
@@ -79,11 +80,21 @@ local function process_func(elt, task)
   local res = elt.expr:process(process_atom)
 
   if res > 0 then
-    return res,matched
+    return res, matched
   end
 
   return nil
 end
+
+exports.schema = ts.shape {
+  expression = ts.string,
+  rules = ts.array_of(
+      ts.shape {
+        selector = ts.string,
+        map = lua_maps.map_schema,
+      }
+  )
+}
 
 --[[[
 -- @function lua_maps_expression.create(config, object, module_name)
@@ -107,7 +118,9 @@ end
 --
 --]]
 local function create(cfg, obj, module_name)
-  if not module_name then module_name = 'lua_maps_expressions' end
+  if not module_name then
+    module_name = 'lua_maps_expressions'
+  end
 
   if not obj or not obj.rules or not obj.expression then
     rspamd_logger.errx(cfg, 'cannot add maps combination for module %s: required elements are missing',
@@ -121,7 +134,7 @@ local function create(cfg, obj, module_name)
     module_name = module_name
   }
 
-  for name,rule in pairs(obj.rules) do
+  for name, rule in pairs(obj.rules) do
     local sel = lua_selectors.create_selector_closure(cfg, rule.selector)
 
     if not sel then
@@ -162,7 +175,7 @@ local function create(cfg, obj, module_name)
   -- Now process and parse expression
   local function parse_atom(str)
     local atom = table.concat(fun.totable(fun.take_while(function(c)
-      if string.find(', \t()><+!|&\n', c) then
+      if string.find(', \t()><+!|&\n', c, 1, true) then
         return false
       end
       return true
@@ -189,7 +202,7 @@ local function create(cfg, obj, module_name)
   ret.expr = expr
 
   if obj.symbol then
-    rspamd_config:register_symbol{
+    rspamd_config:register_symbol {
       type = 'virtual,ghost',
       name = obj.symbol,
       score = 0.0,

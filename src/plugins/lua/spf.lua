@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -88,7 +88,7 @@ local function spf_check_callback(task)
     local rh = task:get_received_headers() or {}
     local found = false
 
-    for i,hdr in ipairs(rh) do
+    for i, hdr in ipairs(rh) do
       if hdr.real_ip and local_config.external_relay:get_key(hdr.real_ip) then
         -- We can use the next header as a source of IP address
         if rh[i + 1] then
@@ -106,9 +106,10 @@ local function spf_check_callback(task)
       end
     end
     if not found then
-      rspamd_logger.warnx(task, "cannot find external relay with IP %s",
-          local_config.external_relay)
       ip = task:get_from_ip()
+      rspamd_logger.warnx(task,
+          "cannot find external relay for SPF checks in received headers; use the original IP: %s",
+          tostring(ip))
     end
   else
     ip = task:get_from_ip()
@@ -128,16 +129,16 @@ local function spf_check_callback(task)
 
   local function policy_decode(res)
     if res == rspamd_spf.policy.fail then
-      return local_config.symbols.fail,'-'
+      return local_config.symbols.fail, '-'
     elseif res == rspamd_spf.policy.pass then
-      return local_config.symbols.allow,'+'
+      return local_config.symbols.allow, '+'
     elseif res == rspamd_spf.policy.soft_fail then
-      return local_config.symbols.softfail,'~'
+      return local_config.symbols.softfail, '~'
     elseif res == rspamd_spf.policy.neutral then
-      return local_config.symbols.neutral,'?'
+      return local_config.symbols.neutral, '?'
     end
 
-    return 'SPF_UNKNOWN','?'
+    return 'SPF_UNKNOWN', '?'
   end
 
   local function spf_resolved_cb(record, flags, err)
@@ -152,7 +153,7 @@ local function spf_check_callback(task)
           ip, flags, err, error_or_addr)
 
       if result then
-        local sym,code = policy_decode(flag_or_policy)
+        local sym, code = policy_decode(flag_or_policy)
         local opt = string.format('%s%s', code, error_or_addr.str or '???')
         if bit.band(flags, rspamd_spf.flags.cached) ~= 0 then
           opt = opt .. ':c'
@@ -202,13 +203,17 @@ end
 
 -- Register all symbols and init rspamd_spf library
 rspamd_spf.config(local_config)
-local sym_id = rspamd_config:register_symbol{
+local sym_id = rspamd_config:register_symbol {
   name = 'SPF_CHECK',
   type = 'callback',
   flags = 'fine,empty',
-  groups = {'policies','spf'},
+  groups = { 'policies', 'spf' },
   score = 0.0,
-  callback = spf_check_callback
+  callback = spf_check_callback,
+  -- We can merely estimate timeout here, as it is possible to construct an SPF record that would cause
+  -- many DNS requests. But we won't like to set the maximum value for that all the time, as
+  -- the majority of requests will typically have 1-4 subrequests
+  augmentations = { string.format("timeout=%f", rspamd_config:get_dns_timeout() * 4 or 0.0) },
 }
 
 if local_config.whitelist then
@@ -222,15 +227,15 @@ if local_config.external_relay then
   local lua_maps = require "lua_maps"
 
   local_config.external_relay = lua_maps.map_add_from_ucl(local_config.external_relay,
-   "radix", "External IP SPF map")
+      "radix", "External IP SPF map")
 end
 
-for _,sym in pairs(local_config.symbols) do
-  rspamd_config:register_symbol{
+for _, sym in pairs(local_config.symbols) do
+  rspamd_config:register_symbol {
     name = sym,
     type = 'virtual',
     parent = sym_id,
-    groups = {'policies', 'spf'},
+    groups = { 'policies', 'spf' },
   }
 end
 

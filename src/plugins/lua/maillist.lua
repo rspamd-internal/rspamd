@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2015, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ local function check_ml_mailman(task)
     return false
   end
 
-  -- Mailmain 3 allows to disable all List-* headers in settings, but by default it adds them.
+  -- Mailman 3 allows to disable all List-* headers in settings, but by default it adds them.
   -- In all other cases all Mailman message should have List-Id header
   if not task:has_header('List-Id') then
     return false
@@ -104,7 +104,8 @@ local function check_ml_mailman(task)
       -- not much elase we can check, Subjects can be changed in settings
       return true
     end
-  else -- Mailman 3
+  else
+    -- Mailman 3
     -- XXX not Mailman3 admin messages have this headers, but one
     -- which don't usually have List-* headers examined below
     if task:has_header('List-Administrivia') then
@@ -113,7 +114,7 @@ local function check_ml_mailman(task)
   end
 
   -- List-Archive and List-Post are optional, check other headers
-  for _, h in ipairs({'List-Help', 'List-Subscribe', 'List-Unsubscribe'}) do
+  for _, h in ipairs({ 'List-Help', 'List-Subscribe', 'List-Unsubscribe' }) do
     header = task:get_header(h)
     if not (header and header:find('<mailto:', 1, true)) then
       return false
@@ -123,63 +124,12 @@ local function check_ml_mailman(task)
   return true
 end
 
--- Subscribe.ru
--- List-Id: <*.subscribe.ru>
--- List-Help: <https://subscribe.ru/catalog/*>
--- List-Subscribe: <mailto:*-sub@subscribe.ru>
--- List-Unsubscribe: <mailto:*-unsub@subscribe.ru>
--- List-Archive:  <https://subscribe.ru/archive/*>
--- List-Owner: <mailto:*@subscribe.ru>
--- List-Post: NO
-local function check_ml_subscriberu(task)
-  -- List-Id
-  local header = task:get_header('list-id')
-  if not (header and header:find('^<.*%.subscribe%.ru>$')) then
-    return false
-  end
-  -- Other headers
-  header = task:get_header('list-archive')
-  if not (header and header:find('^<https?://subscribe%.ru/archive/.+>$')) then
-    return false
-  end
-  header = task:get_header('list-owner')
-  if not (header and header:find('^<mailto:.+@subscribe%.ru>$')) then
-    return false
-  end
-  header = task:get_header('list-help')
-  if not (header and header:find('^<https?://subscribe%.ru/catalog/.+>$')) then
-    return false
-  end
-  -- Subscribe and unsubscribe
-  header = task:get_header('list-subscribe')
-  if not (header and header:find('^<mailto:.+-sub@subscribe%.ru>$')) then
-    return false
-  end
-  header = task:get_header('list-unsubscribe')
-  if not (header and header:find('^<mailto:.+-unsub@subscribe%.ru>$')) then
-    return false
-  end
-
-  return true
-
-end
-
 -- Google groups detector
 -- header exists X-Google-Loop
 -- RFC 2919 headers exist
 --
 local function check_ml_googlegroup(task)
-  local header = task:get_header('X-Google-Loop')
-
-  if not header then
-    header = task:get_header('X-Google-Group-Id')
-
-    if not header then
-      return false
-    end
-  end
-
-  return true
+  return task:has_header('X-Google-Loop') or task:has_header('X-Google-Group-Id')
 end
 
 -- CGP detector
@@ -201,60 +151,46 @@ local function check_generic_list_headers(task)
   local score = 0
   local has_subscribe, has_unsubscribe
 
-  if task:has_header('List-Id') then
-    score = score + 0.75
-    lua_util.debugm(N, task, 'has List-Id header, score = %s', score)
-  end
+  local common_list_headers = {
+    ['List-Id'] = 0.75,
+    ['List-Archive'] = 0.125,
+    ['List-Owner'] = 0.125,
+    ['List-Help'] = 0.125,
+    ['List-Post'] = 0.125,
+    ['X-Loop'] = 0.125,
+    ['List-Subscribe'] = function()
+      has_subscribe = true
+      return 0.125
+    end,
+    ['List-Unsubscribe'] = function()
+      has_unsubscribe = true
+      return 0.125
+    end,
+    ['Precedence'] = function()
+      local header = task:get_header('Precedence')
+      if header and (header == 'list' or header == 'bulk') then
+        return 0.25
+      end
+    end,
+  }
 
-  local header = task:get_header('Precedence')
-  if header and (header == 'list' or header == 'bulk') then
-    score = score + 0.25
-    lua_util.debugm(N, task, 'has header "Precedence: %s", score = %s',
-        header, score)
-  end
-
-  if task:has_header('List-Archive') then
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header List-Archive, score = %s',
-        score)
-  end
-  if task:has_header('List-Owner') then
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header List-Owner, score = %s',
-        score)
-  end
-  if task:has_header('List-Help') then
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header List-Help, score = %s',
-        score)
-  end
-
-  -- Subscribe and unsubscribe
-  if task:has_header('List-Subscribe') then
-    has_subscribe = true
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header List-Subscribe, score = %s',
-        score)
-  end
-  if task:has_header('List-Unsubscribe') then
-    has_unsubscribe = true
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header List-Unsubscribe, score = %s',
-        score)
-  end
-
-  if task:has_header('X-Loop') then
-    score = score + 0.125
-    lua_util.debugm(N, task, 'has header X-Loop, score = %s',
-        score)
+  for hname, hscore in pairs(common_list_headers) do
+    if task:has_header(hname) then
+      if type(hscore) == 'number' then
+        score = score + hscore
+        lua_util.debugm(N, task, 'has %s header, score = %s', hname, score)
+      else
+        local score_change = hscore()
+        if score and score_change then
+          score = score + score_change
+          lua_util.debugm(N, task, 'has %s header, score = %s', hname, score)
+        end
+      end
+    end
   end
 
   if has_subscribe and has_unsubscribe then
     score = score + 0.25
-  elseif (has_unsubscribe) then
-    score = score - 0.25
-  elseif (has_subscribe) then
-    score = score - 0.75
   end
 
   lua_util.debugm(N, task, 'final maillist score %s', score)
@@ -270,14 +206,14 @@ local function check_maillist(task)
       task:insert_result(symbol, 1, 'ezmlm')
     elseif check_ml_mailman(task) then
       task:insert_result(symbol, 1, 'mailman')
-    elseif check_ml_subscriberu(task) then
-      task:insert_result(symbol, 1, 'subscribe.ru')
     elseif check_ml_googlegroup(task) then
       task:insert_result(symbol, 1, 'googlegroups')
     elseif check_ml_cgp(task) then
       task:insert_result(symbol, 1, 'cgp')
     else
-      if score > 2 then score = 2 end
+      if score > 2 then
+        score = 2
+      end
       task:insert_result(symbol, 0.5 * score, 'generic')
     end
   end
@@ -286,13 +222,14 @@ end
 
 
 -- Configuration
-local opts =  rspamd_config:get_all_opt('maillist')
+local opts = rspamd_config:get_all_opt('maillist')
 if opts then
   if opts['symbol'] then
     symbol = opts['symbol']
     rspamd_config:register_symbol({
       name = symbol,
-      callback = check_maillist
+      callback = check_maillist,
+      flags = 'nice'
     })
   end
 end

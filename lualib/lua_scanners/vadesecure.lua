@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ local function vade_config(opts)
     log_spamcause = true,
     symbol_fail = 'VADE_FAIL',
     symbol = 'VADE_CHECK',
+    settings_outbound = nil, -- Set when there is a settings id for outbound messages
     symbols = {
       clean = {
         symbol = 'VADE_CLEAN',
@@ -84,17 +85,17 @@ local function vade_config(opts)
         score = 8.0,
         description = 'VadeSecure decided message to be phishing'
       },
-      commercial =  {
+      commercial = {
         symbol = 'VADE_COMMERCIAL',
         score = 0.0,
         description = 'VadeSecure decided message to be commercial message'
       },
-      community =  {
+      community = {
         symbol = 'VADE_COMMUNITY',
         score = 0.0,
         description = 'VadeSecure decided message to be community message'
       },
-      transactional =  {
+      transactional = {
         symbol = 'VADE_TRANSACTIONAL',
         score = 0.0,
         description = 'VadeSecure decided message to be transactional message'
@@ -151,7 +152,7 @@ local function vade_config(opts)
   return nil
 end
 
-local function vade_check(task, content, digest, rule)
+local function vade_check(task, content, digest, rule, maybe_part)
   local function vade_check_uncached()
     local function vade_url(addr)
       local url
@@ -195,6 +196,26 @@ local function vade_check(task, content, digest, rule)
       hdrs['X-Inet'] = tostring(fip)
     end
 
+    if rule.settings_outbound then
+      local settings_id = task:get_settings_id()
+
+      if settings_id then
+        local lua_settings = require "lua_settings"
+        -- Convert to string
+        settings_id = lua_settings.settings_by_id(settings_id)
+
+        if settings_id then
+          settings_id = settings_id.name or ''
+
+          if settings_id == rule.settings_outbound then
+            lua_util.debugm(rule.name, task, '%s settings has matched outbound',
+                settings_id)
+            hdrs['X-Params'] = 'mode=smtpout'
+          end
+        end
+      end
+    end
+
     local request_data = {
       task = task,
       url = url,
@@ -229,9 +250,9 @@ local function vade_check(task, content, digest, rule)
 
           http.request(request_data)
         else
-          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits '..
+          rspamd_logger.errx(task, '%s: failed to scan, maximum retransmits ' ..
               'exceed', rule.log_prefix)
-          task:insert_result(rule['symbol_fail'], 0.0, 'failed to scan and '..
+          task:insert_result(rule['symbol_fail'], 0.0, 'failed to scan and ' ..
               'retransmits exceed')
         end
       end
@@ -240,7 +261,9 @@ local function vade_check(task, content, digest, rule)
         vade_requery()
       else
         -- Parse the response
-        if upstream then upstream:ok() end
+        if upstream then
+          upstream:ok()
+        end
         if code ~= 200 then
           rspamd_logger.errx(task, 'invalid HTTP code: %s, body: %s, headers: %s', code, body, headers)
           task:insert_result(rule.symbol_fail, 1.0, 'Bad HTTP code: ' .. code)
@@ -310,7 +333,8 @@ local function vade_check(task, content, digest, rule)
     http.request(request_data)
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, vade_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      vade_check_uncached, maybe_part) then
     return
   else
     vade_check_uncached()
@@ -319,7 +343,7 @@ local function vade_check(task, content, digest, rule)
 end
 
 return {
-  type = {'vadesecure', 'scanner'},
+  type = { 'vadesecure', 'scanner' },
   description = 'VadeSecure Filterd interface',
   configure = vade_config,
   check = vade_check,

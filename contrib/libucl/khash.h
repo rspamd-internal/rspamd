@@ -197,11 +197,13 @@ static const double __ac_HASH_UPPER = 0.77;
 		khint32_t *flags; \
 		khkey_t *keys; \
 		khval_t *vals; \
-	} kh_##name##_t;
+	} kh_##name##_t
 
 #define __KHASH_PROTOTYPES(name, khkey_t, khval_t)	 						\
 	extern kh_##name##_t * kh_init_##name(void);							\
+    extern void kh_static_init_##name(kh_##name##_t *);						\
 	extern void kh_destroy_##name(kh_##name##_t *h);						\
+	extern void kh_static_destroy_##name(kh_##name##_t *h);					\
 	extern void kh_clear_##name(kh_##name##_t *h);							\
 	extern khint_t kh_get_##name(const kh_##name##_t *h, khkey_t key); 		\
 	extern int kh_resize_##name(kh_##name##_t *h, khint_t new_n_buckets); 	\
@@ -211,6 +213,9 @@ static const double __ac_HASH_UPPER = 0.77;
 #define __KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
 	SCOPE kh_##name##_t *kh_init_##name(void) {							\
 		return (kh_##name##_t*)kcalloc(1, sizeof(kh_##name##_t));		\
+	}                                                                   \
+    SCOPE void kh_unused(kh_static_init_##name)(kh_##name##_t *target) {\
+		memset(target, 0, sizeof(*target));								\
 	}																	\
 	SCOPE void kh_destroy_##name(kh_##name##_t *h)						\
 	{																	\
@@ -219,6 +224,10 @@ static const double __ac_HASH_UPPER = 0.77;
 			kfree((void *)h->vals);										\
 			kfree(h);													\
 		}																\
+	}																	\
+    SCOPE void kh_unused(kh_static_destroy_##name)(kh_##name##_t *h) {	\
+			kfree((void *)h->keys); kfree(h->flags);					\
+			kfree((void *)h->vals);										\
 	}																	\
 	SCOPE void kh_unused(kh_clear_##name)(kh_##name##_t *h)				\
 	{																	\
@@ -346,7 +355,7 @@ static const double __ac_HASH_UPPER = 0.77;
 		} else *ret = 0; /* Don't touch h->keys[x] if present and not deleted */ \
 		return x;														\
 	}																	\
-	SCOPE void kh_del_##name(kh_##name##_t *h, khint_t x)				\
+	SCOPE void kh_unused(kh_del_##name)(kh_##name##_t *h, khint_t x)	\
 	{																	\
 		if (x != h->n_buckets && !__ac_iseither(h->flags, x)) {			\
 			__ac_set_isdel_true(h->flags, x);							\
@@ -355,11 +364,11 @@ static const double __ac_HASH_UPPER = 0.77;
 	}
 
 #define KHASH_DECLARE(name, khkey_t, khval_t)		 					\
-	__KHASH_TYPE(name, khkey_t, khval_t) 								\
+	__KHASH_TYPE(name, khkey_t, khval_t); 								\
 	__KHASH_PROTOTYPES(name, khkey_t, khval_t)
 
 #define KHASH_INIT2(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
-	__KHASH_TYPE(name, khkey_t, khval_t) 								\
+	__KHASH_TYPE(name, khkey_t, khval_t); 								\
 	__KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)
 
 #define KHASH_INIT(name, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
@@ -398,12 +407,33 @@ static kh_inline khint_t __ac_X31_hash_string(const char *s)
 	if (h) for (++s ; *s; ++s) h = (h << 5) - h + (khint_t)*s;
 	return h;
 }
+
+/**
+ * Wyhash implementation from https://github.com/wangyi-fudan/wyhash
+ */
+static inline unsigned _wyr32(const uint8_t *p) { unsigned v; memcpy(&v, p, 4); return v;}
+static inline unsigned _wyr24(const uint8_t *p, unsigned k) { return (((unsigned)p[0])<<16)|(((unsigned)p[k>>1])<<8)|p[k-1];}
+static inline void _wymix32(unsigned  *A,  unsigned  *B){
+	uint64_t  c=*A^0x53c5ca59u;  c*=*B^0x74743c1bu;
+	*A=(unsigned)c;
+	*B=(unsigned)(c>>32);
+}
+// This version is vulnerable when used with a few bad seeds, which should be skipped beforehand:
+// 0x429dacdd, 0xd637dbf3
+static inline unsigned _wyhash32(const void *key, uint64_t len, unsigned seed) {
+	const uint8_t *p=(const uint8_t *)key; uint64_t i=len;
+	unsigned see1=(unsigned)len; seed^=(unsigned)(len>>32); _wymix32(&seed, &see1);
+	for(;i>8;i-=8,p+=8){  seed^=_wyr32(p); see1^=_wyr32(p+4); _wymix32(&seed, &see1); }
+	if(i>=4){ seed^=_wyr32(p); see1^=_wyr32(p+i-4); } else if (i) seed^=_wyr24(p,(unsigned)i);
+	_wymix32(&seed, &see1); _wymix32(&seed, &see1); return seed^see1;
+}
+
 /*! @function
   @abstract     Another interface to const char* hash function
   @param  key   Pointer to a null terminated string [const char*]
   @return       The hash value [khint_t]
  */
-#define kh_str_hash_func(key) __ac_X31_hash_string(key)
+#define kh_str_hash_func(key) _wyhash32(key, strlen(key), 0)
 /*! @function
   @abstract     Const char* comparison function
  */
@@ -437,6 +467,7 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
   @return       Pointer to the hash table [khash_t(name)*]
  */
 #define kh_init(name) kh_init_##name()
+#define kh_static_init(name, h) kh_static_init_##name(h)
 
 /*! @function
   @abstract     Destroy a hash table.
@@ -444,6 +475,7 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
   @param  h     Pointer to the hash table [khash_t(name)*]
  */
 #define kh_destroy(name, h) kh_destroy_##name(h)
+#define kh_static_destroy(name, h) kh_static_destroy_##name(h)
 
 /*! @function
   @abstract     Reset a hash table without deallocating memory.
@@ -579,6 +611,14 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
 #define kh_foreach_value_ptr(h, pvvar, code) { khint_t __i;		\
 	for (__i = kh_begin(h); __i != kh_end(h); ++__i) {		\
 		if (!kh_exist(h,__i)) continue;						\
+		(pvvar) = &kh_val(h,__i);							\
+		code;												\
+	} }
+
+#define kh_foreach_key_value_ptr(h, kvar, pvvar, code) { khint_t __i;		\
+	for (__i = kh_begin(h); __i != kh_end(h); ++__i) {		\
+		if (!kh_exist(h,__i)) continue;						\
+		(kvar) = kh_key(h,__i);								\
 		(pvvar) = &kh_val(h,__i);							\
 		code;												\
 	} }

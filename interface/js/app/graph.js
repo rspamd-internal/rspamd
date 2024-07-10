@@ -23,18 +23,18 @@
  THE SOFTWARE.
  */
 
-/* global d3:false, FooTable:false */
+/* global FooTable */
 
-define(["jquery", "d3evolution", "footable"],
-    function ($, D3Evolution) {
+define(["jquery", "app/common", "d3evolution", "d3pie", "d3", "footable"],
+    ($, common, D3Evolution, D3Pie, d3) => {
         "use strict";
 
-        var rrd_pie_config = {
-            header: {},
+        const rrd_pie_config = {
+            cornerRadius: 2,
             size: {
                 canvasWidth: 400,
                 canvasHeight: 180,
-                pieInnerRadius: "20%",
+                pieInnerRadius: "50%",
                 pieOuterRadius: "80%"
             },
             labels: {
@@ -42,156 +42,137 @@ define(["jquery", "d3evolution", "footable"],
                     format: "none"
                 },
                 inner: {
-                    hideWhenLessThanPercentage: 8
+                    hideWhenLessThanPercentage: 8,
+                    offset: 0
                 },
             },
-            misc: {
-                pieCenterOffset: {
-                    x: -120,
-                    y: 10,
-                },
-                gradient: {
-                    enabled: true,
-                },
+            padAngle: 0.02,
+            pieCenterOffset: {
+                x: -120,
+                y: 10,
+            },
+            total: {
+                enabled: true
             },
         };
 
-        var graph_options = {
-            title: "Rspamd throughput",
-            width: 1060,
-            height: 370,
-            yAxisLabel: "Message rate, msg/s",
+        const ui = {};
+        let prevUnit = "msg/s";
 
-            legend: {
-                space: 140,
-                entries: [{
-                    label: "reject",
-                    color: "#FF0000"
-                }, {
-                    label: "soft reject",
-                    color: "#BF8040"
-                }, {
-                    label: "rewrite subject",
-                    color: "#FF6600"
-                }, {
-                    label: "add header",
-                    color: "#FFAD00"
-                }, {
-                    label: "greylist",
-                    color: "#436EEE"
-                }, {
-                    label: "no action",
-                    color: "#66CC00"
-                }]
-            }
-        };
+        ui.draw = function (graphs, neighbours, checked_server, type) {
+            const graph_options = {
+                title: "Rspamd throughput",
+                width: 1060,
+                height: 370,
+                yAxisLabel: "Message rate, msg/s",
 
-        function initGraph(rspamd) {
-            var graph = new D3Evolution("graph", $.extend({}, graph_options, {
-                yScale: rspamd.getSelector("selYScale"),
-                type: rspamd.getSelector("selType"),
-                interpolate: rspamd.getSelector("selInterpolate"),
-                convert: rspamd.getSelector("selConvert"),
-            }));
-            $("#selYScale").change(function () {
-                graph.yScale(this.value);
-            });
-            $("#selConvert").change(function () {
-                graph.convert(this.value);
-            });
-            $("#selType").change(function () {
-                graph.type(this.value);
-            });
-            $("#selInterpolate").change(function () {
-                graph.interpolate(this.value);
-            });
-
-            return graph;
-        }
-
-        function getRrdSummary(json, scaleFactor) {
-            var xExtents = d3.extent(d3.merge(json), function (d) { return d.x; });
-            var timeInterval = xExtents[1] - xExtents[0];
-
-            var total = 0;
-            var rows = json.map(function (curr, i) {
-                // Time intervals that don't have data are excluded from average calculation as d3.mean()ignores nulls
-                var avg = d3.mean(curr, function (d) { return d.y; });
-                // To find an integral on the whole time interval we need to convert nulls to zeroes
-                var value = d3.mean(curr, function (d) { return Number(d.y); }) * timeInterval / scaleFactor ^ 0; // eslint-disable-line no-bitwise
-                var yExtents = d3.extent(curr, function (d) { return d.y; });
-
-                total += value;
-                return {
-                    label: graph_options.legend.entries[i].label,
-                    value: value,
-                    min: Number(yExtents[0].toFixed(6)),
-                    avg: Number(avg.toFixed(6)),
-                    max: Number(yExtents[1].toFixed(6)),
-                    last: Number(curr[curr.length - 1].y.toFixed(6)),
-                    color: graph_options.legend.entries[i].color,
-                };
-            }, []);
-
-            return {
-                rows: rows,
-                total: total
+                legend: {
+                    space: 140,
+                    entries: common.chartLegend
+                }
             };
-        }
 
-        function initSummaryTable(tables, rows, unit) {
-            tables.rrd_summary = FooTable.init("#rrd-table", {
-                sorting: {
-                    enabled: true
-                },
-                columns: [
-                    {name:"label", title:"Action"},
-                    {name:"value", title:"Messages", defaultContent:""},
-                    {name:"min", title:"Minimum, <span class=\"unit\">" + unit + "</span>", defaultContent:""},
-                    {name:"avg", title:"Average, <span class=\"unit\">" + unit + "</span>", defaultContent:""},
-                    {name:"max", title:"Maximum, <span class=\"unit\">" + unit + "</span>", defaultContent:""},
-                    {name:"last", title:"Last, " + unit},
-                ],
-                rows: rows.map(function (curr, i) {
+            function initGraph() {
+                const graph = new D3Evolution("graph", $.extend({}, graph_options, {
+                    yScale: common.getSelector("selYScale"),
+                    type: common.getSelector("selType"),
+                    interpolate: common.getSelector("selInterpolate"),
+                    convert: common.getSelector("selConvert"),
+                }));
+                $("#selYScale").change(function () {
+                    graph.yScale(this.value);
+                });
+                $("#selConvert").change(function () {
+                    graph.convert(this.value);
+                });
+                $("#selType").change(function () {
+                    graph.type(this.value);
+                });
+                $("#selInterpolate").change(function () {
+                    graph.interpolate(this.value);
+                });
+
+                return graph;
+            }
+
+            function getRrdSummary(json, scaleFactor) {
+                const xExtents = d3.extent(d3.merge(json), (d) => d.x);
+                const timeInterval = xExtents[1] - xExtents[0];
+
+                let total = 0;
+                const rows = json.map((curr, i) => {
+                    // Time intervals that don't have data are excluded from average calculation as d3.mean()ignores nulls
+                    const avg = d3.mean(curr, (d) => d.y);
+                    // To find an integral on the whole time interval we need to convert nulls to zeroes
+                    // eslint-disable-next-line no-bitwise
+                    const value = d3.mean(curr, (d) => Number(d.y)) * timeInterval / scaleFactor ^ 0;
+                    const yExtents = d3.extent(curr, (d) => d.y);
+
+                    total += value;
                     return {
+                        label: graph_options.legend.entries[i].label,
+                        value: value,
+                        min: Number(yExtents[0].toFixed(6)),
+                        avg: Number(avg.toFixed(6)),
+                        max: Number(yExtents[1].toFixed(6)),
+                        last: Number(curr[curr.length - 1].y.toFixed(6)),
+                        color: graph_options.legend.entries[i].color,
+                    };
+                }, []);
+
+                return {
+                    rows: rows,
+                    total: total
+                };
+            }
+
+            function initSummaryTable(rows, unit) {
+                common.tables.rrd_summary = FooTable.init("#rrd-table", {
+                    sorting: {
+                        enabled: true
+                    },
+                    columns: [
+                        {name: "label", title: "Action"},
+                        {name: "value", title: "Messages", defaultContent: ""},
+                        {name: "min", title: "Minimum, <span class=\"unit\">" + unit + "</span>", defaultContent: ""},
+                        {name: "avg", title: "Average, <span class=\"unit\">" + unit + "</span>", defaultContent: ""},
+                        {name: "max", title: "Maximum, <span class=\"unit\">" + unit + "</span>", defaultContent: ""},
+                        {name: "last", title: "Last, " + unit},
+                    ],
+                    rows: rows.map((curr, i) => ({
                         options: {
                             style: {
                                 color: graph_options.legend.entries[i].color
                             }
                         },
                         value: curr
-                    };
-                }, [])
-            });
-        }
-
-        function drawRrdTable(tables, rows, unit) {
-            if (Object.prototype.hasOwnProperty.call(tables, "rrd_summary")) {
-                $.each(tables.rrd_summary.rows.all, function (i, row) {
-                    row.val(rows[i], false, true);
+                    }), [])
                 });
-            } else {
-                initSummaryTable(tables, rows, unit);
             }
-        }
 
-        var ui = {};
-        var prevUnit = "msg/s";
+            function drawRrdTable(rows, unit) {
+                if (Object.prototype.hasOwnProperty.call(common.tables, "rrd_summary")) {
+                    $.each(common.tables.rrd_summary.rows.all, (i, row) => {
+                        row.val(rows[i], false, true);
+                    });
+                } else {
+                    initSummaryTable(rows, unit);
+                }
+            }
 
-        ui.draw = function (rspamd, graphs, tables, neighbours, checked_server, type) {
             function updateWidgets(data) {
-                var rrd_summary = {rows:[]};
-                var unit = "msg/s";
+                let rrd_summary = {rows: []};
+                let unit = "msg/s";
 
                 if (data) {
                     // Autoranging
-                    var scaleFactor = 1;
-                    var yMax = d3.max(d3.merge(data), function (d) { return d.y; });
+                    let scaleFactor = 1;
+                    const yMax = d3.max(d3.merge(data), (d) => d.y);
                     if (yMax < 1) {
                         scaleFactor = 60;
                         unit = "msg/min";
-                        data.forEach(function (s) {
-                            s.forEach(function (d) {
+                        data.forEach((s) => {
+                            s.forEach((d) => {
                                 if (d.y !== null) { d.y *= scaleFactor; }
                             });
                         });
@@ -200,39 +181,8 @@ define(["jquery", "d3evolution", "footable"],
                     rrd_summary = getRrdSummary(data, scaleFactor);
                 }
 
-                if (graphs.rrd_pie) {
-                    graphs.rrd_pie.destroy();
-                    delete graphs.rrd_pie;
-                }
-                if (rrd_summary.total) {
-                    graphs.rrd_pie = rspamd.drawPie(graphs.rrd_pie,
-                        "rrd-pie",
-                        rrd_summary.rows,
-                        rrd_pie_config);
-                } else {
-                    // Show grayed out pie as percentage is undefined
-                    graphs.rrd_pie = rspamd.drawPie(graphs.rrd_pie,
-                        "rrd-pie",
-                        [{
-                            value: 1,
-                            color: "#FFFFFF",
-                        }],
-                        $.extend({}, rrd_pie_config, {
-                            labels: {
-                                outer: {
-                                    format: "none"
-                                },
-                                inner: {
-                                    format: "none"
-                                },
-                            },
-                            tooltips: {
-                                enabled: true,
-                                string: "Undefined"
-                            },
-                        })
-                    );
-                }
+                if (!graphs.rrd_pie) graphs.rrd_pie = new D3Pie("rrd-pie", rrd_pie_config);
+                graphs.rrd_pie.data(rrd_summary.rows);
 
                 graphs.graph.data(data);
                 if (unit !== prevUnit) {
@@ -240,30 +190,31 @@ define(["jquery", "d3evolution", "footable"],
                     $(".unit").text(unit);
                     prevUnit = unit;
                 }
-                drawRrdTable(tables, rrd_summary.rows, unit);
+                drawRrdTable(rrd_summary.rows, unit);
                 document.getElementById("rrd-total-value").innerHTML = rrd_summary.total;
             }
 
             if (!graphs.graph) {
-                graphs.graph = initGraph(rspamd);
+                graphs.graph = initGraph();
             }
 
-            rspamd.query("graph", {
+
+            common.query("graph", {
                 success: function (req_data) {
-                    var data = null;
-                    var neighbours_data = req_data
-                        .filter(function (d) { return d.status; }) // filter out unavailable neighbours
-                        .map(function (d) { return d.data; });
+                    let data = null;
+                    const neighbours_data = req_data
+                        .filter((d) => d.status) // filter out unavailable neighbours
+                        .map((d) => d.data);
 
                     if (neighbours_data.length === 1) {
-                        data = neighbours_data[0];
+                        [data] = neighbours_data;
                     } else {
-                        var time_match = true;
-                        neighbours_data.reduce(function (res, curr, _, arr) {
+                        let time_match = true;
+                        neighbours_data.reduce((res, curr, _, arr) => {
                             if ((curr[0][0].x !== res[0][0].x) ||
                             (curr[0][curr[0].length - 1].x !== res[0][res[0].length - 1].x)) {
                                 time_match = false;
-                                rspamd.alertMessage("alert-error",
+                                common.alertMessage("alert-error",
                                     "Neighbours time extents do not match. Check if time is synchronized on all servers.");
                                 arr.splice(1); // Break out of .reduce() by mutating the source array
                             }
@@ -271,39 +222,31 @@ define(["jquery", "d3evolution", "footable"],
                         });
 
                         if (time_match) {
-                            data = neighbours_data.reduce(function (res, curr) {
-                                return curr.map(function (action, j) {
-                                    return action.map(function (d, i) {
-                                        return {
-                                            x: d.x,
-                                            y: (res[j][i].y === null) ? d.y : res[j][i].y + d.y
-                                        };
-                                    });
-                                });
-                            });
+                            data = neighbours_data.reduce((res, curr) => curr.map((action, j) => action.map((d, i) => ({
+                                x: d.x,
+                                y: (res[j][i].y === null) ? d.y : res[j][i].y + d.y
+                            }))));
                         }
                     }
                     updateWidgets(data);
                 },
+                complete: function () { $("#refresh").removeAttr("disabled").removeClass("disabled"); },
                 errorMessage: "Cannot receive throughput data",
                 errorOnceId: "alerted_graph_",
-                data: {type:type}
+                data: {type: type}
             });
         };
 
-        ui.setup = function (rspamd) {
-            // Handling mouse events on overlapping elements
-            $("#rrd-pie").mouseover(function () {
-                $("#rrd-pie").css("z-index", "200");
-                $("#rrd-table_toggle").css("z-index", "300");
-            });
-            $("#rrd-table_toggle").mouseover(function () {
-                $("#rrd-pie").css("z-index", "0");
-                $("#rrd-table_toggle").css("z-index", "0");
-            });
 
-            return rspamd.getSelector("selData");
-        };
+        // Handling mouse events on overlapping elements
+        $("#rrd-pie").mouseover(() => {
+            $("#rrd-pie,#rrd-pie-tooltip").css("z-index", "200");
+            $("#rrd-table_toggle").css("z-index", "300");
+        });
+        $("#rrd-table_toggle").mouseover(() => {
+            $("#rrd-pie,#rrd-pie-tooltip").css("z-index", "0");
+            $("#rrd-table_toggle").css("z-index", "0");
+        });
 
         return ui;
     });

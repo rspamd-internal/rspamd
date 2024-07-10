@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,10 +55,10 @@ reconf['INTRODUCTION'] = {
 local onion_uri_v2 = '/[a-z0-9]{16}\\.onion?/{url}i'
 local onion_uri_v3 = '/[a-z0-9]{56}\\.onion?/{url}i'
 reconf['HAS_ONION_URI'] = {
-    re = string.format('(%s | %s)', onion_uri_v2, onion_uri_v3),
-    description = 'Contains .onion hidden service URI',
-    score = 0.0,
-    group = 'experimental'
+  re = string.format('(%s | %s)', onion_uri_v2, onion_uri_v3),
+  description = 'Contains .onion hidden service URI',
+  score = 0.0,
+  group = 'url'
 }
 
 local my_victim = [[/(?:victim|prey)/{words}]]
@@ -82,7 +82,7 @@ reconf['LEAKED_PASSWORD_SCAM_RE'] = {
     check_data_images = function(task)
       local tp = task:get_text_parts() or {}
 
-      for _,p in ipairs(tp) do
+      for _, p in ipairs(tp) do
         if p:is_html() then
           local hc = p:get_html()
 
@@ -100,3 +100,18 @@ reconf['LEAKED_PASSWORD_SCAM_RE'] = {
 }
 
 rspamd_config:register_dependency('LEAKED_PASSWORD_SCAM', 'BITCOIN_ADDR')
+
+-- Heurististic for detecting InterPlanetary File System (IPFS) gateway URLs:
+-- These contain "ipfs" somewhere (either in the FQDN or the URL path) and a
+-- content identifier (CID), comprising of either "qm", followed by 44 alphanumerical
+-- characters (CIDv0), or a CIDv1 of an alphanumerical string of unspecified length,
+-- depending on the hash algorithm used, but starting with a multibase prefix.
+local ipfs_cid = '/(qm[a-z0-9]{44}|[079fvtbchkzmup][a-z0-9]{44,128})/{url}i'
+local ipfs_string = '/ipfs(\\.|-|_|\\/|\\?)/{url}i'
+reconf['HAS_IPFS_GATEWAY_URL'] = {
+  description = 'Message contains InterPlanetary File System (IPFS) gateway URL, likely malicious',
+  re = string.format('(%s & %s)', ipfs_cid, ipfs_string),
+  score = 6.0,
+  one_shot = true,
+  group = 'url',
+}

@@ -39,7 +39,7 @@ local settings = {
   csymbol_missing_mid_allowed = 'MISSING_MID_ALLOWED',
 }
 
-local map = {}
+local map
 
 local E = {}
 
@@ -48,7 +48,7 @@ local function known_mid_cb(task)
   local header = task:get_header('Message-Id')
   local das = task:get_symbol(settings['symbol_dkim_allow'])
   if ((das or E)[1] or E).options then
-    for _,dkim_domain in ipairs(das[1]['options']) do
+    for _, dkim_domain in ipairs(das[1]['options']) do
       if dkim_domain then
         local v = map:get_key(dkim_domain:match "[^:]+")
         if v then
@@ -70,13 +70,23 @@ local function known_mid_cb(task)
   end
 end
 
-local opts =  rspamd_config:get_all_opt('mid')
+local opts = rspamd_config:get_all_opt('mid')
 if opts then
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     settings[k] = v
   end
 
-  map = rspamd_map_add('mid', 'source', 'map', 'Message-IDs map')
+  if not opts.source then
+    rspamd_logger.infox(rspamd_config, 'mid module requires "source" parameter')
+    lua_util.disable_module(N, "config")
+    return
+  end
+
+  map = rspamd_config:add_map {
+    url = opts.source,
+    description = "Message-IDs map",
+    type = 'map'
+  }
   if map then
     local id = rspamd_config:register_symbol({
       name = 'KNOWN_MID_CALLBACK',
@@ -97,13 +107,17 @@ if opts then
       type = 'virtual'
     })
     rspamd_config:add_composite(settings['csymbol_invalid_msgid_allowed'],
-      settings['symbol_known_mid'] .. ' & ' .. settings['symbol_invalid_msgid'])
+        string.format('~%s & ^%s',
+            settings['symbol_known_mid'],
+            settings['symbol_invalid_msgid']))
     rspamd_config:add_composite(settings['csymbol_missing_mid_allowed'],
-      settings['symbol_known_no_mid'] .. ' & ' .. settings['symbol_missing_mid'])
+        string.format('~%s & ^%s',
+            settings['symbol_known_no_mid'],
+            settings['symbol_missing_mid']))
 
-    rspamd_config:register_dependency('KNOWN_MID_CALLBACK', settings['symbol_dkim_allow'])
+    rspamd_config:register_dependency('KNOWN_MID_CALLBACK', 'DKIM_CHECK')
   else
-    rspamd_logger.infox(rspamd_config, 'source is not specified, disabling module')
+    rspamd_logger.infox(rspamd_config, 'source is not a valid map definition, disabling module')
     lua_util.disable_module(N, "config")
   end
 end

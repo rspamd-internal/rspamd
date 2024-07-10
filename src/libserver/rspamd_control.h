@@ -20,9 +20,7 @@
 #include "mem_pool.h"
 #include "contrib/libev/ev.h"
 
-#ifdef  __cplusplus
-extern "C" {
-#endif
+G_BEGIN_DECLS
 
 struct rspamd_main;
 struct rspamd_worker;
@@ -38,6 +36,7 @@ enum rspamd_control_type {
 	RSPAMD_CONTROL_FUZZY_SYNC,
 	RSPAMD_CONTROL_MONITORED_CHANGE,
 	RSPAMD_CONTROL_CHILD_CHANGE,
+	RSPAMD_CONTROL_FUZZY_BLOCKED,
 	RSPAMD_CONTROL_MAX
 };
 
@@ -48,12 +47,15 @@ enum rspamd_srv_type {
 	RSPAMD_SRV_LOG_PIPE,
 	RSPAMD_SRV_ON_FORK,
 	RSPAMD_SRV_HEARTBEAT,
+	RSPAMD_SRV_HEALTH,
+	RSPAMD_SRV_NOTICE_HYPERSCAN_CACHE,
+	RSPAMD_SRV_FUZZY_BLOCKED, /* Used to notify main process about a blocked ip */
 };
 
 enum rspamd_log_pipe_type {
 	RSPAMD_LOG_PIPE_SYMBOLS = 0,
 };
-#define CONTROL_PATHLEN 400
+#define CONTROL_PATHLEN MIN(PATH_MAX, PIPE_BUF - sizeof(int) * 2 - sizeof(gint64) * 2)
 struct rspamd_control_command {
 	enum rspamd_control_type type;
 	union {
@@ -70,8 +72,8 @@ struct rspamd_control_command {
 			guint unused;
 		} recompile;
 		struct {
-			gchar cache_dir[CONTROL_PATHLEN];
 			gboolean forced;
+			gchar cache_dir[CONTROL_PATHLEN];
 		} hs_loaded;
 		struct {
 			gchar tag[32];
@@ -96,6 +98,14 @@ struct rspamd_control_command {
 			pid_t pid;
 			guint additional;
 		} child_change;
+		struct {
+			union {
+				struct sockaddr sa;
+				struct sockaddr_in s4;
+				struct sockaddr_in6 s6;
+			} addr;
+			sa_family_t af;
+		} fuzzy_blocked;
 	} cmd;
 };
 
@@ -134,6 +144,9 @@ struct rspamd_control_reply {
 		struct {
 			guint status;
 		} fuzzy_sync;
+		struct {
+			guint status;
+		} fuzzy_blocked;
 	} reply;
 };
 
@@ -149,8 +162,8 @@ struct rspamd_srv_command {
 			guint pair_num;
 		} spair;
 		struct {
-			gchar cache_dir[CONTROL_PATHLEN];
 			gboolean forced;
+			gchar cache_dir[CONTROL_PATHLEN];
 		} hs_loaded;
 		struct {
 			gchar tag[32];
@@ -172,6 +185,22 @@ struct rspamd_srv_command {
 			guint status;
 			/* TODO: add more fields */
 		} heartbeat;
+		struct {
+			guint status;
+		} health;
+		/* Used when a worker loads a valid hyperscan file */
+		struct {
+			char path[CONTROL_PATHLEN];
+		} hyperscan_cache_file;
+		/* Send when one worker has blocked some IP address */
+		struct {
+			union {
+				struct sockaddr sa;
+				struct sockaddr_in s4;
+				struct sockaddr_in6 s6;
+			} addr;
+			sa_family_t af;
+		} fuzzy_blocked;
 	} cmd;
 };
 
@@ -197,58 +226,70 @@ struct rspamd_srv_reply {
 		struct {
 			gint status;
 		} heartbeat;
+		struct {
+			guint status;
+			guint workers_count;
+			guint scanners_count;
+			guint workers_hb_lost;
+		} health;
+		struct {
+			int unused;
+		} hyperscan_cache_file;
+		struct {
+			int unused;
+		} fuzzy_blocked;
 	} reply;
 };
 
-typedef gboolean (*rspamd_worker_control_handler) (struct rspamd_main *rspamd_main,
-												   struct rspamd_worker *worker,
-												   gint fd,
-												   gint attached_fd,
-												   struct rspamd_control_command *cmd,
-												   gpointer ud);
+typedef gboolean (*rspamd_worker_control_handler)(struct rspamd_main *rspamd_main,
+												  struct rspamd_worker *worker,
+												  gint fd,
+												  gint attached_fd,
+												  struct rspamd_control_command *cmd,
+												  gpointer ud);
 
-typedef void (*rspamd_srv_reply_handler) (struct rspamd_worker *worker,
-										  struct rspamd_srv_reply *rep, gint rep_fd,
-										  gpointer ud);
+typedef void (*rspamd_srv_reply_handler)(struct rspamd_worker *worker,
+										 struct rspamd_srv_reply *rep, gint rep_fd,
+										 gpointer ud);
 
 /**
  * Process client socket connection
  */
-void rspamd_control_process_client_socket (struct rspamd_main *rspamd_main,
-										   gint fd, rspamd_inet_addr_t *addr);
+void rspamd_control_process_client_socket(struct rspamd_main *rspamd_main,
+										  gint fd, rspamd_inet_addr_t *addr);
 
 /**
  * Register default handlers for a worker
  */
-void rspamd_control_worker_add_default_cmd_handlers (struct rspamd_worker *worker,
-													 struct ev_loop *ev_base);
+void rspamd_control_worker_add_default_cmd_handlers(struct rspamd_worker *worker,
+													struct ev_loop *ev_base);
 
 /**
  * Register custom handler for a specific control command for this worker
  */
-void rspamd_control_worker_add_cmd_handler (struct rspamd_worker *worker,
-											enum rspamd_control_type type,
-											rspamd_worker_control_handler handler,
-											gpointer ud);
+void rspamd_control_worker_add_cmd_handler(struct rspamd_worker *worker,
+										   enum rspamd_control_type type,
+										   rspamd_worker_control_handler handler,
+										   gpointer ud);
 
 /**
  * Start watching on srv pipe
  */
-void rspamd_srv_start_watching (struct rspamd_main *srv,
-								struct rspamd_worker *worker,
-								struct ev_loop *ev_base);
+void rspamd_srv_start_watching(struct rspamd_main *srv,
+							   struct rspamd_worker *worker,
+							   struct ev_loop *ev_base);
 
 
 /**
  * Send command to srv pipe and read reply calling the specified callback at the
  * end
  */
-void rspamd_srv_send_command (struct rspamd_worker *worker,
-							  struct ev_loop *ev_base,
-							  struct rspamd_srv_command *cmd,
-							  gint attached_fd,
-							  rspamd_srv_reply_handler handler,
-							  gpointer ud);
+void rspamd_srv_send_command(struct rspamd_worker *worker,
+							 struct ev_loop *ev_base,
+							 struct rspamd_srv_command *cmd,
+							 gint attached_fd,
+							 rspamd_srv_reply_handler handler,
+							 gpointer ud);
 
 /**
  * Broadcast srv cmd from rspamd_main to workers
@@ -256,32 +297,32 @@ void rspamd_srv_send_command (struct rspamd_worker *worker,
  * @param cmd
  * @param except_pid
  */
-void rspamd_control_broadcast_srv_cmd (struct rspamd_main *rspamd_main,
-									   struct rspamd_control_command *cmd,
-									   pid_t except_pid);
+void rspamd_control_broadcast_srv_cmd(struct rspamd_main *rspamd_main,
+									  struct rspamd_control_command *cmd,
+									  pid_t except_pid);
 
 /**
  * Returns command from a specified string (case insensitive)
  * @param str
  * @return
  */
-enum rspamd_control_type rspamd_control_command_from_string (const gchar *str);
+enum rspamd_control_type rspamd_control_command_from_string(const gchar *str);
 
 /**
  * Returns command name from it's type
  * @param cmd
  * @return
  */
-const gchar *rspamd_control_command_to_string (enum rspamd_control_type cmd);
+const gchar *rspamd_control_command_to_string(enum rspamd_control_type cmd);
+
+const gchar *rspamd_srv_command_to_string(enum rspamd_srv_type cmd);
 
 /**
  * Used to cleanup pending events
  * @param p
  */
-void rspamd_pending_control_free (gpointer p);
+void rspamd_pending_control_free(gpointer p);
 
-#ifdef  __cplusplus
-}
-#endif
+G_END_DECLS
 
 #endif

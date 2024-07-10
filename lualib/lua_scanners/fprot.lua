@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,22 +78,21 @@ local function fprot_config(opts)
   return nil
 end
 
-local function fprot_check(task, content, digest, rule)
+local function fprot_check(task, content, digest, rule, maybe_part)
   local function fprot_check_uncached ()
     local upstream = rule.upstreams:get_upstream_round_robin()
     local addr = upstream:get_addr()
     local retransmits = rule.retransmits
     local scan_id = task:get_queue_id()
-    if not scan_id then scan_id = task:get_uid() end
+    if not scan_id then
+      scan_id = task:get_uid()
+    end
     local header = string.format('SCAN STREAM %s SIZE %d\n', scan_id,
         #content)
     local footer = '\n'
 
     local function fprot_callback(err, data)
       if err then
-        -- set current upstream to fail because an error occurred
-        upstream:fail()
-
         -- retry with another upstream until retransmits exceeds
         if retransmits > 0 then
 
@@ -110,6 +109,7 @@ local function fprot_check(task, content, digest, rule)
             task = task,
             host = addr:to_string(),
             port = addr:get_port(),
+            upstream = upstream,
             timeout = rule['timeout'],
             callback = fprot_callback,
             data = { header, content, footer },
@@ -119,7 +119,8 @@ local function fprot_check(task, content, digest, rule)
           rspamd_logger.errx(task,
               '%s [%s]: failed to scan, maximum retransmits exceed',
               rule['symbol'], rule['type'])
-          common.yield_result(task, rule, 'failed to scan and retransmits exceed', 0.0, 'fail')
+          common.yield_result(task, rule, 'failed to scan and retransmits exceed',
+              0.0, 'fail', maybe_part)
         end
       else
         upstream:ok()
@@ -134,18 +135,18 @@ local function fprot_check(task, content, digest, rule)
                 rule['symbol'], rule['type'])
           end
         else
-          -- returncodes: 1: infected, 2: suspicious, 3: both, 4-255: some error occured
+          -- returncodes: 1: infected, 2: suspicious, 3: both, 4-255: some error occurred
           -- see http://www.f-prot.com/support/helpfiles/unix/appendix_c.html for more detail
           local vname = string.match(data, '^[1-3] <[%w%s]-: (.-)>')
           if not vname then
             rspamd_logger.errx(task, 'Unhandled response: %s', data)
           else
-            common.yield_result(task, rule, vname)
+            common.yield_result(task, rule, vname, 1.0, nil, maybe_part)
             cached = vname
           end
         end
         if cached then
-          common.save_cache(task, digest, rule, cached)
+          common.save_cache(task, digest, rule, cached, 1.0, maybe_part)
         end
       end
     end
@@ -154,6 +155,7 @@ local function fprot_check(task, content, digest, rule)
       task = task,
       host = addr:to_string(),
       port = addr:get_port(),
+      upstream = upstream,
       timeout = rule['timeout'],
       callback = fprot_callback,
       data = { header, content, footer },
@@ -161,7 +163,8 @@ local function fprot_check(task, content, digest, rule)
     })
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, fprot_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      fprot_check_uncached, maybe_part) then
     return
   else
     fprot_check_uncached()

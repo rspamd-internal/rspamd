@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,7 +78,7 @@ local function sophos_config(opts)
   return nil
 end
 
-local function sophos_check(task, content, digest, rule)
+local function sophos_check(task, content, digest, rule, maybe_part)
   local function sophos_check_uncached ()
     local upstream = rule.upstreams:get_upstream_round_robin()
     local addr = upstream:get_addr()
@@ -90,9 +90,6 @@ local function sophos_check(task, content, digest, rule)
     local function sophos_callback(err, data, conn)
 
       if err then
-        -- set current upstream to fail because an error occurred
-        upstream:fail()
-
         -- retry with another upstream until retransmits exceeds
         if retransmits > 0 then
 
@@ -109,24 +106,25 @@ local function sophos_check(task, content, digest, rule)
             task = task,
             host = addr:to_string(),
             port = addr:get_port(),
+            upstream = upstream,
             timeout = rule['timeout'],
             callback = sophos_callback,
             data = { protocol, streamsize, content, bye }
           })
         else
           rspamd_logger.errx(task, '%s [%s]: failed to scan, maximum retransmits exceed', rule['symbol'], rule['type'])
-          common.yield_result(task, rule, 'failed to scan and retransmits exceed', 0.0, 'fail')
+          common.yield_result(task, rule, 'failed to scan and retransmits exceed',
+              0.0, 'fail', maybe_part)
         end
       else
-        upstream:ok()
         data = tostring(data)
         lua_util.debugm(rule.name, task,
             '%s [%s]: got reply: %s', rule['symbol'], rule['type'], data)
         local vname = string.match(data, 'VIRUS (%S+) ')
         local cached
         if vname then
-          common.yield_result(task, rule, vname)
-          common.save_cache(task, digest, rule, vname)
+          common.yield_result(task, rule, vname, 1.0, nil, maybe_part)
+          common.save_cache(task, digest, rule, vname, 1.0, maybe_part)
         else
           if string.find(data, 'DONE OK') then
             if rule['log_clean'] then
@@ -141,21 +139,25 @@ local function sophos_check(task, content, digest, rule)
             conn:add_read(sophos_callback)
           elseif string.find(data, 'FAIL 0212') then
             rspamd_logger.warnx(task, 'Message is encrypted (FAIL 0212): %s', data)
-            common.yield_result(task, rule, 'SAVDI: Message is encrypted (FAIL 0212)', 0.0, 'encrypted')
+            common.yield_result(task, rule, 'SAVDI: Message is encrypted (FAIL 0212)',
+                0.0, 'encrypted', maybe_part)
             cached = 'ENCRYPTED'
           elseif string.find(data, 'REJ 4') then
             rspamd_logger.warnx(task, 'Message is oversized (REJ 4): %s', data)
-            common.yield_result(task, rule, 'SAVDI: Message oversized (REJ 4)', 0.0, 'fail')
-            -- excplicitly set REJ1 message when SAVDIreports a protocol error
+            common.yield_result(task, rule, 'SAVDI: Message oversized (REJ 4)',
+                0.0, 'fail', maybe_part)
+            -- explicitly set REJ1 message when SAVDIreports a protocol error
           elseif string.find(data, 'REJ 1') then
             rspamd_logger.errx(task, 'SAVDI (Protocol error (REJ 1)): %s', data)
-            common.yield_result(task, rule, 'SAVDI: Protocol error (REJ 1)', 0.0, 'fail')
+            common.yield_result(task, rule, 'SAVDI: Protocol error (REJ 1)',
+                0.0, 'fail', maybe_part)
           else
             rspamd_logger.errx(task, 'unhandled response: %s', data)
-            common.yield_result(task, rule, 'unhandled response: ' .. data, 0.0, 'fail')
+            common.yield_result(task, rule, 'unhandled response: ' .. data,
+                0.0, 'fail', maybe_part)
           end
           if cached then
-            common.save_cache(task, digest, rule, cached)
+            common.save_cache(task, digest, rule, cached, 1.0, maybe_part)
           end
         end
       end
@@ -165,13 +167,15 @@ local function sophos_check(task, content, digest, rule)
       task = task,
       host = addr:to_string(),
       port = addr:get_port(),
+      upstream = upstream,
       timeout = rule['timeout'],
       callback = sophos_callback,
       data = { protocol, streamsize, content, bye }
     })
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, sophos_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      sophos_check_uncached, maybe_part) then
     return
   else
     sophos_check_uncached()

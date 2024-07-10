@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2020, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -81,7 +81,7 @@ local function avast_config(opts)
   return nil
 end
 
-local function avast_check(task, content, digest, rule)
+local function avast_check(task, content, digest, rule, maybe_part)
   local function avast_check_uncached ()
     local upstream = rule.upstreams:get_upstream_round_robin()
     local addr = upstream:get_addr()
@@ -93,6 +93,7 @@ local function avast_check(task, content, digest, rule)
       stop_pattern = CRLF,
       host = addr:to_string(),
       port = addr:get_port(),
+      upstream = upstream,
       timeout = rule.timeout,
       task = task
     }
@@ -148,13 +149,14 @@ local function avast_check(task, content, digest, rule)
             '%s [%s]: failed to scan, maximum retransmits exceed',
             rule['symbol'], rule['type'])
         common.yield_result(task, rule, 'failed to scan and retransmits exceed',
-            0.0, 'fail')
+            0.0, 'fail', maybe_part)
 
         return
       end
 
       upstream = rule.upstreams:get_upstream_round_robin()
       addr = upstream:get_addr()
+      tcp_opts.upstream = upstream
       tcp_opts.callback = avast_helo_cb
 
       local is_succ, err = tcp.request(tcp_opts)
@@ -187,7 +189,7 @@ local function avast_check(task, content, digest, rule)
 
 
     -- Define callbacks
-    avast_helo_cb = function (merr, mdata, conn)
+    avast_helo_cb = function(merr, mdata, conn)
       -- Called when we have established a connection but not read anything
       tcp_conn = conn
 
@@ -201,7 +203,6 @@ local function avast_check(task, content, digest, rule)
         end
       end
     end
-
 
     avast_scan_cb = function(merr)
       -- Called when we have send request to avast and are waiting for reply
@@ -224,7 +225,6 @@ local function avast_check(task, content, digest, rule)
             end
           elseif beg == '200' then
             -- Final line
-            upstream:ok()
             if tcp_conn then
               tcp_conn:close()
               tcp_conn = nil
@@ -251,7 +251,7 @@ local function avast_check(task, content, digest, rule)
 
                 if vname then
                   vname = vname:gsub('\\ ', ' '):gsub('\\\\', '\\')
-                  common.yield_result(task, rule, vname)
+                  common.yield_result(task, rule, vname, 1.0, nil, maybe_part)
                   cached = vname
                 end
               end
@@ -263,12 +263,12 @@ local function avast_check(task, content, digest, rule)
               if ret then
                 rspamd_logger.errx(task, '%s: error: %s', rule.log_prefix, ret[1][2])
                 common.yield_result(task, rule, 'error:' .. ret[1][2],
-                    0.0, 'fail')
+                    0.0, 'fail', maybe_part)
               end
             end
 
             if cached then
-              common.save_cache(task, digest, rule, cached)
+              common.save_cache(task, digest, rule, cached, 1.0, maybe_part)
             else
               -- Unexpected reply
               rspamd_logger.errx(task, '%s: unexpected reply: %s', rule.log_prefix, mdata)
@@ -286,7 +286,8 @@ local function avast_check(task, content, digest, rule)
     maybe_retransmit()
   end
 
-  if common.condition_check_and_continue(task, content, rule, digest, avast_check_uncached) then
+  if common.condition_check_and_continue(task, content, rule, digest,
+      avast_check_uncached, maybe_part) then
     return
   else
     avast_check_uncached()

@@ -19,7 +19,7 @@
 
 #include "config.h"
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -29,7 +29,7 @@ extern "C" {
  * @param len length of header
  * @return time_t or (time_t)-1 in case of error
  */
-time_t rspamd_http_parse_date (const gchar *header, gsize len);
+time_t rspamd_http_parse_date(const gchar *header, gsize len);
 
 /**
  * Prints HTTP date from `time` to `buf` using standard HTTP date format
@@ -38,18 +38,9 @@ time_t rspamd_http_parse_date (const gchar *header, gsize len);
  * @param time time in unix seconds
  * @return number of bytes written
  */
-glong rspamd_http_date_format (gchar *buf, gsize len, time_t time);
+glong rspamd_http_date_format(gchar *buf, gsize len, time_t time);
 
-/**
- * Normalize HTTP path removing dot sequences and repeating '/' symbols as
- * per rfc3986#section-5.2
- * @param path
- * @param len
- * @param nlen
- */
-void rspamd_http_normalize_path_inplace (gchar *path, guint len, guint *nlen);
-
-#ifdef  __cplusplus
+#ifdef __cplusplus
 }
 #endif
 

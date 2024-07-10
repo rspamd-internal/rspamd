@@ -9,7 +9,6 @@ SET(RSPAMADMSRC rspamadm.c
         stat_convert.c
         signtool.c
         lua_repl.c
-        dkim_keygen.c
         ${CMAKE_BINARY_DIR}/src/workers.c
         #${CMAKE_BINARY_DIR}/src/modules.c - defined in rspamdserver
         ${CMAKE_SOURCE_DIR}/src/controller.c
@@ -27,8 +26,6 @@ IF (NOT DEBIAN_BUILD)
     SET_TARGET_PROPERTIES(rspamadm PROPERTIES VERSION ${RSPAMD_VERSION})
 ENDIF (NOT DEBIAN_BUILD)
 
-IF(USE_CXX_LINKER)
-    SET_TARGET_PROPERTIES(rspamadm PROPERTIES LINKER_LANGUAGE CXX)
-ENDIF()
-
+SET_TARGET_PROPERTIES(rspamadm PROPERTIES LINKER_LANGUAGE CXX)
+ADD_BACKWARD(rspamadm)
 INSTALL(TARGETS rspamadm RUNTIME DESTINATION bin)

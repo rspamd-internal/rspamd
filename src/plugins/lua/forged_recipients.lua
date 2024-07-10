@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2015, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ end
 
 local symbol_rcpt = 'FORGED_RECIPIENTS'
 local symbol_sender = 'FORGED_SENDER'
+local rspamd_util = require "rspamd_util"
 
 local E = {}
 
@@ -39,10 +40,14 @@ local function check_forged_headers(task)
   local smtp_rcpts = task:get_recipients(1)
   local smtp_from = task:get_from(1)
 
-  if not smtp_rcpts then return end
-  if #smtp_rcpts == 0 then return end
+  if not smtp_rcpts then
+    return
+  end
+  if #smtp_rcpts == 0 then
+    return
+  end
 
-  local mime_rcpts = task:get_recipients({ 'mime', 'orig'})
+  local mime_rcpts = task:get_recipients({ 'mime', 'orig' })
 
   if not mime_rcpts then
     return
@@ -87,10 +92,10 @@ local function check_forged_headers(task)
     end
   end
 
-  for _,mime_rcpt in ipairs(mime_rcpts) do
+  for _, mime_rcpt in ipairs(mime_rcpts) do
     if mime_rcpt.addr and mime_rcpt.addr ~= '' then
       local addr = string.lower(mime_rcpt.addr)
-      local dom =  string.lower(mime_rcpt.domain)
+      local dom = string.lower(mime_rcpt.domain)
       local matched_smtp_addr = smtp_rcpt_map[addr]
       if matched_smtp_addr then
         -- Direct match, go forward
@@ -118,15 +123,15 @@ local function check_forged_headers(task)
   local opts = {}
   local seen_mime_unmatched = false
   local seen_smtp_unmatched = false
-  for _,mime_rcpt in ipairs(mime_rcpts) do
+  for _, mime_rcpt in ipairs(mime_rcpts) do
     if not mime_rcpt.matched then
       seen_mime_unmatched = true
       table.insert(opts, 'm:' .. mime_rcpt.addr)
     end
   end
-  for _,smtp_rcpt in ipairs(smtp_rcpts) do
+  for _, smtp_rcpt in ipairs(smtp_rcpts) do
     if not smtp_rcpt.matched then
-      if not smtp_rcpt_domain_map[smtp_rcpt.domain]._seen_mime_domain then
+      if not smtp_rcpt_domain_map[smtp_rcpt.domain:lower()]._seen_mime_domain then
         seen_smtp_unmatched = true
         table.insert(opts, 's:' .. smtp_rcpt.addr)
       end
@@ -141,14 +146,14 @@ local function check_forged_headers(task)
   if smtp_from and smtp_from[1] and smtp_from[1]['addr'] ~= '' then
     local mime_from = task:get_from(2)
     if not mime_from or not mime_from[1] or
-      not (string.lower(mime_from[1]['addr']) == string.lower(smtp_from[1]['addr'])) then
+        not rspamd_util.strequal_caseless_utf8(mime_from[1]['addr'], smtp_from[1]['addr']) then
       task:insert_result(symbol_sender, 1, ((mime_from or E)[1] or E).addr or '', smtp_from[1].addr)
     end
   end
 end
 
 -- Configuration
-local opts =  rspamd_config:get_all_opt('forged_recipients')
+local opts = rspamd_config:get_all_opt('forged_recipients')
 if opts then
   if opts['symbol_rcpt'] or opts['symbol_sender'] then
     local id = rspamd_config:register_symbol({
@@ -168,7 +173,7 @@ if opts then
     end
     if opts['symbol_sender'] then
       symbol_sender = opts['symbol_sender']
-       rspamd_config:register_symbol({
+      rspamd_config:register_symbol({
         name = symbol_sender,
         type = 'virtual',
         parent = id,

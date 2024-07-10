@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 --[[[
 -- @module virustotal
--- This module contains Virustotal integaration support
+-- This module contains Virustotal integration support
 -- https://www.virustotal.com/
 --]]
 
@@ -74,7 +74,7 @@ local function virustotal_config(opts)
   return default_conf
 end
 
-local function virustotal_check(task, content, digest, rule)
+local function virustotal_check(task, content, digest, rule, maybe_part)
   local function virustotal_check_uncached()
     local function make_url(hash)
       return string.format('%s/report?apikey=%s&resource=%s',
@@ -123,7 +123,7 @@ local function virustotal_check(task, content, digest, rule)
         else
           local ucl = require "ucl"
           local parser = ucl.parser()
-          local res,json_err = parser:parse_string(body)
+          local res, json_err = parser:parse_string(body)
 
           lua_util.debugm(rule.name, task, '%s: got reply data: "%s"',
               rule.log_prefix, body)
@@ -172,7 +172,7 @@ local function virustotal_check(task, content, digest, rule)
                 end
                 local sopt = string.format("%s:%s/%s",
                     hash, obj.positives, obj.total)
-                common.yield_result(task, rule, sopt, dyn_score)
+                common.yield_result(task, rule, sopt, dyn_score, nil, maybe_part)
                 cached = sopt
               end
             end
@@ -186,7 +186,7 @@ local function virustotal_check(task, content, digest, rule)
         end
 
         if cached then
-          common.save_cache(task, digest, rule, cached, dyn_score)
+          common.save_cache(task, digest, rule, cached, dyn_score, maybe_part)
         end
       end
     end

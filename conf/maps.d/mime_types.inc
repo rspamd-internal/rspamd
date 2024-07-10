@@ -199,6 +199,7 @@ application/p2p-overlay+xml 0
 application/patch-ops-error+xml 0
 application/pdf 0
 application/pgp-encrypted 0
+application/pgp-keys 0
 application/pgp-signature 0
 application/pidf+xml 0
 application/pidf-diff+xml 0
@@ -1341,6 +1342,8 @@ image/vnd.tencent.tap 0
 image/vnd.valve.source.texture 0
 image/vnd.xiff 0
 image/vnd.zbrush.pcx 0
+image/wmf 0
+image/x-wmf 0
 message/CPIM 0
 message/delivery-status 0
 message/disposition-notification 0
@@ -1354,6 +1357,7 @@ message/http 0
 message/imdn+xml 0
 message/news 0
 message/rfc822 0
+message/rfc822-headers 0
 message/s-http 0
 message/sip 0
 message/sipfrag 0

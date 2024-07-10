@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2016, Andrew Lewis <nerf@judo.za.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,15 +71,17 @@ local function asn_check(task)
       if dns_err and (dns_err ~= 'requested record is not found' and dns_err ~= 'no records with this name') then
         rspamd_logger.errx(task, 'error querying dns "%s" on %s: %s',
             req_name, serv, dns_err)
+        task:insert_result(options['symbol_fail'], 0, string.format('%s:%s', req_name, dns_err))
+        return
       end
-      if not (results and results[1]) then
-        rspamd_logger.infox(task, 'cannot query ip %s on %s: no results',
+      if not results or not results[1] then
+        rspamd_logger.infox(task, 'no ASN information is available for the IP address "%s" on %s',
             req_name, serv)
         return
       end
 
       lua_util.debugm(N, task, 'got reply from %s when requesting %s: %s',
-        serv, req_name, results[1])
+          serv, req_name, results[1])
 
       local parts = rspamd_re:split(results[1])
       -- "15169 | 8.8.8.0/24 | US | arin |" for 8.8.8.8
@@ -104,9 +106,9 @@ end
 
 -- Configuration options
 local configure_asn_module = function()
-  local opts =  rspamd_config:get_all_opt('asn')
+  local opts = rspamd_config:get_all_opt('asn')
   if opts then
-    for k,v in pairs(opts) do
+    for k, v in pairs(opts) do
       options[k] = v
     end
   end
@@ -126,6 +128,13 @@ local configure_asn_module = function()
     rspamd_logger.errx("Unknown provider_type: %s", options['provider_type'])
     return false
   end
+
+  if options['symbol'] then
+    options['symbol_fail'] = options['symbol'] .. '_FAIL'
+  else
+    options['symbol_fail'] = 'ASN_FAIL'
+  end
+
   return true
 end
 
@@ -134,18 +143,26 @@ if configure_asn_module() then
     name = 'ASN_CHECK',
     type = 'prefilter',
     callback = asn_check,
-    priority = 8,
+    priority = lua_util.symbols_priorities.high,
     flags = 'empty,nostat',
+    augmentations = { lua_util.dns_timeout_augmentation(rspamd_config) },
   })
   if options['symbol'] then
     rspamd_config:register_symbol({
       name = options['symbol'],
       parent = id,
       type = 'virtual',
-      flags = 'empty',
+      flags = 'empty,nostat',
       score = 0,
     })
   end
+  rspamd_config:register_symbol {
+    name = options['symbol_fail'],
+    parent = id,
+    type = 'virtual',
+    flags = 'empty,nostat',
+    score = 0,
+  }
 else
   lua_util.disable_module(N, 'config')
 end

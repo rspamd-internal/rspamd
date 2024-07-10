@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2017-2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,11 +40,10 @@ local default_prefix = 'RR:' -- Rspamd Reputation
 
 local tanh = math.tanh or rspamd_util.tanh
 
-local reject_threshold = rspamd_config:get_action('reject') or 10.0
-
 -- Get reputation from ham/spam/probable hits
 local function generic_reputation_calc(token, rule, mult, task)
   local cfg = rule.selector.config or E
+  local reject_threshold = task:get_metric_score()[2] or 10.0
 
   if cfg.score_calc_func then
     return cfg.score_calc_func(rule, token, mult)
@@ -64,20 +63,35 @@ local function generic_reputation_calc(token, rule, mult, task)
   -- Apply function tanh(x / reject_score * atanh(0.95) - atanh(0.5))
   --                                        1.83178       0.5493
   local score = tanh(avg_score / reject_threshold * 1.83178 - 0.5493) * mult
-  lua_util.debugm(N, task, "got generic average score %s -> %s for rule %s",
-      avg_score, score, rule.symbol)
+  lua_util.debugm(N, task, "got generic average score %s (reject threshold=%s, mult=%s) -> %s for rule %s",
+      avg_score, reject_threshold, mult, score, rule.symbol)
   return score
 end
 
 local function add_symbol_score(task, rule, mult, params)
-  if not params then params = {tostring(mult)};
-
+  if not params then
+    params = { tostring(mult) }
   end
+
   if rule.selector.config.split_symbols then
+    local sym_spam = rule.symbol .. '_SPAM'
+    local sym_ham = rule.symbol .. '_HAM'
+    if not rule.static_symbols then
+      rule.static_symbols = {}
+      rule.static_symbols.ham = rspamd_config:get_symbol(sym_ham)
+      rule.static_symbols.spam = rspamd_config:get_symbol(sym_spam)
+    end
     if mult >= 0 then
-      task:insert_result(rule.symbol .. '_SPAM', mult, params)
+      task:insert_result(sym_spam, mult, params)
     else
-      task:insert_result(rule.symbol .. '_HAM', mult, params)
+      -- Avoid multiplication of negative the `mult` by negative static score of the
+      -- ham symbol
+      if rule.static_symbols.ham and rule.static_symbols.ham.score then
+        if rule.static_symbols.ham.score < 0 then
+          mult = math.abs(mult)
+        end
+      end
+      task:insert_result(sym_ham, mult, params)
     end
   else
     task:insert_result(rule.symbol, mult, params)
@@ -110,9 +124,11 @@ end
 -- Extracts task score and subtracts score of the rule itself
 local function extract_task_score(task, rule)
   local lua_verdict = require "lua_verdict"
-  local verdict,score = lua_verdict.get_specific_verdict(N, task)
+  local verdict, score = lua_verdict.get_specific_verdict(N, task)
 
-  if not score or verdict == 'passthrough' then return nil end
+  if not score or verdict == 'passthrough' then
+    return nil
+  end
 
   return sub_symbol_score(task, rule, score)
 end
@@ -126,23 +142,25 @@ local function gen_dkim_queries(task, rule)
 
   if not gr then
     local semicolon = lpeg.P(':')
-    local domain = lpeg.C((1 - semicolon)^1)
-    local res = lpeg.S'+-?~'
+    local domain = lpeg.C((1 - semicolon) ^ 1)
+    local res = lpeg.S '+-?~'
 
     local function res_to_label(ch)
-      if ch == '+' then return 'a'
-      elseif ch == '-' then return 'r'
+      if ch == '+' then
+        return 'a'
+      elseif ch == '-' then
+        return 'r'
       end
 
       return 'u'
     end
 
-    gr = domain * semicolon * (lpeg.C(res^1) / res_to_label)
+    gr = domain * semicolon * (lpeg.C(res ^ 1) / res_to_label)
   end
 
   if dkim_trace and dkim_trace.options then
-    for _,opt in ipairs(dkim_trace.options) do
-      local dom,res = lpeg.match(gr, opt)
+    for _, opt in ipairs(dkim_trace.options) do
+      local dom, res = lpeg.match(gr, opt)
 
       if dom and res then
         local tld = rspamd_util.get_tld(dom)
@@ -157,47 +175,65 @@ end
 local function dkim_reputation_filter(task, rule)
   local requests = gen_dkim_queries(task, rule)
   local results = {}
-  local nchecked = 0
+  local dkim_tlds = lua_util.keys(requests)
+  local requests_left = #dkim_tlds
   local rep_accepted = 0.0
-  local rep_rejected = 0.0
 
   lua_util.debugm(N, task, 'dkim reputation tokens: %s', requests)
 
   local function tokens_cb(err, token, values)
-    nchecked = nchecked + 1
+    requests_left = requests_left - 1
 
     if values then
       results[token] = values
     end
 
-    if nchecked == #requests then
-      for k,v in pairs(results) do
-        if requests[k] == 'a' then
-          rep_accepted = rep_accepted + generic_reputation_calc(v, rule, 1.0, task)
-        elseif requests[k] == 'r' then
-          rep_rejected = rep_rejected + generic_reputation_calc(v, rule, 1.0, task)
+    if requests_left == 0 then
+      for k, v in pairs(results) do
+        -- `k` in results is a prefixed and suffixed tld, so we need to look through
+        -- all requests to find any request with the matching tld
+        local sel_tld
+        for _, tld in ipairs(dkim_tlds) do
+          if k:find(tld, 1, true) then
+            sel_tld = tld
+            break
+          end
+        end
+
+        if sel_tld and requests[sel_tld] then
+          if requests[sel_tld] == 'a' then
+            rep_accepted = rep_accepted + generic_reputation_calc(v, rule, 1.0, task)
+          end
+        else
+          rspamd_logger.warnx(task, "cannot find the requested tld for a request: %s (%s tlds noticed)",
+              k, dkim_tlds)
         end
       end
 
       -- Set local reputation symbol
-      if rep_accepted > 0 or rep_rejected > 0 then
-        if rep_accepted > rep_rejected then
-          add_symbol_score(task, rule, -(rep_accepted - rep_rejected))
-        else
-          add_symbol_score(task, rule, (rep_rejected - rep_accepted))
+      local rep_accepted_abs = math.abs(rep_accepted or 0)
+      lua_util.debugm(N, task, "dkim reputation accepted: %s",
+          rep_accepted_abs)
+      if rep_accepted_abs then
+        local final_rep = rep_accepted
+        if rep_accepted > 1.0 then
+          final_rep = 1.0
         end
+        if rep_accepted < -1.0 then
+          final_rep = -1.0
+        end
+        add_symbol_score(task, rule, final_rep)
 
         -- Store results for future DKIM results adjustments
         task:get_mempool():set_variable("dkim_reputation_accept", tostring(rep_accepted))
-        task:get_mempool():set_variable("dkim_reputation_reject", tostring(rep_rejected))
       end
     end
   end
 
-  for dom,res in pairs(requests) do
+  for dom, res in pairs(requests) do
     -- tld + "." + check_result, e.g. example.com.+ - reputation for valid sigs
     local query = string.format('%s.%s', dom, res)
-    rule.backend.get_token(task, rule, query, tokens_cb)
+    rule.backend.get_token(task, rule, nil, query, tokens_cb, 'string')
   end
 end
 
@@ -206,31 +242,29 @@ local function dkim_reputation_idempotent(task, rule)
   local sc = extract_task_score(task, rule)
 
   if sc then
-    for dom,res in pairs(requests) do
+    for dom, res in pairs(requests) do
       -- tld + "." + check_result, e.g. example.com.+ - reputation for valid sigs
       local query = string.format('%s.%s', dom, res)
-      rule.backend.set_token(task, rule, query, sc)
+      rule.backend.set_token(task, rule, nil, query, sc)
     end
   end
 end
 
 local function dkim_reputation_postfilter(task, rule)
-  local sym_accepted = task:get_symbol('R_DKIM_ALLOW')
+  local sym_accepted = (task:get_symbol('R_DKIM_ALLOW') or E)[1]
   local accept_adjustment = task:get_mempool():get_variable("dkim_reputation_accept")
+  local cfg = rule.selector.config or E
 
-  if sym_accepted and accept_adjustment then
-    local final_adjustment = rule.config.max_accept_adjustment *
-        rspamd_util.tanh(tonumber(accept_adjustment))
-    task:adjust_result('R_DKIM_ALLOW', sym_accepted.score * final_adjustment)
-  end
+  if sym_accepted and sym_accepted.score and
+      accept_adjustment and type(cfg.max_accept_adjustment) == 'number' then
+    local final_adjustment = cfg.max_accept_adjustment *
+        rspamd_util.tanh(tonumber(accept_adjustment) or 0)
+    lua_util.debugm(N, task, "adjust DKIM_ALLOW: " ..
+        "cfg.max_accept_adjustment=%s accept_adjustment=%s final_adjustment=%s sym_accepted.score=%s",
+        cfg.max_accept_adjustment, accept_adjustment, final_adjustment,
+        sym_accepted.score)
 
-  local sym_rejected = task:get_symbol('R_DKIM_REJECT')
-  local reject_adjustment = task:get_mempool():get_variable("dkim_reputation_reject")
-
-  if sym_rejected and reject_adjustment then
-    local final_adjustment = rule.config.max_reject_adjustment *
-        rspamd_util.tanh(tonumber(reject_adjustment))
-    task:adjust_result('R_DKIM_REJECT', sym_rejected.score * final_adjustment)
+    task:adjust_result('R_DKIM_ALLOW', sym_accepted.score + final_adjustment)
   end
 end
 
@@ -243,12 +277,11 @@ local dkim_selector = {
     outbound = true,
     inbound = true,
     max_accept_adjustment = 2.0, -- How to adjust accepted DKIM score
-    max_reject_adjustment = 3.0 -- How to adjust rejected DKIM score
   },
-  dependencies = {"DKIM_TRACE"},
+  dependencies = { "DKIM_TRACE" },
   filter = dkim_reputation_filter, -- used to get scores
   postfilter = dkim_reputation_postfilter, -- used to adjust DKIM scores
-  idempotent = dkim_reputation_idempotent -- used to set scores
+  idempotent = dkim_reputation_idempotent, -- used to set scores
 }
 
 -- URL Selector functions
@@ -270,14 +303,18 @@ local function gen_url_queries(task, rule)
     else
       domains[dom] = domains[dom] + 1
     end
-  end, fun.filter(function(u) return not u:is_html_displayed() end,
-    task:get_urls(true)))
+  end, fun.filter(function(u)
+    return not u:is_html_displayed()
+  end,
+      task:get_urls(true)))
 
   local results = {}
-  for k,v in lua_util.spairs(domains,
-    function(t, a, b) return t[a] > t[b] end, rule.selector.config.max_urls) do
+  for k, v in lua_util.spairs(domains,
+      function(t, a, b)
+        return t[a] > t[b]
+      end, rule.selector.config.max_urls) do
     if v > 0 then
-      table.insert(results, {k,v})
+      table.insert(results, { k, v })
     end
   end
 
@@ -286,30 +323,44 @@ end
 
 local function url_reputation_filter(task, rule)
   local requests = gen_url_queries(task, rule)
+  local url_keys = lua_util.keys(requests)
+  local requests_left = #url_keys
   local results = {}
-  local nchecked = 0
 
   local function indexed_tokens_cb(err, index, values)
-    nchecked = nchecked + 1
+    requests_left = requests_left - 1
 
     if values then
       results[index] = values
     end
 
-    if nchecked == #requests then
+    if requests_left == 0 then
       -- Check the url with maximum hits
       local mhits = 0
-      for k,_ in pairs(results) do
-        if requests[k][2] > mhits then
-          mhits = requests[k][2]
+
+      for i, res in ipairs(results) do
+        local req = requests[i]
+        if req then
+          local hits = tonumber(res[1])
+          if hits > mhits then
+            mhits = hits
+          end
+        else
+          rspamd_logger.warnx(task, "cannot find the requested response for a request: %s (%s requests noticed)",
+              i, #requests)
         end
       end
 
       if mhits > 0 then
         local score = 0
-        for k,v in pairs(results) do
-          score = score + generic_reputation_calc(v, rule,
-              requests[k][2] / mhits, task)
+        for i, res in pairs(results) do
+          local req = requests[i]
+          if req then
+            local url_score = generic_reputation_calc(res, rule,
+                req[2] / mhits, task)
+            lua_util.debugm(N, task, "score for url %s is %s, score=%s", req[1], url_score, score)
+            score = score + url_score
+          end
         end
 
         if math.abs(score) > 1e-3 then
@@ -320,12 +371,12 @@ local function url_reputation_filter(task, rule)
     end
   end
 
-  for i,req in ipairs(requests) do
+  for i, req in ipairs(requests) do
     local function tokens_cb(err, token, values)
       indexed_tokens_cb(err, i, values)
     end
 
-    rule.backend.get_token(task, rule, req[1], tokens_cb)
+    rule.backend.get_token(task, rule, nil, req[1], tokens_cb, 'string')
   end
 end
 
@@ -334,8 +385,8 @@ local function url_reputation_idempotent(task, rule)
   local sc = extract_task_score(task, rule)
 
   if sc then
-    for _,tld in ipairs(requests) do
-      rule.backend.set_token(task, rule, tld[1], sc)
+    for _, tld in ipairs(requests) do
+      rule.backend.set_token(task, rule, nil, tld[1], sc)
     end
   end
 end
@@ -360,10 +411,10 @@ local function ip_reputation_init(rule)
   local cfg = rule.selector.config
 
   if cfg.asn_cc_whitelist then
-    cfg.asn_cc_whitelist = rspamd_map_add('reputation',
-      'asn_cc_whitelist',
-      'map',
-      'IP score whitelisted ASNs/countries')
+    cfg.asn_cc_whitelist = lua_maps.map_add('reputation',
+        'asn_cc_whitelist',
+        'map',
+        'IP score whitelisted ASNs/countries')
   end
 
   return true
@@ -373,10 +424,20 @@ local function ip_reputation_filter(task, rule)
 
   local ip = task:get_from_ip()
 
-  if not ip or not ip:is_valid() then return end
-  if lua_util.is_rspamc_or_controller(task) then return end
+  if not ip or not ip:is_valid() then
+    return
+  end
+  if lua_util.is_rspamc_or_controller(task) then
+    return
+  end
 
   local cfg = rule.selector.config
+
+  if ip:get_version() == 4 and cfg.ipv4_mask then
+    ip = ip:apply_mask(cfg.ipv4_mask)
+  elseif cfg.ipv6_mask then
+    ip = ip:apply_mask(cfg.ipv6_mask)
+  end
 
   local pool = task:get_mempool()
   local asn = pool:get_variable("asn")
@@ -405,19 +466,22 @@ local function ip_reputation_filter(task, rule)
     if asn_stats then
       local asn_score = generic_reputation_calc(asn_stats, rule, cfg.scores.asn, task)
       score = score + asn_score
-      table.insert(description_t, string.format('asn: %s(%.2f)', asn, asn_score))
+      table.insert(description_t, string.format('asn: %s(%.2f)',
+          asn, asn_score))
     end
     if country_stats then
       local country_score = generic_reputation_calc(country_stats, rule,
           cfg.scores.country, task)
       score = score + country_score
-      table.insert(description_t, string.format('country: %s(%.2f)', country, country_score))
+      table.insert(description_t, string.format('country: %s(%.2f)',
+          country, country_score))
     end
     if ip_stats then
       local ip_score = generic_reputation_calc(ip_stats, rule, cfg.scores.ip,
-        task)
+          task)
       score = score + ip_score
-      table.insert(description_t, string.format('ip: %s(%.2f)', ip, ip_score))
+      table.insert(description_t, string.format('ip: %s(%.2f)',
+          tostring(ip), ip_score))
     end
 
     if math.abs(score) > 0.001 then
@@ -456,24 +520,39 @@ local function ip_reputation_filter(task, rule)
   end
 
   if asn then
-    rule.backend.get_token(task, rule, cfg.asn_prefix .. asn, gen_token_callback('asn'))
+    rule.backend.get_token(task, rule, cfg.asn_prefix, asn,
+        gen_token_callback('asn'), 'string')
   end
   if country then
-    rule.backend.get_token(task, rule, cfg.country_prefix .. country, gen_token_callback('country'))
+    rule.backend.get_token(task, rule, cfg.country_prefix, country,
+        gen_token_callback('country'), 'string')
   end
 
-  rule.backend.get_token(task, rule, cfg.ip_prefix .. tostring(ip), gen_token_callback('ip'))
+  rule.backend.get_token(task, rule, cfg.ip_prefix, ip,
+      gen_token_callback('ip'), 'ip')
 end
 
 -- Used to set scores
 local function ip_reputation_idempotent(task, rule)
-  if not rule.backend.set_token then return end -- Read only backend
+  if not rule.backend.set_token then
+    return
+  end -- Read only backend
   local ip = task:get_from_ip()
-
-  if not ip or not ip:is_valid() then return end
-  if lua_util.is_rspamc_or_controller(task) then return end
-
   local cfg = rule.selector.config
+
+  if not ip or not ip:is_valid() then
+    return
+  end
+
+  if lua_util.is_rspamc_or_controller(task) then
+    return
+  end
+
+  if ip:get_version() == 4 and cfg.ipv4_mask then
+    ip = ip:apply_mask(cfg.ipv4_mask)
+  elseif cfg.ipv6_mask then
+    ip = ip:apply_mask(cfg.ipv6_mask)
+  end
 
   local pool = task:get_mempool()
   local asn = pool:get_variable("asn")
@@ -490,13 +569,13 @@ local function ip_reputation_idempotent(task, rule)
   local sc = extract_task_score(task, rule)
   if sc then
     if asn then
-      rule.backend.set_token(task, rule, cfg.asn_prefix .. asn, sc)
+      rule.backend.set_token(task, rule, cfg.asn_prefix, asn, sc, nil, 'string')
     end
     if country then
-      rule.backend.set_token(task, rule, cfg.country_prefix .. country, sc)
+      rule.backend.set_token(task, rule, cfg.country_prefix, country, sc, nil, 'string')
     end
 
-    rule.backend.set_token(task, rule, cfg.ip_prefix .. tostring(ip), sc)
+    rule.backend.set_token(task, rule, cfg.ip_prefix, ip, sc, nil, 'ip')
   end
 end
 
@@ -519,11 +598,13 @@ local ip_selector = {
     score_divisor = 1,
     outbound = false,
     inbound = true,
+    ipv4_mask = 32, -- Mask bits for ipv4
+    ipv6_mask = 64, -- Mask bits for ipv6
   },
   --dependencies = {"ASN"}, -- ASN is a prefilter now...
   init = ip_reputation_init,
   filter = ip_reputation_filter, -- used to get scores
-  idempotent = ip_reputation_idempotent -- used to set scores
+  idempotent = ip_reputation_idempotent, -- used to set scores
 }
 
 -- SPF Selector functions
@@ -533,7 +614,9 @@ local function spf_reputation_filter(task, rule)
   local spf_allow = task:has_symbol('R_SPF_ALLOW')
 
   -- Don't care about bad/missing spf
-  if not spf_record or not spf_allow then return end
+  if not spf_record or not spf_allow then
+    return
+  end
 
   local cr = require "rspamd_cryptobox_hash"
   local hkey = cr.create(spf_record):base32():sub(1, 32)
@@ -551,7 +634,7 @@ local function spf_reputation_filter(task, rule)
     end
   end
 
-  rule.backend.get_token(task, rule, hkey, tokens_cb)
+  rule.backend.get_token(task, rule, nil, hkey, tokens_cb, 'string')
 end
 
 local function spf_reputation_idempotent(task, rule)
@@ -559,16 +642,17 @@ local function spf_reputation_idempotent(task, rule)
   local spf_record = task:get_mempool():get_variable('spf_record')
   local spf_allow = task:has_symbol('R_SPF_ALLOW')
 
-  if not spf_record or not spf_allow or not sc then return end
+  if not spf_record or not spf_allow or not sc then
+    return
+  end
 
   local cr = require "rspamd_cryptobox_hash"
   local hkey = cr.create(spf_record):base32():sub(1, 32)
 
   lua_util.debugm(N, task, 'set spf record %s -> %s = %s',
       spf_record, hkey, sc)
-  rule.backend.set_token(task, rule, hkey, sc)
+  rule.backend.set_token(task, rule, nil, hkey, sc)
 end
-
 
 local spf_selector = {
   config = {
@@ -579,12 +663,10 @@ local spf_selector = {
     max_score = nil,
     outbound = true,
     inbound = true,
-    max_accept_adjustment = 2.0, -- How to adjust accepted DKIM score
-    max_reject_adjustment = 3.0 -- How to adjust rejected DKIM score
   },
-  dependencies = {"R_SPF_ALLOW"},
+  dependencies = { "R_SPF_ALLOW" },
   filter = spf_reputation_filter, -- used to get scores
-  idempotent = spf_reputation_idempotent -- used to set scores
+  idempotent = spf_reputation_idempotent, -- used to set scores
 }
 
 -- Generic selector based on lua_selectors framework
@@ -637,13 +719,13 @@ local function generic_reputation_filter(task, rule)
     if type(selector_res) == 'table' then
       fun.each(function(e)
         lua_util.debugm(N, task, 'check generic reputation (%s) %s',
-          rule['symbol'], e)
-        rule.backend.get_token(task, rule, e, tokens_cb)
+            rule['symbol'], e)
+        rule.backend.get_token(task, rule, nil, e, tokens_cb, 'string')
       end, selector_res)
     else
       lua_util.debugm(N, task, 'check generic reputation (%s) %s',
-        rule['symbol'], selector_res)
-      rule.backend.get_token(task, rule, selector_res, tokens_cb)
+          rule['symbol'], selector_res)
+      rule.backend.get_token(task, rule, nil, selector_res, tokens_cb, 'string')
     end
   end
 end
@@ -653,26 +735,27 @@ local function generic_reputation_idempotent(task, rule)
   local cfg = rule.selector.config
 
   local selector_res = cfg.selector(task)
-  if not selector_res then return end
+  if not selector_res then
+    return
+  end
 
   if sc then
     if type(selector_res) == 'table' then
       fun.each(function(e)
         lua_util.debugm(N, task, 'set generic selector (%s) %s = %s',
             rule['symbol'], e, sc)
-        rule.backend.set_token(task, rule, e, sc)
+        rule.backend.set_token(task, rule, nil, e, sc)
       end, selector_res)
     else
       lua_util.debugm(N, task, 'set generic selector (%s) %s = %s',
           rule['symbol'], selector_res, sc)
-      rule.backend.set_token(task, rule, selector_res, sc)
+      rule.backend.set_token(task, rule, nil, selector_res, sc)
     end
   end
 end
 
-
 local generic_selector = {
-  schema = ts.shape{
+  schema = ts.shape {
     lower_bound = ts.number + ts.string / tonumber,
     max_score = ts.number:is_optional(),
     min_score = ts.number:is_optional(),
@@ -680,7 +763,7 @@ local generic_selector = {
     inbound = ts.boolean,
     selector = ts.string,
     delimiter = ts.string,
-    whitelist = ts.string:is_optional(),
+    whitelist = ts.one_of(lua_maps.map_schema, lua_maps_exprs.schema):is_optional(),
   },
   config = {
     lower_bound = 10, -- minimum number of messages to be scored
@@ -697,8 +780,6 @@ local generic_selector = {
   idempotent = generic_reputation_idempotent -- used to set scores
 }
 
-
-
 local selectors = {
   ip = ip_selector,
   sender = ip_selector, -- Better name
@@ -711,15 +792,17 @@ local selectors = {
 local function reputation_dns_init(rule, _, _, _)
   if not rule.backend.config.list then
     rspamd_logger.errx(rspamd_config, "rule %s with DNS backend has no `list` parameter defined",
-      rule.symbol)
+        rule.symbol)
     return false
   end
 
   return true
 end
 
-
-local function gen_token_key(token, rule)
+local function gen_token_key(prefix, token, rule)
+  if prefix then
+    token = prefix .. token
+  end
   local res = token
   if rule.backend.config.hashed then
     local hash_alg = rule.backend.config.hash_alg or "blake2"
@@ -752,7 +835,7 @@ end
 
 --[[
 -- Generic interface for get and set tokens functions:
--- get_token(task, rule, token, continuation), where `continuation` is the following function:
+-- get_token(task, rule, prefix, token, continuation, token_type), where `continuation` is the following function:
 --
 -- function(err, token, values) ... end
 -- `err`: string value for error (similar to redis or DNS callbacks)
@@ -771,42 +854,64 @@ end
 -- example of tokens: {'s': 0, 'h': 0, 'p': 1}
 --]]
 
-local function reputation_dns_get_token(task, rule, token, continuation_cb)
+local function reputation_dns_get_token(task, rule, prefix, token, continuation_cb, token_type)
   -- local r = task:get_resolver()
-  local key = gen_token_key(token, rule)
+  -- In DNS we never ever use prefix as prefix, we use if as a suffix!
+  if token_type == 'ip' then
+    token = table.concat(token:inversed_str_octets(), '.')
+  end
+
+  local key = gen_token_key(nil, token, rule)
   local dns_name = key .. '.' .. rule.backend.config.list
+
+  if prefix then
+    dns_name = string.format('%s.%s.%s', key, prefix,
+        rule.backend.config.list)
+  else
+    dns_name = string.format('%s.%s', key, rule.backend.config.list)
+  end
 
   local function dns_cb(_, _, results, err)
     if err and (err ~= 'requested record is not found' and
         err ~= 'no records with this name') then
-      rspamd_logger.errx(task, 'error looking up %s: %s', dns_name, err)
+      rspamd_logger.warnx(task, 'error looking up %s: %s', dns_name, err)
     end
 
     lua_util.debugm(N, task, 'DNS RESPONSE: label=%1 results=%2 err=%3 list=%4',
         dns_name, results, err, rule.backend.config.list)
 
     -- Now split tokens to list of values
-    if results  then
-      local values = {}
-      -- Format: key1=num1;key2=num2...keyn=numn
-      fun.each(function(e)
-        local vals = lua_util.rspamd_str_split(e, "=")
-        if vals and #vals == 2 then
-          local nv = tonumber(vals[2])
-          if nv then
-            values[vals[1]] = nv
-          end
-        end
+    if results and results[1] then
+      -- Format: num_messages;sc1;sc2...scn
+      local dns_tokens = lua_util.rspamd_str_split(results[1], ";")
+      -- Convert all to numbers excluding any possible non-numbers
+      dns_tokens = fun.totable(fun.filter(function(e)
+        return type(e) == 'number'
       end,
-          lua_util.rspamd_str_split(results[1], ";"))
+          fun.map(function(e)
+            local n = tonumber(e)
+            if n then
+              return n
+            end
+            return "BAD"
+          end, dns_tokens)))
 
-      continuation_cb(nil, dns_name, values)
+      if #dns_tokens < 2 then
+        rspamd_logger.warnx(task, 'cannot parse response for reputation token %s: %s',
+            dns_name, results[1])
+        continuation_cb(results, dns_name, nil)
+      else
+        local cnt = table.remove(dns_tokens, 1)
+        continuation_cb(nil, dns_name, { cnt, dns_tokens })
+      end
     else
+      rspamd_logger.messagex(task, 'invalid response for reputation token %s: %s',
+          dns_name, results[1])
       continuation_cb(results, dns_name, nil)
     end
   end
 
- task:get_resolver():resolve_a({
+  task:get_resolver():resolve_a({
     task = task,
     name = dns_name,
     callback = dns_cb,
@@ -849,7 +954,7 @@ local function reputation_redis_init(rule, cfg, ev_base, worker)
   ]]
 
   local get_script = lua_util.jinja_template(redis_get_script_tpl,
-      {windows = rule.backend.config.buckets})
+      { windows = rule.backend.config.buckets })
   rspamd_logger.debugm(N, rspamd_config, 'added extraction script %s', get_script)
   rule.backend.script_get = lua_redis.add_redis_script(get_script, our_redis_params)
 
@@ -897,15 +1002,18 @@ local function reputation_redis_init(rule, cfg, ev_base, worker)
 ]]
 
   local set_script = lua_util.jinja_template(redis_adaptive_emea_script_tpl,
-      {windows = rule.backend.config.buckets})
+      { windows = rule.backend.config.buckets })
   rspamd_logger.debugm(N, rspamd_config, 'added emea update script %s', set_script)
   rule.backend.script_set = lua_redis.add_redis_script(set_script, our_redis_params)
 
   return true
 end
 
-local function reputation_redis_get_token(task, rule, token, continuation_cb)
-  local key = gen_token_key(token, rule)
+local function reputation_redis_get_token(task, rule, prefix, token, continuation_cb, token_type)
+  if token_type and token_type == 'ip' then
+    token = tostring(token)
+  end
+  local key = gen_token_key(prefix, token, rule)
 
   local function redis_get_cb(err, data)
     if data then
@@ -915,37 +1023,40 @@ local function reputation_redis_get_token(task, rule, token, continuation_cb)
         continuation_cb(nil, key, data)
       else
         rspamd_logger.errx(task, 'rule %s - invalid type while getting reputation keys %s: %s',
-          rule['symbol'], key, type(data))
+            rule['symbol'], key, type(data))
         continuation_cb("invalid type", key, nil)
       end
 
     elseif err then
       rspamd_logger.errx(task, 'rule %s - got error while getting reputation keys %s: %s',
-        rule['symbol'], key, err)
+          rule['symbol'], key, err)
       continuation_cb(err, key, nil)
     else
       rspamd_logger.errx(task, 'rule %s - got error while getting reputation keys %s: %s',
-        rule['symbol'], key, "unknown error")
+          rule['symbol'], key, "unknown error")
       continuation_cb("unknown error", key, nil)
     end
   end
 
   local ret = lua_redis.exec_redis_script(rule.backend.script_get,
-      {task = task, is_write = false},
+      { task = task, is_write = false },
       redis_get_cb,
-      {key})
+      { key })
   if not ret then
     rspamd_logger.errx(task, 'cannot make redis request to check results')
   end
 end
 
-local function reputation_redis_set_token(task, rule, token, sc, continuation_cb)
-  local key = gen_token_key(token, rule)
+local function reputation_redis_set_token(task, rule, prefix, token, sc, continuation_cb, token_type)
+  if token_type and token_type == 'ip' then
+    token = tostring(token)
+  end
+  local key = gen_token_key(prefix, token, rule)
 
   local function redis_set_cb(err, data)
     if err then
       rspamd_logger.errx(task, 'rule %s - got error while setting reputation keys %s: %s',
-        rule['symbol'], key, err)
+          rule['symbol'], key, err)
       if continuation_cb then
         continuation_cb(err, key)
       end
@@ -959,11 +1070,11 @@ local function reputation_redis_set_token(task, rule, token, sc, continuation_cb
   lua_util.debugm(N, task, 'rule %s - set values for key %s -> %s',
       rule['symbol'], key, sc)
   local ret = lua_redis.exec_redis_script(rule.backend.script_set,
-      {task = task, is_write = true},
+      { task = task, is_write = true },
       redis_set_cb,
-      {key, tostring(os.time() * 1000),
-       tostring(sc),
-       tostring(rule.backend.config.expiry)})
+      { key, tostring(os.time() * 1000),
+        tostring(sc),
+        tostring(rule.backend.config.expiry) })
   if not ret then
     rspamd_logger.errx(task, 'got error while connecting to redis')
   end
@@ -978,15 +1089,15 @@ end
 --]]
 local backends = {
   redis = {
-    schema = ts.shape({
-      prefix = ts.string,
-      expiry = ts.number + ts.string / lua_util.parse_time_interval,
-      buckets = ts.array_of(ts.shape{
+    schema = lua_redis.enrich_schema({
+      prefix = ts.string:is_optional(),
+      expiry = (ts.number + ts.string / lua_util.parse_time_interval):is_optional(),
+      buckets = ts.array_of(ts.shape {
         time = ts.number + ts.string / lua_util.parse_time_interval,
         name = ts.string,
         mult = ts.number + ts.string / tonumber
-      }),
-    }, {extra_fields = lua_redis.config_schema}),
+      })          :is_optional(),
+    }),
     config = {
       expiry = default_expiry,
       prefix = default_prefix,
@@ -1003,7 +1114,7 @@ local backends = {
     set_token = reputation_redis_set_token,
   },
   dns = {
-    schema = ts.shape{
+    schema = ts.shape {
       list = ts.string,
     },
     config = {
@@ -1065,22 +1176,22 @@ local function callback_gen(cb, rule)
 end
 
 local function parse_rule(name, tbl)
-  local sel_type,sel_conf = fun.head(tbl.selector)
+  local sel_type, sel_conf = fun.head(tbl.selector)
   local selector = selectors[sel_type]
 
   if not selector then
     rspamd_logger.errx(rspamd_config, "unknown selector defined for rule %s: %s", name,
         sel_type)
-    return
+    return false
   end
 
-  local bk_type,bk_conf = fun.head(tbl.backend)
+  local bk_type, bk_conf = fun.head(tbl.backend)
 
   local backend = backends[bk_type]
   if not backend then
     rspamd_logger.errx(rspamd_config, "unknown backend defined for rule %s: %s", name,
-      tbl.backend.type)
-    return
+        tbl.backend.type)
+    return false
   end
   -- Allow config override
   local rule = {
@@ -1092,12 +1203,12 @@ local function parse_rule(name, tbl)
   -- Override default config params
   rule.backend.config = lua_util.override_defaults(rule.backend.config, bk_conf)
   if backend.schema then
-    local checked,schema_err = backend.schema:transform(rule.backend.config)
+    local checked, schema_err = backend.schema:transform(rule.backend.config)
     if not checked then
       rspamd_logger.errx(rspamd_config, "cannot parse backend config for %s: %s",
           sel_type, schema_err)
 
-      return
+      return false
     end
 
     rule.backend.config = checked
@@ -1105,7 +1216,7 @@ local function parse_rule(name, tbl)
 
   rule.selector.config = lua_util.override_defaults(rule.selector.config, sel_conf)
   if selector.schema then
-    local checked,schema_err = selector.schema:transform(rule.selector.config)
+    local checked, schema_err = selector.schema:transform(rule.selector.config)
 
     if not checked then
       rspamd_logger.errx(rspamd_config, "cannot parse selector config for %s: %s (%s)",
@@ -1122,8 +1233,38 @@ local function parse_rule(name, tbl)
   rule.config = lua_util.override_defaults(rule.config, tbl)
 
   if rule.config.whitelist then
-    rule.config.whitelist_map = lua_maps_exprs.create(rspamd_config,
-        rule.config.whitelist, N)
+    if lua_maps_exprs.schema(rule.config.whitelist) then
+      rule.config.whitelist_map = lua_maps_exprs.create(rspamd_config,
+          rule.config.whitelist, N)
+    elseif lua_maps.map_schema(rule.config.whitelist) then
+      local map = lua_maps.map_add_from_ucl(rule.config.whitelist,
+          'radix',
+          sel_type .. ' reputation whitelist')
+
+      if not map then
+        rspamd_logger.errx(rspamd_config, "cannot parse whitelist map config for %s: (%s)",
+            sel_type,
+            rule.config.whitelist)
+        return
+      end
+
+      rule.config.whitelist_map = {
+        process = function(_, task)
+          -- Hack: we assume that it is an ip whitelist :(
+          local ip = task:get_from_ip()
+
+          if ip and map:get_key(ip) then
+            return true
+          end
+          return false
+        end
+      }
+    else
+      rspamd_logger.errx(rspamd_config, "cannot parse whitelist map config for %s: (%s)",
+          sel_type,
+          rule.config.whitelist)
+      return false
+    end
   end
 
   local symbol = rule.selector.config.symbol or name
@@ -1173,19 +1314,20 @@ local function parse_rule(name, tbl)
     rule_type = 'callback'
   end
 
-  local id = rspamd_config:register_symbol{
+  local id = rspamd_config:register_symbol {
     name = rule.symbol,
     type = rule_type,
     callback = callback_gen(reputation_filter_cb, rule),
+    augmentations = { string.format("timeout=%f", redis_params.timeout or 0.0) },
   }
 
   if rule.selector.config.split_symbols then
-    rspamd_config:register_symbol{
+    rspamd_config:register_symbol {
       name = rule.symbol .. '_HAM',
       type = 'virtual',
       parent = id,
     }
-    rspamd_config:register_symbol{
+    rspamd_config:register_symbol {
       name = rule.symbol .. '_SPAM',
       type = 'virtual',
       parent = id,
@@ -1200,23 +1342,27 @@ local function parse_rule(name, tbl)
 
   if rule.selector.postfilter then
     -- Also register a postfilter
-    rspamd_config:register_symbol{
+    rspamd_config:register_symbol {
       name = rule.symbol .. '_POST',
       type = 'postfilter',
-      flags = 'nostat',
+      flags = 'nostat,explicit_disable,ignore_passthrough',
       callback = callback_gen(reputation_postfilter_cb, rule),
+      augmentations = { string.format("timeout=%f", redis_params.timeout or 0.0) },
     }
   end
 
   if rule.selector.idempotent then
     -- Has also idempotent component (e.g. saving data to the backend)
-    rspamd_config:register_symbol{
+    rspamd_config:register_symbol {
       name = rule.symbol .. '_IDEMPOTENT',
       type = 'idempotent',
+      flags = 'explicit_disable,ignore_passthrough',
       callback = callback_gen(reputation_idempotent_cb, rule),
+      augmentations = { string.format("timeout=%f", redis_params.timeout or 0.0) },
     }
   end
 
+  return true
 end
 
 redis_params = lua_redis.parse_redis_server('reputation')
@@ -1224,16 +1370,19 @@ local opts = rspamd_config:get_all_opt("reputation")
 
 -- Initialization part
 if not (opts and type(opts) == 'table') then
-  rspamd_logger.infox(rspamd_config, 'Module is unconfigured')
+  rspamd_logger.infox(rspamd_config, 'Module is not configured, disabling it')
   return
 end
 
 if opts['rules'] then
-  for k,v in pairs(opts['rules']) do
+  for k, v in pairs(opts['rules']) do
     if not ((v or E).selector) then
       rspamd_logger.errx(rspamd_config, "no selector defined for rule %s", k)
+      lua_util.config_utils.push_config_error(N, "no selector defined for rule: " .. k)
     else
-      parse_rule(k, v)
+      if not parse_rule(k, v) then
+        lua_util.config_utils.push_config_error(N, "reputation rule is misconfigured: " .. k)
+      end
     end
   end
 else

@@ -86,6 +86,10 @@ requires input.
 -b *host:port*, \--bind=*host:port*
 :	Bind to specified ip address
 
+-R, \--human
+:	Output human readable report. The first line of the output contains the message score and three threshold scores, in this format:
+:           score/greylist/addheader/reject,action=N:ACTION,spam=0|1,skipped=0|1
+
 -j, \--json
 :	Output formatted JSON
 
@@ -114,7 +118,7 @@ requires input.
 :	Add custom HTTP header for a request. You may specify header in format `name=value` or just `name` for an empty header. This option can be repeated multiple times.
 
 \--sort=*type*
-:	Sort output according to a specific field. For `counters` command the allowed values for this key are `name`, `weight`, `frequency` and `hits`. Appending `:desc` to any of these types inverts sorting order.
+:	Sort output according to a specific field. For `counters` command the allowed values for this key are `name`, `weight`, `frequency` and `hits`. Appending `:asc` to any of these types inverts sorting order.
 
 \--commands
 :	List available commands

@@ -35,6 +35,8 @@ set(archdetect_c_code "
     #else
         #error cmake_ARCH ppc
     #endif
+#elif defined(__loongarch__) || defined(__loongarch64)
+    #error cmake_ARCH loongarch64
 #endif
 
 #error cmake_ARCH unknown
@@ -89,8 +91,6 @@ function(target_architecture output_var)
         endif()
     else()
         file(WRITE "${CMAKE_BINARY_DIR}/arch.c" "${archdetect_c_code}")
-
-        enable_language(C)
 
         # Detect the architecture in a rather creative way...
         # This compiles a small C program which is a series of ifdefs that selects a

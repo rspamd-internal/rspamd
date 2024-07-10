@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,22 +19,24 @@ limitations under the License.
 local rspamd_util = require "rspamd_util"
 
 rspamd_config.FWD_GOOGLE = {
-  callback = function (task)
+  callback = function(task)
     if not (task:has_from(1) and task:has_recipients(1)) then
       return false
     end
-    local envfrom = task:get_from{'smtp', 'orig'}
+    local envfrom = task:get_from { 'smtp', 'orig' }
     local envrcpts = task:get_recipients(1)
     -- Forwarding will only be to a single recipient
-    if #envrcpts > 1 then return false end
+    if #envrcpts > 1 then
+      return false
+    end
     -- Get recipient and compute VERP address
     local rcpt = envrcpts[1].addr:lower()
-    local verp = rcpt:gsub('@','=')
+    local verp = rcpt:gsub('@', '=')
     -- Get the user portion of the envfrom
     local ef_user = envfrom[1].user:lower()
     -- Check for a match
     if ef_user:find('+caf_=' .. verp, 1, true) then
-      local _,_,user = ef_user:find('^(.+)+caf_=')
+      local _, _, user = ef_user:find('^(.+)+caf_=')
       if user then
         user = user .. '@' .. envfrom[1].domain
         return true, user
@@ -48,15 +50,13 @@ rspamd_config.FWD_GOOGLE = {
 }
 
 rspamd_config.FWD_YANDEX = {
-  callback = function (task)
+  callback = function(task)
     if not (task:has_from(1) and task:has_recipients(1)) then
       return false
     end
     local hostname = task:get_hostname()
     if hostname and hostname:lower():find('%.yandex%.[a-z]+$') then
-      if task:get_header_raw('X-Yandex-Forward') then
-        return true
-      end
+      return task:has_header('X-Yandex-Forward')
     end
     return false
   end,
@@ -66,15 +66,13 @@ rspamd_config.FWD_YANDEX = {
 }
 
 rspamd_config.FWD_MAILRU = {
-  callback = function (task)
+  callback = function(task)
     if not (task:has_from(1) and task:has_recipients(1)) then
       return false
     end
     local hostname = task:get_hostname()
     if hostname and hostname:lower():find('%.mail%.ru$') then
-      if task:get_header_raw('X-MailRu-Forward') then
-        return true
-      end
+      return task:has_header('X-MailRu-Forward')
     end
     return false
   end,
@@ -84,14 +82,16 @@ rspamd_config.FWD_MAILRU = {
 }
 
 rspamd_config.FWD_SRS = {
-  callback = function (task)
+  callback = function(task)
     if not (task:has_from(1) and task:has_recipients(1)) then
       return false
     end
     local envfrom = task:get_from(1)
     local envrcpts = task:get_recipients(1)
     -- Forwarding is only to a single recipient
-    if #envrcpts > 1 then return false end
+    if #envrcpts > 1 then
+      return false
+    end
     -- Get recipient and compute rewritten SRS address
     local srs = '=' .. envrcpts[1].domain:lower() ..
         '=' .. envrcpts[1].user:lower()
@@ -108,10 +108,10 @@ rspamd_config.FWD_SRS = {
 }
 
 rspamd_config.FORWARDED = {
-  callback = function (task)
+  callback = function(task)
     local function normalize_addr(addr)
       addr = string.match(addr, '^<?([^>]*)>?$') or addr
-      local cap, _,domain = string.match(addr, '^([^%+][^%+]*)(%+[^@]*)@(.*)$')
+      local cap, _, domain = string.match(addr, '^([^%+][^%+]*)(%+[^@]*)@(.*)$')
       if cap then
         addr = string.format('%s@%s', cap, domain)
       end
@@ -119,12 +119,16 @@ rspamd_config.FORWARDED = {
       return addr
     end
 
-    if not task:has_recipients(1) or not task:has_recipients(2) then return false end
+    if not task:has_recipients(1) or not task:has_recipients(2) then
+      return false
+    end
     local envrcpts = task:get_recipients(1)
     -- Forwarding will only be for single recipient messages
-    if #envrcpts > 1 then return false end
+    if #envrcpts > 1 then
+      return false
+    end
     -- Get any other headers we might need
-    local lu = task:get_header('List-Unsubscribe')
+    local has_list_unsub = task:has_header('List-Unsubscribe')
     local to = task:get_recipients(2)
     local matches = 0
     -- Retrieve and loop through all Received headers
@@ -139,7 +143,7 @@ rspamd_config.FORWARDED = {
           -- Check that it doesn't match the envrcpt
           if not rspamd_util.strequal_caseless(addr, envrcpts[1].addr) then
             -- Check for mailing-lists as they will have the same signature
-            if matches < 2 and lu and to and rspamd_util.strequal_caseless(to[1].addr, addr) then
+            if matches < 2 and has_list_unsub and to and rspamd_util.strequal_caseless(to[1].addr, addr) then
               return false
             else
               return true, 1.0, addr
@@ -157,4 +161,3 @@ rspamd_config.FORWARDED = {
   description = "Message was forwarded",
   group = "forwarding"
 }
-

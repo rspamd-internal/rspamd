@@ -26,6 +26,7 @@ local function make_subj_bounce_keywords_re()
     'delivery failed',
     'delivery failure',
     'delivery report',
+    'delivery status',
     'delivery warning',
     'failure delivery',
     'failure notice',
@@ -42,7 +43,7 @@ config.regexp.SUBJ_BOUNCE_WORDS = {
   re = make_subj_bounce_keywords_re(),
   group = 'headers',
   score = 0.0,
-  description = 'Words/phrases typical for DNS'
+  description = 'Words/phrases typical for DSN'
 }
 
 rspamd_config.BOUNCE = {
@@ -52,21 +53,20 @@ rspamd_config.BOUNCE = {
       -- RFC 3464:
       -- Whenever an SMTP transaction is used to send a DSN, the MAIL FROM
       -- command MUST use a NULL return address, i.e., "MAIL FROM:<>"
-      -- In practise it is almost always the case for DNS
+      -- In practise it is almost always the case for DSN
       return false
     end
-
 
     local parts = task:get_parts()
     local top_type, top_subtype, params = parts[1]:get_type_full()
     -- RFC 3464, RFC 8098
     if top_type == 'multipart' and top_subtype == 'report' and params and
-       (params['report-type'] == 'delivery-status' or params['report-type'] == 'disposition-notification') then
+        (params['report-type'] == 'delivery-status' or params['report-type'] == 'disposition-notification') then
       -- Assume that inner parts are OK, don't check them to save time
       return true, 1.0, 'DSN'
     end
 
-    -- Apply heuristics for non-standard bounecs
+    -- Apply heuristics for non-standard bounces
     local bounce_sender
     local mime_from = task:get_from('mime')
     if mime_from then
@@ -74,9 +74,9 @@ rspamd_config.BOUNCE = {
       -- Check common bounce senders
       if (from_user == 'postmaster' or from_user == 'mailer-daemon') then
         bounce_sender = from_user
-      -- MDaemon >= 14.5 sends multipart/report (RFC 3464) DNS covered above,
-      -- but older versions send non-standard bounces with localized subjects and they
-      -- are still around
+        -- MDaemon >= 14.5 sends multipart/report (RFC 3464) DSN covered above,
+        -- but older versions send non-standard bounces with localized subjects and they
+        -- are still around
       elseif from_user == 'mdaemon' and task:has_header('X-MDDSN-Message') then
         return true, 1.0, 'MDaemon'
       end
@@ -94,7 +94,7 @@ rspamd_config.BOUNCE = {
 
     -- Look for a message/rfc822(-headers) part inside
     local rfc822_part
-    parts[10] = nil -- limit numbe of parts to check
+    parts[10] = nil -- limit number of parts to check
     for _, p in ipairs(parts) do
       local mime_type, mime_subtype = p:get_type()
       if (mime_subtype == 'rfc822' or mime_subtype == 'rfc822-headers') and

@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2016, Steve Freegard <steve@freegard.name>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,9 @@ limitations under the License.
 local rspamd_util = require "rspamd_util"
 local function mid_check_func(task)
   local mid = task:get_header('Message-ID')
-  if not mid then return false end
+  if not mid then
+    return false
+  end
   -- Check for 'bare' IP addresses in RHS
   if mid:find("@%d+%.%d+%.%d+%.%d+>$") then
     task:insert_result('MID_BARE_IP', 1.0)
@@ -39,7 +41,7 @@ local function mid_check_func(task)
   local fd
   if (from and from[1] and from[1].domain and from[1].domain ~= '') then
     fd = from[1].domain:lower()
-    local _,_,md = mid:find("@([^>]+)>?$")
+    local _, _, md = mid:find("@([^>]+)>?$")
     -- See if all or part of the From address
     -- can be found in the Message-ID
     -- extract tld
@@ -49,7 +51,7 @@ local function mid_check_func(task)
       fdtld = rspamd_util.get_tld(fd)
       mdtld = rspamd_util.get_tld(md)
     end
-    if (mid:lower():find(from[1].addr:lower(),1,true)) then
+    if (mid:lower():find(from[1].addr:lower(), 1, true)) then
       task:insert_result('MID_CONTAINS_FROM', 1.0)
     elseif (md and fd == md:lower()) then
       task:insert_result('MID_RHS_MATCH_FROM', 1.0)
@@ -61,12 +63,12 @@ local function mid_check_func(task)
   local to = task:get_recipients(2)
   if (to and to[1] and to[1].domain and to[1].domain ~= '') then
     local td = to[1].domain:lower()
-    local _,_,md = mid:find("@([^>]+)>?$")
+    local _, _, md = mid:find("@([^>]+)>?$")
     -- Skip if from domain == to domain
     if ((fd and fd ~= td) or not fd) then
       -- See if all or part of the To address
       -- can be found in the Message-ID
-      if (mid:lower():find(to[1].addr:lower(),1,true)) then
+      if (mid:lower():find(to[1].addr:lower(), 1, true)) then
         task:insert_result('MID_CONTAINS_TO', 1.0)
       elseif (md and td == md:lower()) then
         task:insert_result('MID_RHS_MATCH_TO', 1.0)
@@ -105,3 +107,25 @@ rspamd_config:set_metric_symbol('MID_CONTAINS_TO', 1.0, 'Message-ID contains To 
 rspamd_config:register_virtual_symbol('MID_RHS_MATCH_TO', 1.0, check_mid_id)
 rspamd_config:set_metric_symbol('MID_RHS_MATCH_TO', 1.0, 'Message-ID RHS matches To domain', 'default', 'Message ID')
 
+-- Another check from https://github.com/rspamd/rspamd/issues/4299
+rspamd_config:register_symbol {
+  type = 'normal,mime',
+  group = 'mid',
+  name = 'MID_END_EQ_FROM_USER_PART',
+  description = 'Message-ID RHS (after @) and MIME from local part are the same',
+  score = 4.0,
+
+  callback = function(task)
+    local mid = task:get_header('Message-ID')
+    if not mid then
+      return
+    end
+    local mime_from = task:get_from('mime')
+    local _, _, mid_realm = mid:find("@([a-z]+)>?$")
+    if mid_realm and mime_from and mime_from[1] and mime_from[1].user then
+      if (mid_realm == mime_from[1].user) then
+        return true
+      end
+    end
+  end
+}

@@ -1,18 +1,27 @@
 {
     "extends": "stylelint-config-standard",
+    "overrides": [
+        {
+            "files": ["**/*.html"],
+            "customSyntax": "postcss-html"
+        }
+    ],
     "ignoreFiles": [
         "**/*.min.css",
-        "**/*.min.js",
+        "**/*.js",
         "interface/css/d3evolution.css",
+        "interface/css/codejar-linenumbers.css",
         "interface/css/nprogress.css",
         "interface/css/prism.css"
     ],
     "rules": {
+        "alpha-value-notation": null,
         "at-rule-empty-line-before": null,
         "color-hex-length": null,
         "comment-empty-line-before": null,
-        "indentation": 4,
-        "number-leading-zero": null,
-        "rule-empty-line-before": null
+        "media-feature-range-notation": "prefix",
+        "property-no-vendor-prefix": null,
+        "rule-empty-line-before": null,
+        "value-no-vendor-prefix": null
     }
 }

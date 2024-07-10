@@ -887,43 +887,48 @@ ucl_fetch_file (const unsigned char *filename, unsigned char **buf, size_t *bufl
 {
 	int fd;
 	struct stat st;
+	if ((fd = open (filename, O_RDONLY)) == -1) {
+		ucl_create_err (err, "cannot open file %s: %s",
+				filename, strerror (errno));
+		return false;
+	}
 
-	if (stat (filename, &st) == -1) {
+	if (fstat (fd, &st) == -1) {
 		if (must_exist || errno == EPERM) {
 			ucl_create_err (err, "cannot stat file %s: %s",
 					filename, strerror (errno));
 		}
+		close (fd);
+
 		return false;
 	}
 	if (!S_ISREG (st.st_mode)) {
 		if (must_exist) {
 			ucl_create_err (err, "file %s is not a regular file", filename);
 		}
+		close (fd);
 
 		return false;
 	}
+
 	if (st.st_size == 0) {
 		/* Do not map empty files */
 		*buf = NULL;
 		*buflen = 0;
 	}
 	else {
-		if ((fd = open (filename, O_RDONLY)) == -1) {
-			ucl_create_err (err, "cannot open file %s: %s",
-					filename, strerror (errno));
-			return false;
-		}
-		if ((*buf = ucl_mmap (NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED) {
-			close (fd);
-			ucl_create_err (err, "cannot mmap file %s: %s",
-					filename, strerror (errno));
+		if ((*buf = ucl_mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+			close(fd);
+			ucl_create_err(err, "cannot mmap file %s: %s",
+					filename, strerror(errno));
 			*buf = NULL;
 
 			return false;
 		}
 		*buflen = st.st_size;
-		close (fd);
 	}
+
+	close (fd);
 
 	return true;
 }
@@ -1136,6 +1141,10 @@ ucl_include_file_single (const unsigned char *data, size_t len,
 		/* We need to check signature first */
 		snprintf (filebuf, sizeof (filebuf), "%s.sig", realbuf);
 		if (!ucl_fetch_file (filebuf, &sigbuf, &siglen, &parser->err, true)) {
+			if (buf) {
+				ucl_munmap (buf, buflen);
+			}
+
 			return false;
 		}
 		if (!ucl_sig_check (buf, buflen, sigbuf, siglen, parser)) {
@@ -1145,8 +1154,13 @@ ucl_include_file_single (const unsigned char *data, size_t len,
 			if (sigbuf) {
 				ucl_munmap (sigbuf, siglen);
 			}
+			if (buf) {
+				ucl_munmap (buf, buflen);
+			}
+
 			return false;
 		}
+
 		if (sigbuf) {
 			ucl_munmap (sigbuf, siglen);
 		}
@@ -1254,6 +1268,8 @@ ucl_include_file_single (const unsigned char *data, size_t len,
 						if (buf) {
 							ucl_munmap (buf, buflen);
 						}
+
+						ucl_object_unref (new_obj);
 
 						return false;
 					}
@@ -1911,7 +1927,7 @@ ucl_inherit_handler (const unsigned char *data, size_t len,
 
 	/* Some sanity checks */
 	if (parent == NULL || ucl_object_type (parent) != UCL_OBJECT) {
-		ucl_create_err (&parser->err, "Unable to find inherited object %*.s",
+		ucl_create_err (&parser->err, "Unable to find inherited object %.*s",
 				(int)len, data);
 		return false;
 	}
@@ -2169,7 +2185,7 @@ ucl_strnstr (const char *s, const char *find, int len)
 		mlen = strlen (find);
 		do {
 			do {
-				if ((sc = *s++) == 0 || len-- == 0)
+				if ((sc = *s++) == 0 || len-- < mlen)
 					return (NULL);
 			} while (sc != c);
 		} while (strncmp (s, find, mlen) != 0);
@@ -2588,6 +2604,7 @@ ucl_object_merge (ucl_object_t *top, ucl_object_t *elt, bool copy)
 						if (!ucl_object_merge (found, cp, copy)) {
 							return false;
 						}
+						ucl_object_unref (cp);
 					}
 					else {
 						ucl_hash_replace (top->value.ov, found, cp);
@@ -2619,6 +2636,7 @@ ucl_object_merge (ucl_object_t *top, ucl_object_t *elt, bool copy)
 					if (!ucl_object_merge (found, cp, copy)) {
 						return false;
 					}
+					ucl_object_unref (cp);
 				}
 				else {
 					ucl_hash_replace (top->value.ov, found, cp);
@@ -3586,9 +3604,11 @@ ucl_object_copy_internal (const ucl_object_t *other, bool allow_array)
 
 		/* deep copy of values stored */
 		if (other->trash_stack[UCL_TRASH_KEY] != NULL) {
-			new->trash_stack[UCL_TRASH_KEY] =
-					strdup (other->trash_stack[UCL_TRASH_KEY]);
+			new->trash_stack[UCL_TRASH_KEY] = NULL;
 			if (other->key == (const char *)other->trash_stack[UCL_TRASH_KEY]) {
+				new->trash_stack[UCL_TRASH_KEY] = malloc(other->keylen + 1);
+				memcpy(new->trash_stack[UCL_TRASH_KEY], other->trash_stack[UCL_TRASH_KEY], other->keylen);
+				new->trash_stack[UCL_TRASH_KEY][other->keylen] = '\0';
 				new->key = new->trash_stack[UCL_TRASH_KEY];
 			}
 		}

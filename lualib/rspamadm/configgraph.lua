@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,17 +31,16 @@ parser:option "-c --config"
 parser:flag "-a --all"
       :description('Show all nodes, not just existing ones')
 
-
 local function process_filename(fname)
   local cdir = rspamd_paths['CONFDIR'] .. '/'
   fname = fname:gsub(cdir, '')
   return fname
 end
 
-local function output_dot(opts, nodes, adjastency)
+local function output_dot(opts, nodes, adjacency)
   rspamd_logger.messagex("digraph rspamd {")
-  for k,node in pairs(nodes) do
-    local attrs = {"shape=box"}
+  for k, node in pairs(nodes) do
+    local attrs = { "shape=box" }
     local skip = false
     if node.exists then
       if node.priority >= 10 then
@@ -62,7 +61,7 @@ local function output_dot(opts, nodes, adjastency)
           table.concat(attrs, ','))
     end
   end
-  for _,adj in ipairs(adjastency) do
+  for _, adj in ipairs(adjacency) do
     local attrs = {}
     local skip = false
 
@@ -91,11 +90,11 @@ end
 
 local function load_config_traced(opts)
   local glob_traces = {}
-  local adjastency = {}
+  local adjacency = {}
   local nodes = {}
 
   local function maybe_match_glob(file)
-    for _,gl in ipairs(glob_traces) do
+    for _, gl in ipairs(glob_traces) do
       if gl.re:match(file) then
         return gl
       end
@@ -105,7 +104,7 @@ local function load_config_traced(opts)
   end
 
   local function add_dep(from, node, args)
-    adjastency[#adjastency + 1] = {
+    adjacency[#adjacency + 1] = {
       from = from,
       to = node,
       args = args
@@ -151,15 +150,14 @@ local function load_config_traced(opts)
     end
   end
 
-  local _r,err = rspamd_config:load_ucl(opts['config'], trace_func)
+  local _r, err = rspamd_config:load_ucl(opts['config'], trace_func)
   if not _r then
     rspamd_logger.errx('cannot parse %s: %s', opts['config'], err)
     os.exit(1)
   end
 
-  output_dot(opts, nodes, adjastency)
+  output_dot(opts, nodes, adjacency)
 end
-
 
 local function handler(args)
   local res = parser:parse(args)

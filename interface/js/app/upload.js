@@ -22,18 +22,20 @@
  THE SOFTWARE.
  */
 
-define(["jquery"],
-    function ($) {
+/* global require */
+
+define(["jquery", "app/common", "app/libft"],
+    ($, common, libft) => {
         "use strict";
-        var ui = {};
+        const ui = {};
 
         function cleanTextUpload(source) {
             $("#" + source + "TextSource").val("");
         }
 
         // @upload text
-        function uploadText(rspamd, data, source, headers) {
-            var url = null;
+        function uploadText(data, source, headers) {
+            let url = null;
             if (source === "spam") {
                 url = "learnspam";
             } else if (source === "ham") {
@@ -43,7 +45,17 @@ define(["jquery"],
             } else if (source === "scan") {
                 url = "checkv2";
             }
-            rspamd.query(url, {
+
+            function server() {
+                if (common.getSelector("selSrv") === "All SERVERS" &&
+                    common.getSelector("selLearnServers") === "random") {
+                    const servers = $("#selSrv option").slice(1).map((_, o) => o.value);
+                    return servers[Math.floor(Math.random() * servers.length)];
+                }
+                return null;
+            }
+
+            common.query(url, {
                 data: data,
                 params: {
                     processData: false,
@@ -52,194 +64,175 @@ define(["jquery"],
                 headers: headers,
                 success: function (json, jqXHR) {
                     cleanTextUpload(source);
-                    rspamd.alertMessage("alert-success", "Data successfully uploaded");
+                    common.alertMessage("alert-success", "Data successfully uploaded");
                     if (jqXHR.status !== 200) {
-                        rspamd.alertMessage("alert-info", jqXHR.statusText);
+                        common.alertMessage("alert-info", jqXHR.statusText);
                     }
-                }
+                },
+                server: server()
             });
         }
 
-        function columns_v2() {
-            return [{
-                name: "id",
-                title: "ID",
-                style: {
-                    "font-size": "11px",
-                    "minWidth": 130,
-                    "overflow": "hidden",
-                    "textOverflow": "ellipsis",
-                    "wordBreak": "break-all",
-                    "whiteSpace": "normal"
-                }
-            }, {
-                name: "action",
-                title: "Action",
-                style: {
-                    "font-size": "11px",
-                    "minwidth": 82
-                }
-            }, {
-                name: "score",
-                title: "Score",
-                style: {
-                    "font-size": "11px",
-                    "maxWidth": 110
+        // @upload text
+        function scanText(data, headers) {
+            common.query("checkv2", {
+                data: data,
+                params: {
+                    processData: false,
                 },
-                sortValue: function (val) { return Number(val.options.sortValue); }
-            }, {
-                name: "symbols",
-                title: "Symbols<br /><br />" +
-                        '<span style="font-weight:normal;">Sort by:</span><br />' +
-                        '<div class="btn-group btn-group-toggle btn-group-xs btn-sym-order-scan" data-toggle="buttons">' +
-                            '<label type="button" class="btn btn-outline-secondary btn-sym-scan-magnitude">' +
-                                '<input type="radio" value="magnitude">Magnitude</label>' +
-                            '<label type="button" class="btn btn-outline-secondary btn-sym-scan-score">' +
-                                '<input type="radio" value="score">Value</label>' +
-                            '<label type="button" class="btn btn-outline-secondary btn-sym-scan-name">' +
-                                '<input type="radio" value="name">Name</label>' +
-                        "</div>",
-                breakpoints: "all",
-                style: {
-                    "font-size": "11px",
-                    "width": 550,
-                    "maxWidth": 550
-                }
-            }, {
-                name: "time_real",
-                title: "Scan time",
-                breakpoints: "xs sm md",
-                style: {
-                    "font-size": "11px",
-                    "maxWidth": 72
+                method: "POST",
+                headers: headers,
+                success: function (neighbours_status) {
+                    function scrollTop(rows_total) {
+                        // Is there a way to get an event when all rows are loaded?
+                        libft.waitForRowsDisplayed("scan", rows_total, () => {
+                            $("#cleanScanHistory").removeAttr("disabled", true);
+                            $("html, body").animate({
+                                scrollTop: $("#scanResult").offset().top
+                            }, 1000);
+                        });
+                    }
+
+                    const json = neighbours_status[0].data;
+                    if (json.action) {
+                        common.alertMessage("alert-success", "Data successfully scanned");
+
+                        const rows_total = $("#historyTable_scan > tbody > tr:not(.footable-detail-row)").length + 1;
+                        const o = libft.process_history_v2({rows: [json]}, "scan");
+                        const {items} = o;
+                        common.symbols.scan.push(o.symbols[0]);
+
+                        if (Object.prototype.hasOwnProperty.call(common.tables, "scan")) {
+                            common.tables.scan.rows.load(items, true);
+                            scrollTop(rows_total);
+                        } else {
+                            libft.destroyTable("scan");
+                            require(["footable"], () => {
+                                // Is there a way to get an event when the table is destroyed?
+                                setTimeout(() => {
+                                    libft.initHistoryTable(data, items, "scan", libft.columns_v2("scan"), true);
+                                    scrollTop(rows_total);
+                                }, 200);
+                            });
+                        }
+                    } else {
+                        common.alertMessage("alert-error", "Cannot scan data");
+                    }
                 },
-                sortValue: function (val) { return Number(val); }
-            }, {
-                sorted: true,
-                direction: "DESC",
-                name: "time",
-                title: "Time",
-                style: {
-                    "font-size": "11px"
+                errorMessage: "Cannot upload data",
+                statusCode: {
+                    404: function () {
+                        common.alertMessage("alert-error", "Cannot upload data, no server found");
+                    },
+                    500: function () {
+                        common.alertMessage("alert-error", "Cannot tokenize message: no text data");
+                    },
+                    503: function () {
+                        common.alertMessage("alert-error", "Cannot tokenize message: no text data");
+                    }
                 },
-                sortValue: function (val) { return Number(val.options.sortValue); }
-            }];
+                server: common.getServer()
+            });
         }
 
-        // @upload text
-        function scanText(rspamd, tables, data, server) {
-            rspamd.query("checkv2", {
+        function getFuzzyHashes(data) {
+            function fillHashTable(rules) {
+                $("#hashTable tbody").empty();
+                for (const [rule, hashes] of Object.entries(rules)) {
+                    hashes.forEach((hash, i) => {
+                        $("#hashTable tbody").append("<tr>" +
+                          (i === 0 ? '<td rowspan="' + Object.keys(hashes).length + '">' + rule + "</td>" : "") +
+                          "<td>" + hash + "</td></tr>");
+                    });
+                }
+                $("#hash-card").slideDown();
+            }
+
+            common.query("plugins/fuzzy/hashes?flag=" + $("#fuzzy-flag").val(), {
                 data: data,
                 params: {
                     processData: false,
                 },
                 method: "POST",
                 success: function (neighbours_status) {
-                    var json = neighbours_status[0].data;
-                    if (json.action) {
-                        rspamd.alertMessage("alert-success", "Data successfully scanned");
-
-                        var rows_total = $("#historyTable_scan > tbody > tr:not(.footable-detail-row)").length + 1;
-                        var o = rspamd.process_history_v2(rspamd, {rows:[json]}, "scan");
-                        var items = o.items;
-                        rspamd.symbols.scan.push(o.symbols[0]);
-
-                        if (Object.prototype.hasOwnProperty.call(tables, "scan")) {
-                            tables.scan.rows.load(items, true);
-                            // Is there a way to get an event when all rows are loaded?
-                            rspamd.waitForRowsDisplayed("scan", rows_total, function () {
-                                rspamd.drawTooltips();
-                                $("html, body").animate({
-                                    scrollTop: $("#scanResult").offset().top
-                                }, 1000);
-                            });
-                        } else {
-                            rspamd.destroyTable("scan");
-                            // Is there a way to get an event when the table is destroyed?
-                            setTimeout(function () {
-                                rspamd.initHistoryTable(rspamd, data, items, "scan", columns_v2(), true);
-                                rspamd.waitForRowsDisplayed("scan", rows_total, function () {
-                                    $("html, body").animate({
-                                        scrollTop: $("#scanResult").offset().top
-                                    }, 1000);
-                                });
-                            }, 200);
-                        }
+                    const json = neighbours_status[0].data;
+                    if (json.success) {
+                        common.alertMessage("alert-success", "Message successfully processed");
+                        fillHashTable(json.hashes);
                     } else {
-                        rspamd.alertMessage("alert-error", "Cannot scan data");
+                        common.alertMessage("alert-error", "Unexpected error processing message");
                     }
                 },
-                errorMessage: "Cannot upload data",
-                statusCode: {
-                    404: function () {
-                        rspamd.alertMessage("alert-error", "Cannot upload data, no server found");
-                    },
-                    500: function () {
-                        rspamd.alertMessage("alert-error", "Cannot tokenize message: no text data");
-                    },
-                    503: function () {
-                        rspamd.alertMessage("alert-error", "Cannot tokenize message: no text data");
-                    }
-                },
-                server: server
+                server: common.getServer()
             });
         }
 
-        ui.setup = function (rspamd, tables) {
-            rspamd.set_page_size("scan", $("#scan_page_size").val());
-            rspamd.bindHistoryTableEventHandlers("scan", 3);
 
-            $("#cleanScanHistory").off("click");
-            $("#cleanScanHistory").on("click", function (e) {
-                e.preventDefault();
-                if (!confirm("Are you sure you want to clean scan history?")) { // eslint-disable-line no-alert
-                    return;
-                }
-                rspamd.destroyTable("scan");
-                rspamd.symbols.scan.length = 0;
-            });
+        libft.set_page_size("scan", $("#scan_page_size").val());
+        libft.bindHistoryTableEventHandlers("scan", 3);
 
-            function enable_disable_scan_btn() {
-                $("#scan button").prop("disabled", ($.trim($("textarea").val()).length === 0));
+        $("#cleanScanHistory").off("click");
+        $("#cleanScanHistory").on("click", (e) => {
+            e.preventDefault();
+            if (!confirm("Are you sure you want to clean scan history?")) { // eslint-disable-line no-alert
+                return;
             }
+            libft.destroyTable("scan");
+            common.symbols.scan.length = 0;
+            $("#cleanScanHistory").attr("disabled", true);
+        });
+
+        function enable_disable_scan_btn() {
+            $("#scan button:not(#cleanScanHistory, #scanOptionsToggle)")
+                .prop("disabled", ($.trim($("textarea").val()).length === 0));
+        }
+        enable_disable_scan_btn();
+        $("textarea").on("input", () => {
             enable_disable_scan_btn();
-            $("textarea").on("input", function () {
-                enable_disable_scan_btn();
-            });
+        });
 
-            $("#scanClean").on("click", function () {
-                $("#scan button").attr("disabled", true);
-                $("#scanMsgSource").val("");
-                $("#scanResult").hide();
-                $("#scanOutput tbody").remove();
-                $("html, body").animate({scrollTop:0}, 1000);
-                return false;
-            });
-            // @init upload
-            $("[data-upload]").on("click", function () {
-                var source = $(this).data("upload");
-                var data = $("#scanMsgSource").val();
-                var headers = (source === "fuzzy")
-                    ? {
-                        flag: $("#fuzzyFlagText").val(),
-                        weight: $("#fuzzyWeightText").val()
-                    }
-                    : {};
-                if ($.trim(data).length > 0) {
-                    if (source === "scan") {
-                        var checked_server = rspamd.getSelector("selSrv");
-                        var server = (checked_server === "All SERVERS") ? "local" : checked_server;
-                        scanText(rspamd, tables, data, server);
-                    } else {
-                        uploadText(rspamd, data, source, headers);
-                    }
+        $("#scanClean").on("click", () => {
+            $("#scan button:not(#cleanScanHistory, #scanOptionsToggle)").attr("disabled", true);
+            $("#scanForm")[0].reset();
+            $("#scanResult").hide();
+            $("#scanOutput tbody").remove();
+            $("html, body").animate({scrollTop: 0}, 1000);
+            return false;
+        });
+
+        $(".card-close-btn").on("click", function () {
+            $(this).closest(".card").slideUp();
+        });
+
+        $("[data-upload]").on("click", function () {
+            const source = $(this).data("upload");
+            const data = $("#scanMsgSource").val();
+            let headers = {};
+            if ($.trim(data).length > 0) {
+                if (source === "scan") {
+                    headers = ["IP", "User", "From", "Rcpt", "Helo", "Hostname"].reduce((o, header) => {
+                        const value = $("#scan-opt-" + header.toLowerCase()).val();
+                        if (value !== "") o[header] = value;
+                        return o;
+                    }, {});
+                    if ($("#scan-opt-pass-all").prop("checked")) headers.Pass = "all";
+                    scanText(data, headers);
+                } else if (source === "compute-fuzzy") {
+                    getFuzzyHashes(data);
                 } else {
-                    rspamd.alertMessage("alert-error", "Message source field cannot be blank");
+                    if (source === "fuzzy") {
+                        headers = {
+                            flag: $("#fuzzyFlagText").val(),
+                            weight: $("#fuzzyWeightText").val()
+                        };
+                    }
+                    uploadText(data, source, headers);
                 }
-                return false;
-            });
-        };
-
+            } else {
+                common.alertMessage("alert-error", "Message source field cannot be blank");
+            }
+            return false;
+        });
 
         return ui;
     });

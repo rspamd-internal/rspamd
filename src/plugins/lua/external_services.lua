@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2019, Carsten Rosenberg <c.rosenberg@heinlein-support.de>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,90 +27,89 @@ local N = "external_services"
 
 if confighelp then
   rspamd_config:add_example(nil, 'external_services',
-    "Check messages using external services (e.g. OEM AS engines, DCC, Pyzor etc)",
-    [[
-external_services {
-  # multiple scanners could be checked, for each we create a configuration block with an arbitrary name
+      "Check messages using external services (e.g. OEM AS engines, DCC, Pyzor etc)",
+      [[
+  external_services {
+    # multiple scanners could be checked, for each we create a configuration block with an arbitrary name
 
-  oletools {
-    # If set force this action if any virus is found (default unset: no action is forced)
-    # action = "reject";
-    # If set, then rejection message is set to this value (mention single quotes)
-    # If `max_size` is set, messages > n bytes in size are not scanned
-    # max_size = 20000000;
-    # log_clean = true;
-    # servers = "127.0.0.1:10050";
-    # cache_expire = 86400;
-    # scan_mime_parts = true;
-    # extended = false;
-    # if `patterns` is specified virus name will be matched against provided regexes and the related
-    # symbol will be yielded if a match is found. If no match is found, default symbol is yielded.
-    patterns {
-      # symbol_name = "pattern";
-      JUST_EICAR = "^Eicar-Test-Signature$";
+    oletools {
+      # If set force this action if any virus is found (default unset: no action is forced)
+      # action = "reject";
+      # If set, then rejection message is set to this value (mention single quotes)
+      # If `max_size` is set, messages > n bytes in size are not scanned
+      # max_size = 20000000;
+      # log_clean = true;
+      # servers = "127.0.0.1:10050";
+      # cache_expire = 86400;
+      # scan_mime_parts = true;
+      # extended = false;
+      # if `patterns` is specified virus name will be matched against provided regexes and the related
+      # symbol will be yielded if a match is found. If no match is found, default symbol is yielded.
+      patterns {
+        # symbol_name = "pattern";
+        JUST_EICAR = "^Eicar-Test-Signature$";
+      }
+      # mime-part regex matching in content-type or filename
+      mime_parts_filter_regex {
+        #GEN1 = "application\/octet-stream";
+        DOC2 = "application\/msword";
+        DOC3 = "application\/vnd\.ms-word.*";
+        XLS = "application\/vnd\.ms-excel.*";
+        PPT = "application\/vnd\.ms-powerpoint.*";
+        GEN2 = "application\/vnd\.openxmlformats-officedocument.*";
+      }
+      # Mime-Part filename extension matching (no regex)
+      mime_parts_filter_ext {
+        doc = "doc";
+        dot = "dot";
+        docx = "docx";
+        dotx = "dotx";
+        docm = "docm";
+        dotm = "dotm";
+        xls = "xls";
+        xlt = "xlt";
+        xla = "xla";
+        xlsx = "xlsx";
+        xltx = "xltx";
+        xlsm = "xlsm";
+        xltm = "xltm";
+        xlam = "xlam";
+        xlsb = "xlsb";
+        ppt = "ppt";
+        pot = "pot";
+        pps = "pps";
+        ppa = "ppa";
+        pptx = "pptx";
+        potx = "potx";
+        ppsx = "ppsx";
+        ppam = "ppam";
+        pptm = "pptm";
+        potm = "potm";
+        ppsm = "ppsm";
+      }
+      # `whitelist` points to a map of IP addresses. Mail from these addresses is not scanned.
+      whitelist = "/etc/rspamd/antivirus.wl";
     }
-    # mime-part regex matching in content-type or filename
-    mime_parts_filter_regex {
-      #GEN1 = "application\/octet-stream";
-      DOC2 = "application\/msword";
-      DOC3 = "application\/vnd\.ms-word.*";
-      XLS = "application\/vnd\.ms-excel.*";
-      PPT = "application\/vnd\.ms-powerpoint.*";
-      GEN2 = "application\/vnd\.openxmlformats-officedocument.*";
+    dcc {
+      # If set force this action if any virus is found (default unset: no action is forced)
+      # action = "reject";
+      # If set, then rejection message is set to this value (mention single quotes)
+      # If `max_size` is set, messages > n bytes in size are not scanned
+      max_size = 20000000;
+      #servers = "127.0.0.1:10045;
+      # if `patterns` is specified virus name will be matched against provided regexes and the related
+      # symbol will be yielded if a match is found. If no match is found, default symbol is yielded.
+      patterns {
+        # symbol_name = "pattern";
+        JUST_EICAR = "^Eicar-Test-Signature$";
+      }
+      # `whitelist` points to a map of IP addresses. Mail from these addresses is not scanned.
+      whitelist = "/etc/rspamd/antivirus.wl";
     }
-    # Mime-Part filename extension matching (no regex)
-    mime_parts_filter_ext {
-      doc = "doc";
-      dot = "dot";
-      docx = "docx";
-      dotx = "dotx";
-      docm = "docm";
-      dotm = "dotm";
-      xls = "xls";
-      xlt = "xlt";
-      xla = "xla";
-      xlsx = "xlsx";
-      xltx = "xltx";
-      xlsm = "xlsm";
-      xltm = "xltm";
-      xlam = "xlam";
-      xlsb = "xlsb";
-      ppt = "ppt";
-      pot = "pot";
-      pps = "pps";
-      ppa = "ppa";
-      pptx = "pptx";
-      potx = "potx";
-      ppsx = "ppsx";
-      ppam = "ppam";
-      pptm = "pptm";
-      potm = "potm";
-      ppsm = "ppsm";
-    }
-    # `whitelist` points to a map of IP addresses. Mail from these addresses is not scanned.
-    whitelist = "/etc/rspamd/antivirus.wl";
   }
-  dcc {
-    # If set force this action if any virus is found (default unset: no action is forced)
-    # action = "reject";
-    # If set, then rejection message is set to this value (mention single quotes)
-    # If `max_size` is set, messages > n bytes in size are not scanned
-    max_size = 20000000;
-    #servers = "127.0.0.1:10045;
-    # if `patterns` is specified virus name will be matched against provided regexes and the related
-    # symbol will be yielded if a match is found. If no match is found, default symbol is yielded.
-    patterns {
-      # symbol_name = "pattern";
-      JUST_EICAR = "^Eicar-Test-Signature$";
-    }
-    # `whitelist` points to a map of IP addresses. Mail from these addresses is not scanned.
-    whitelist = "/etc/rspamd/antivirus.wl";
-  }
-}
-]])
+  ]])
   return
 end
-
 
 local function add_scanner_rule(sym, opts)
   if not opts.type then
@@ -118,7 +117,6 @@ local function add_scanner_rule(sym, opts)
     return nil
   end
 
-  if not opts.symbol then opts.symbol = sym:upper() end
   local cfg = lua_scanners[opts.type]
 
   if not cfg then
@@ -131,14 +129,23 @@ local function add_scanner_rule(sym, opts)
 
   if not rule then
     rspamd_logger.errx(rspamd_config, 'cannot configure %s for %s',
-      opts.type, opts.symbol)
+        opts.type, rule.symbol or sym:upper())
     return nil
   end
 
   rule.type = opts.type
-
+  -- Fill missing symbols
+  if not rule.symbol then
+    rule.symbol = sym:upper()
+  end
   if not rule.symbol_fail then
     rule.symbol_fail = rule.symbol .. '_FAIL'
+  end
+  if not rule.symbol_encrypted then
+    rule.symbol_encrypted = rule.symbol .. '_ENCRYPTED'
+  end
+  if not rule.symbol_macro then
+    rule.symbol_macro = rule.symbol .. '_MACRO'
   end
 
   rule.redis_params = redis_params
@@ -174,17 +181,17 @@ local function add_scanner_rule(sym, opts)
       fun.each(function(p)
         local content = p:get_content()
         if content and #content > 0 then
-          cfg.check(task, content, p:get_digest(), rule)
+          cfg.check(task, content, p:get_digest(), rule, p)
         end
       end, common.check_parts_match(task, rule))
 
     else
-      cfg.check(task, task:get_content(), task:get_digest(), rule)
+      cfg.check(task, task:get_content(), task:get_digest(), rule, nil)
     end
   end
 
-  rspamd_logger.infox(rspamd_config, 'registered external services rule: %s',
-      rule.name)
+  rspamd_logger.infox(rspamd_config, 'registered external services rule: symbol %s; type %s',
+      rule.symbol, rule.type)
 
   return scan_cb, rule
 end
@@ -196,8 +203,12 @@ if opts and type(opts) == 'table' then
   local has_valid = false
   for k, m in pairs(opts) do
     if type(m) == 'table' and m.servers then
-      if not m.type then m.type = k end
-      if not m.name then m.name = k end
+      if not m.type then
+        m.type = k
+      end
+      if not m.name then
+        m.name = k
+      end
       local cb, nrule = add_scanner_rule(k, m)
 
       if not cb then
@@ -214,9 +225,17 @@ if opts and type(opts) == 'table' then
 
         if m.symbol_type == 'postfilter' then
           t.type = 'postfilter'
-          t.priority = 3
+          t.priority = lua_util.symbols_priorities.medium
         else
           t.type = 'normal'
+        end
+
+        t.augmentations = {}
+
+        if type(m.timeout) == 'number' then
+          -- Here, we ignore possible DNS timeout and timeout from multiple retries
+          -- as these situations are not usual nor likely for the external_services module
+          table.insert(t.augmentations, string.format("timeout=%f", m.timeout))
         end
 
         local id = rspamd_config:register_symbol(t)
@@ -265,6 +284,7 @@ if opts and type(opts) == 'table' then
                     type = 'virtual',
                     name = sym,
                     parent = id,
+                    score = 0.0,
                     group = N
                   })
                 end
@@ -276,15 +296,48 @@ if opts and type(opts) == 'table' then
                 type = 'virtual',
                 name = sym,
                 parent = id,
+                score = 0.0,
                 group = N
               })
             end
           end
         end
-
+        if type(m['patterns_fail']) == 'table' then
+          if m['patterns_fail'][1] then
+            for _, p in ipairs(m['patterns_fail']) do
+              if type(p) == 'table' then
+                for sym in pairs(p) do
+                  rspamd_logger.debugm(N, rspamd_config, 'registering: %1', {
+                    type = 'virtual',
+                    name = sym,
+                    parent = m['symbol'],
+                    parent_id = id,
+                  })
+                  rspamd_config:register_symbol({
+                    type = 'virtual',
+                    name = sym,
+                    parent = id,
+                    score = 0.0,
+                    group = N
+                  })
+                end
+              end
+            end
+          else
+            for sym in pairs(m['patterns_fail']) do
+              rspamd_config:register_symbol({
+                type = 'virtual',
+                name = sym,
+                parent = id,
+                score = 0.0,
+                group = N
+              })
+            end
+          end
+        end
         if m.symbols then
           local function reg_symbols(tbl)
-            for _,sym in pairs(tbl) do
+            for _, sym in pairs(tbl) do
               if type(sym) == 'string' then
                 rspamd_config:register_symbol({
                   type = 'virtual',
@@ -335,6 +388,15 @@ if opts and type(opts) == 'table' then
             description = description,
             group = group
           })
+        end
+
+        -- Add preloads if a module requires that
+        if type(m.preloads) == 'table' then
+          for _, preload in ipairs(m.preloads) do
+            rspamd_config:add_on_load(function(cfg, ev_base, worker)
+              preload(m, cfg, ev_base, worker)
+            end)
+          end
         end
       end
     end

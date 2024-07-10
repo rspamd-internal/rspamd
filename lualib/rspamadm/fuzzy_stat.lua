@@ -1,9 +1,10 @@
-local util = require "rspamd_util"
+local rspamd_util = require "rspamd_util"
+local lua_util = require "lua_util"
 local opts = {}
 
 local argparse = require "argparse"
 local parser = argparse()
-    :name "rspamadm confighelp"
+    :name "rspamadm control fuzzystat"
     :description "Shows help for the specified configuration options"
     :help_description_margin(32)
 parser:flag "--no-ips"
@@ -14,47 +15,93 @@ parser:flag "--short"
       :description "Short output mode"
 parser:flag "-n --number"
       :description "Disable numbers humanization"
-parser:option "-s --sort"
+parser:option "--sort"
       :description "Sort order"
       :convert {
-        matched = "matched",
-        errors = "errors",
-        ip = "ip"
-      }
+  checked = "checked",
+  matched = "matched",
+  errors = "errors",
+  name = "name"
+}
 
 local function add_data(target, src)
-  for k,v in pairs(src) do
-    if k ~= 'ips' then
+  for k, v in pairs(src) do
+    if type(v) == 'number' then
       if target[k] then
         target[k] = target[k] + v
       else
         target[k] = v
       end
-    else
-      if not target['ips'] then target['ips'] = {} end
+    elseif k == 'ips' then
+      if not target['ips'] then
+        target['ips'] = {}
+      end
       -- Iterate over IPs
-      for ip,st in pairs(v) do
-        if not target['ips'][ip] then target['ips'][ip] = {} end
+      for ip, st in pairs(v) do
+        if not target['ips'][ip] then
+          target['ips'][ip] = {}
+        end
         add_data(target['ips'][ip], st)
+      end
+    elseif k == 'flags' then
+      if not target['flags'] then
+        target['flags'] = {}
+      end
+      -- Iterate over Flags
+      for flag, st in pairs(v) do
+        if not target['flags'][flag] then
+          target['flags'][flag] = {}
+        end
+        add_data(target['flags'][flag], st)
+      end
+    elseif k == 'keypair' then
+      if type(v.extensions) == 'table' then
+        if type(v.extensions.name) == 'string' then
+          target.name = v.extensions.name
+        end
       end
     end
   end
 end
 
 local function print_num(num)
-  if opts['n'] or opts['number'] then
-    return tostring(num)
+  if num then
+    if opts['n'] or opts['number'] then
+      return tostring(num)
+    else
+      return rspamd_util.humanize_number(num)
+    end
   else
-    return util.humanize_number(num)
+    return 'na'
   end
 end
 
 local function print_stat(st, tabs)
   if st['checked'] then
-    print(string.format('%sChecked: %s', tabs, print_num(st['checked'])))
+    if st.checked_per_hour then
+      print(string.format('%sChecked: %s (%s per hour in average)', tabs,
+          print_num(st['checked']), print_num(st['checked_per_hour'])))
+    else
+      print(string.format('%sChecked: %s', tabs, print_num(st['checked'])))
+    end
   end
   if st['matched'] then
-    print(string.format('%sMatched: %s', tabs, print_num(st['matched'])))
+    if st.checked and st.checked > 0 and st.checked <= st.matched then
+      local percentage = st.matched / st.checked * 100.0
+      if st.matched_per_hour then
+        print(string.format('%sMatched: %s - %s percent (%s per hour in average)', tabs,
+            print_num(st['matched']), percentage, print_num(st['matched_per_hour'])))
+      else
+        print(string.format('%sMatched: %s - %s percent', tabs, print_num(st['matched']), percentage))
+      end
+    else
+      if st.matched_per_hour then
+        print(string.format('%sMatched: %s (%s per hour in average)', tabs,
+            print_num(st['matched']), print_num(st['matched_per_hour'])))
+      else
+        print(string.format('%sMatched: %s', tabs, print_num(st['matched'])))
+      end
+    end
   end
   if st['errors'] then
     print(string.format('%sErrors: %s', tabs, print_num(st['errors'])))
@@ -68,31 +115,31 @@ local function print_stat(st, tabs)
 end
 
 -- Sort by checked
-local function sort_ips(tbl, _opts)
+local function sort_hash_table(tbl, sort_opts, key_key)
   local res = {}
-  for k,v in pairs(tbl) do
-    table.insert(res, {ip = k, data = v})
+  for k, v in pairs(tbl) do
+    table.insert(res, { [key_key] = k, data = v })
   end
 
   local function sort_order(elt)
     local key = 'checked'
-    local _res = 0
+    local sort_res = 0
 
-    if _opts['sort'] then
-      if _opts['sort'] == 'matched' then
+    if sort_opts['sort'] then
+      if sort_opts['sort'] == 'matched' then
         key = 'matched'
-      elseif _opts['sort'] == 'errors' then
+      elseif sort_opts['sort'] == 'errors' then
         key = 'errors'
-      elseif _opts['sort'] == 'ip' then
-        return elt['ip']
+      elseif sort_opts['sort'] == 'name' then
+        return elt[key_key]
       end
     end
 
-    if elt['data'][key] then
-      _res = elt['data'][key]
+    if elt.data[key] then
+      sort_res = elt.data[key]
     end
 
-    return _res
+    return sort_res
   end
 
   table.sort(res, function(a, b)
@@ -106,12 +153,12 @@ local function add_result(dst, src, k)
   if type(src) == 'table' then
     if type(dst) == 'number' then
       -- Convert dst to table
-      dst = {dst}
+      dst = { dst }
     elseif type(dst) == 'nil' then
       dst = {}
     end
 
-    for i,v in ipairs(src) do
+    for i, v in ipairs(src) do
       if dst[i] and k ~= 'fuzzy_stored' then
         dst[i] = dst[i] + v
       else
@@ -154,7 +201,7 @@ local function print_result(r)
   end
   if type(r) == 'table' then
     local res = {}
-    for i,num in ipairs(r) do
+    for i, num in ipairs(r) do
       res[i] = string.format('(%s: %s)', num_to_epoch(i), print_num(num))
     end
 
@@ -171,7 +218,7 @@ return function(args, res)
   opts = parser:parse(args)
 
   if wrk then
-    for _,pr in pairs(wrk) do
+    for _, pr in pairs(wrk) do
       -- processes cycle
       if pr['data'] then
         local id = pr['id']
@@ -186,7 +233,7 @@ return function(args, res)
           end
 
           -- General stats
-          for k,v in pairs(pr['data']) do
+          for k, v in pairs(pr['data']) do
             if k ~= 'keys' and k ~= 'errors_ips' then
               res_db[k] = add_result(res_db[k], v, k)
             elseif k == 'errors_ips' then
@@ -194,7 +241,7 @@ return function(args, res)
               if not res_db['errors_ips'] then
                 res_db['errors_ips'] = {}
               end
-              for ip,nerrors in pairs(v) do
+              for ip, nerrors in pairs(v) do
                 if not res_db['errors_ips'][ip] then
                   res_db['errors_ips'][ip] = nerrors
                 else
@@ -211,7 +258,7 @@ return function(args, res)
               res_db['keys'] = res_keys
             end
             -- Go through keys in input
-            for k,elts in pairs(pr['data']['keys']) do
+            for k, elts in pairs(pr['data']['keys']) do
               -- keys cycle
               if not res_keys[k] then
                 res_keys[k] = {}
@@ -220,7 +267,7 @@ return function(args, res)
               add_data(res_keys[k], elts)
 
               if elts['ips'] then
-                for ip,v in pairs(elts['ips']) do
+                for ip, v in pairs(elts['ips']) do
                   if not res_ips[ip] then
                     res_ips[ip] = {}
                   end
@@ -235,10 +282,10 @@ return function(args, res)
   end
 
   -- General stats
-  for db,st in pairs(res_databases) do
+  for db, st in pairs(res_databases) do
     print(string.format('Statistics for storage %s', db))
 
-    for k,v in pairs(st) do
+    for k, v in pairs(st) do
       if k ~= 'keys' and k ~= 'errors_ips' then
         print(string.format('%s: %s', k, print_result(v)))
       end
@@ -246,20 +293,41 @@ return function(args, res)
     print('')
 
     local res_keys = st['keys']
-    if res_keys and not opts['no-keys'] and not opts['short'] then
+    if res_keys and not opts['no_keys'] and not opts['short'] then
       print('Keys statistics:')
-      for k,_st in pairs(res_keys) do
-        print(string.format('Key id: %s', k))
-        print_stat(_st, '\t')
+      -- Convert into an array to allow sorting
+      local sorted_keys = sort_hash_table(res_keys, opts, 'key')
 
-        if _st['ips'] and not opts['no-ips'] then
+      for _, key in ipairs(sorted_keys) do
+        local key_stat = key.data
+        if key_stat.name then
+          print(string.format('Key id: %s, name: %s', key.key, key_stat.name))
+        else
+          print(string.format('Key id: %s', key.key))
+        end
+
+        print_stat(key_stat, '\t')
+
+        if key_stat['ips'] and not opts['no_ips'] then
           print('')
           print('\tIPs stat:')
-          local sorted_ips = sort_ips(_st['ips'], opts)
+          local sorted_ips = sort_hash_table(key_stat['ips'], opts, 'ip')
 
-          for _,v in ipairs(sorted_ips) do
+          for _, v in ipairs(sorted_ips) do
             print(string.format('\t%s', v['ip']))
             print_stat(v['data'], '\t\t')
+            print('')
+          end
+        end
+
+        if key_stat.flags then
+          print('')
+          print('\tFlags stat:')
+          for flag, v in pairs(key_stat.flags) do
+            print(string.format('\t[%s]:', flag))
+            -- Remove irrelevant fields
+            v.checked = nil
+            print_stat(v, '\t\t')
             print('')
           end
         end
@@ -267,24 +335,27 @@ return function(args, res)
         print('')
       end
     end
-    if st['errors_ips'] and not opts['no-ips'] and not opts['short'] then
+    if st['errors_ips'] and not opts['no_ips'] and not opts['short'] then
       print('')
       print('Errors IPs statistics:')
-      table.sort(st['errors_ips'], function(a, b)
-        return a > b
+      local ip_stat = st['errors_ips']
+      local ips = lua_util.keys(ip_stat)
+      -- Reverse sort by number of errors
+      table.sort(ips, function(a, b)
+        return ip_stat[a] > ip_stat[b]
       end)
-      for i, v in pairs(st['errors_ips']) do
-        print(string.format('%s: %s', i, print_result(v)))
+      for _, ip in ipairs(ips) do
+        print(string.format('%s: %s', ip, print_result(ip_stat[ip])))
       end
       print('')
     end
   end
 
-  if not opts['no-ips'] and not opts['short'] then
+  if not opts['no_ips'] and not opts['short'] then
     print('')
     print('IPs statistics:')
 
-    local sorted_ips = sort_ips(res_ips, opts)
+    local sorted_ips = sort_hash_table(res_ips, opts, 'ip')
     for _, v in ipairs(sorted_ips) do
       print(string.format('%s', v['ip']))
       print_stat(v['data'], '\t')

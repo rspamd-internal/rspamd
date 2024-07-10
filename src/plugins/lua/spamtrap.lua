@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2016, Andrew Lewis <nerf@judo.za.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ local redis_params
 local use_redis = false;
 local M = 'spamtrap'
 local lua_util = require "lua_util"
+local fun = require "fun"
 
 local settings = {
   symbol = 'SPAMTRAP',
@@ -31,6 +32,7 @@ local settings = {
   fuzzy_flag = 1,
   fuzzy_weight = 10.0,
   key_prefix = 'sptr_',
+  allow_multiple_rcpts = false,
 }
 
 local check_authed = true
@@ -41,7 +43,6 @@ local function spamtrap_cb(task)
   local authed_user = task:get_user()
   local ip_addr = task:get_ip()
   local called_for_domain = false
-  local target
 
   if ((not check_authed and authed_user) or
       (not check_local and ip_addr and ip_addr:is_local())) then
@@ -52,83 +53,101 @@ local function spamtrap_cb(task)
   local function do_action(rcpt)
     if settings['learn_fuzzy'] then
       rspamd_plugins.fuzzy_check.learn(task,
-        settings['fuzzy_flag'],
-        settings['fuzzy_weight'])
+          settings['fuzzy_flag'],
+          settings['fuzzy_weight'])
     end
+    local act_flags = ''
     if settings['learn_spam'] then
       task:set_flag("learn_spam")
+      -- Allow processing as we still need to learn and do other stuff
+      act_flags = 'process_all'
     end
     task:insert_result(settings['symbol'], 1, rcpt)
 
-    if settings['action'] then
+    if settings.action then
       rspamd_logger.infox(task, 'spamtrap found: <%s>', rcpt)
+      local smtp_message
       if settings.smtp_message then
-        task:set_pre_result(settings['action'],
-          lua_util.template(settings.smtp_message, { rcpt = rcpt}), 'spamtrap')
+        smtp_message = lua_util.template(settings.smtp_message, { rcpt = rcpt })
       else
-        local smtp_message = 'unknown error'
+        smtp_message = 'unknown error'
         if settings.action == 'no action' then
           smtp_message = 'message accepted'
         elseif settings.action == 'reject' then
           smtp_message = 'message rejected'
         end
-        task:set_pre_result(settings['action'], smtp_message, 'spamtrap')
       end
+      task:set_pre_result { action = settings.action,
+                            message = smtp_message,
+                            module = 'spamtrap',
+                            flags = act_flags }
     end
+
+    return true
   end
 
-  local function redis_spamtrap_cb(err, data)
-    if err ~= nil then
-      rspamd_logger.errx(task, 'redis_spamtrap_cb received error: %1', err)
-      return
-    end
+  local function gen_redis_spamtrap_cb(target)
+    return function(err, data)
+      if err ~= nil then
+        rspamd_logger.errx(task, 'redis_spamtrap_cb received error: %1', err)
+        return
+      end
 
-    if data and type(data) ~= 'userdata' then
-      do_action(target)
-    else
-      if not called_for_domain then
-        -- Recurse for @catchall domain
-        target = rcpts[1]['domain']:lower()
-        local key = settings['key_prefix'] .. '@' .. target
-        local ret = rspamd_redis_make_request(task,
-          redis_params, -- connect params
-          key, -- hash key
-          false, -- is write
-          redis_spamtrap_cb, -- callback
-          'GET', -- command
-          {key} -- arguments
-        )
-        if not ret then
-          rspamd_logger.errx(task, "redis request wasn't scheduled")
-        end
-        called_for_domain = true
+      if data and type(data) ~= 'userdata' then
+        do_action(target)
       else
-        lua_util.debugm(M, task, 'skip spamtrap for %s', target)
+        if not called_for_domain then
+          -- Recurse for @catchall domain
+          target = rcpts[1]['domain']:lower()
+          local key = settings['key_prefix'] .. '@' .. target
+          local ret = rspamd_redis_make_request(task,
+              redis_params, -- connect params
+              key, -- hash key
+              false, -- is write
+              gen_redis_spamtrap_cb(target), -- callback
+              'GET', -- command
+              { key } -- arguments
+          )
+          if not ret then
+            rspamd_logger.errx(task, "redis request wasn't scheduled")
+          end
+          called_for_domain = true
+        else
+          lua_util.debugm(M, task, 'skip spamtrap for %s', target)
+        end
       end
     end
   end
 
   -- Do not risk a FP by checking for more than one recipient
-  if rcpts and #rcpts == 1 then
-    target = rcpts[1]['addr']:lower()
+  if rcpts and (#rcpts == 1 or (#rcpts > 0 and settings.allow_multiple_rcpts)) then
+    local targets = fun.map(function(r)
+      return r['addr']:lower()
+    end, rcpts)
     if use_redis then
-      local key = settings['key_prefix'] .. target
-      local ret = rspamd_redis_make_request(task,
-        redis_params, -- connect params
-        key, -- hash key
-        false, -- is write
-        redis_spamtrap_cb, -- callback
-        'GET', -- command
-        {key} -- arguments
-      )
-      if not ret then
-        rspamd_logger.errx(task, "redis request wasn't scheduled")
-      end
+      fun.each(function(target)
+        local key = settings['key_prefix'] .. target
+        local ret = rspamd_redis_make_request(task,
+            redis_params, -- connect params
+            key, -- hash key
+            false, -- is write
+            gen_redis_spamtrap_cb(target), -- callback
+            'GET', -- command
+            { key } -- arguments
+        )
+        if not ret then
+          rspamd_logger.errx(task, "redis request wasn't scheduled")
+        end
+      end, targets)
+
     elseif settings['map'] then
-      if settings['map']:get_key(target) then
-        do_action(target)
-      else
-        lua_util.debugm(M, task, 'skip spamtrap for %s', target)
+      local function check_map_functor(target)
+        if settings['map']:get_key(target) then
+          return do_action(target)
+        end
+      end
+      if not fun.any(check_map_functor, targets) then
+        lua_util.debugm(M, task, 'skip spamtrap')
       end
     end
   end
@@ -142,18 +161,17 @@ if not (opts and type(opts) == 'table') then
   return
 end
 
-
 local auth_and_local_conf = lua_util.config_check_local_or_authed(rspamd_config, 'spamtrap',
     false, false)
 check_local = auth_and_local_conf[1]
 check_authed = auth_and_local_conf[2]
 
 if opts then
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     settings[k] = v
   end
   if settings['map'] then
-    settings['map'] = rspamd_config:add_map{
+    settings['map'] = rspamd_config:add_map {
       url = settings['map'],
       description = string.format("Spamtrap map for %s", settings['symbol']),
       type = "regexp"
@@ -162,7 +180,7 @@ if opts then
     redis_params = rspamd_parse_redis_server('spamtrap')
     if not redis_params then
       rspamd_logger.errx(
-        rspamd_config, 'no redis servers are specified, disabling module')
+          rspamd_config, 'no redis servers are specified, disabling module')
       return
     end
     use_redis = true;

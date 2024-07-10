@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2011-2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,13 +33,6 @@ reconf['MICROSOFT_SPAM'] = {
   group = 'upstream_spam_filters'
 }
 
-reconf['AOL_SPAM'] = {
-  re = 'X-AOL-Global-Disposition=/^S/H',
-  score = 5.0,
-  description = "AOL says this message is spam",
-  group = 'upstream_spam_filters'
-}
-
 reconf['KLMS_SPAM'] = {
   re = 'X-KLMS-AntiSpam-Status=/^spam/H',
   score = 5.0,
@@ -58,7 +51,9 @@ reconf['SPAM_FLAG'] = {
 }
 
 reconf['UNITEDINTERNET_SPAM'] = {
-  re = 'X-UI-Out-Filterresults=/^junk:/H',
+  re = string.format('%s || %s',
+      'X-UI-Filterresults=/^junk:/H',
+      'X-UI-Out-Filterresults=/^junk:/H'),
   score = 5.0,
   description = "United Internet says this message is spam",
   group = 'upstream_spam_filters'

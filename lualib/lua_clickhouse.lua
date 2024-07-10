@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2018, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2018, Mikhail Galanin <mgalanin@mimecast.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,7 @@ local function escape_spaces(query)
 end
 
 local function ch_number(a)
-  if (a+2^52)-2^52 == a then
+  if (a + 2 ^ 52) - 2 ^ 52 == a then
     -- Integer
     return tostring(math.floor(a))
   end
@@ -45,11 +45,12 @@ end
 
 local function clickhouse_quote(str)
   if str then
-    return str:gsub('[\'\\\n\t]', {
+    return str:gsub('[\'\\\n\t\r]', {
       ['\''] = [[\']],
       ['\\'] = [[\\]],
       ['\n'] = [[\n]],
       ['\t'] = [[\t]],
+      ['\r'] = [[\r]],
     })
   end
 
@@ -58,10 +59,13 @@ end
 
 -- Converts an array to a string suitable for clickhouse
 local function array_to_string(ar)
-  for i,elt in ipairs(ar) do
-    if type(elt) == 'string' then
-      ar[i] = '\'' .. clickhouse_quote(elt) .. '\''
-    elseif type(elt) == 'number' then
+  for i, elt in ipairs(ar) do
+    local t = type(elt)
+    if t == 'string' then
+      ar[i] = string.format('\'%s\'', clickhouse_quote(elt))
+    elseif t == 'userdata' then
+      ar[i] = string.format('\'%s\'', clickhouse_quote(tostring(elt)))
+    elseif t == 'number' then
       ar[i] = ch_number(elt)
     end
   end
@@ -72,11 +76,14 @@ end
 -- Converts a row into TSV, taking extra care about arrays
 local function row_to_tsv(row)
 
-  for i,elt in ipairs(row) do
-    if type(elt) == 'table' then
+  for i, elt in ipairs(row) do
+    local t = type(elt)
+    if t == 'table' then
       row[i] = '[' .. array_to_string(elt) .. ']'
-    elseif type(elt) == 'number' then
+    elseif t == 'number' then
       row[i] = ch_number(elt)
+    elseif t == 'userdata' then
+      row[i] = clickhouse_quote(tostring(elt))
     else
       row[i] = clickhouse_quote(elt)
     end
@@ -88,7 +95,7 @@ end
 exports.row_to_tsv = row_to_tsv
 
 -- Parses JSONEachRow reply from CH
-local function parse_clickhouse_response_json_eachrow(params, data)
+local function parse_clickhouse_response_json_eachrow(params, data, row_cb)
   local ucl = require "ucl"
 
   if data == nil then
@@ -98,7 +105,13 @@ local function parse_clickhouse_response_json_eachrow(params, data)
 
   local function parse_string(s)
     local parser = ucl.parser()
-    local res, err = parser:parse_string(s)
+    local res, err
+    if type(s) == 'string' then
+      res, err = parser:parse_string(s)
+    else
+      res, err = parser:parse_text(s)
+    end
+
     if not res then
       rspamd_logger.errx(params.log_obj, 'Parser error: %s', err)
       return nil
@@ -107,13 +120,16 @@ local function parse_clickhouse_response_json_eachrow(params, data)
   end
 
   -- iterate over rows and parse
-  local ch_rows = lua_util.str_split(data, "\n")
   local parsed_rows = {}
-  for _, plain_row in pairs(ch_rows) do
-    if plain_row and plain_row:len() > 1 then
+  for plain_row in data:lines() do
+    if plain_row and #plain_row > 1 then
       local parsed_row = parse_string(plain_row)
       if parsed_row then
-        table.insert(parsed_rows, parsed_row)
+        if row_cb then
+          row_cb(parsed_row)
+        else
+          table.insert(parsed_rows, parsed_row)
+        end
       end
     end
   end
@@ -132,7 +148,14 @@ local function parse_clickhouse_response_json(params, data)
 
   local function parse_string(s)
     local parser = ucl.parser()
-    local res, err = parser:parse_string(s)
+    local res, err
+
+    if type(s) == 'string' then
+      res, err = parser:parse_string(s)
+    else
+      res, err = parser:parse_text(s)
+    end
+
     if not res then
       rspamd_logger.errx(params.log_obj, 'Parser error: %s', err)
       return nil
@@ -146,14 +169,16 @@ local function parse_clickhouse_response_json(params, data)
     return 'bad json', {}
   end
 
-  return nil,json
+  return nil, json
 end
 
 -- Helper to generate HTTP closure
-local function mk_http_select_cb(upstream, params, ok_cb, fail_cb)
+local function mk_http_select_cb(upstream, params, ok_cb, fail_cb, row_cb)
   local function http_cb(err_message, code, data, _)
     if code ~= 200 or err_message then
-      if not err_message then err_message = data end
+      if not err_message then
+        err_message = data
+      end
       local ip_addr = upstream:get_addr():to_string(true)
 
       if fail_cb then
@@ -166,7 +191,7 @@ local function mk_http_select_cb(upstream, params, ok_cb, fail_cb)
       upstream:fail()
     else
       upstream:ok()
-      local rows = parse_clickhouse_response_json_eachrow(params, data)
+      local rows = parse_clickhouse_response_json_eachrow(params, data, row_cb)
 
       if rows then
         if ok_cb then
@@ -182,8 +207,8 @@ local function mk_http_select_cb(upstream, params, ok_cb, fail_cb)
         else
           local ip_addr = upstream:get_addr():to_string(true)
           rspamd_logger.errx(params.log_obj,
-            "request failed on clickhouse server %s: %s",
-            ip_addr, 'failed to parse reply')
+              "request failed on clickhouse server %s: %s",
+              ip_addr, 'failed to parse reply')
         end
       end
     end
@@ -196,7 +221,9 @@ end
 local function mk_http_insert_cb(upstream, params, ok_cb, fail_cb)
   local function http_cb(err_message, code, data, _)
     if code ~= 200 or err_message then
-      if not err_message then err_message = data end
+      if not err_message then
+        err_message = data
+      end
       local ip_addr = upstream:get_addr():to_string(true)
 
       if fail_cb then
@@ -211,7 +238,7 @@ local function mk_http_insert_cb(upstream, params, ok_cb, fail_cb)
       upstream:ok()
 
       if ok_cb then
-        local err,parsed = parse_clickhouse_response_json(data)
+        local err, parsed = parse_clickhouse_response_json(data)
 
         if err then
           fail_cb(params, err, data)
@@ -245,16 +272,19 @@ end
 -- @param {string} query select query (passed in HTTP body)
 -- @param {function} ok_cb callback to be called in case of success
 -- @param {function} fail_cb callback to be called in case of some error
+-- @param {function} row_cb optional callback to be called on each parsed data row (instead of table insertion)
 -- @return {boolean} whether a connection was successful
 -- @example
 --
 --]]
-exports.select = function (upstream, settings, params, query, ok_cb, fail_cb)
+exports.select = function(upstream, settings, params, query, ok_cb, fail_cb, row_cb)
   local http_params = {}
 
-  for k,v in pairs(params) do http_params[k] = v end
+  for k, v in pairs(params) do
+    http_params[k] = v
+  end
 
-  http_params.callback = mk_http_select_cb(upstream, http_params, ok_cb, fail_cb)
+  http_params.callback = mk_http_select_cb(upstream, http_params, ok_cb, fail_cb, row_cb)
   http_params.gzip = settings.use_gzip
   http_params.mime_type = 'text/plain'
   http_params.timeout = settings.timeout or default_timeout
@@ -263,6 +293,7 @@ exports.select = function (upstream, settings, params, query, ok_cb, fail_cb)
   http_params.password = settings.password
   http_params.body = query
   http_params.log_obj = params.task or params.config
+  http_params.opaque_body = true
 
   lua_util.debugm(N, http_params.log_obj, "clickhouse select request: %s", http_params.body)
 
@@ -282,7 +313,7 @@ end
 
 --[[[
 -- @function lua_clickhouse.select_sync(upstream, settings, params, query,
-      ok_cb, fail_cb)
+      ok_cb, fail_cb, row_cb)
 -- Make select request to clickhouse
 -- @param {upstream} upstream clickhouse server upstream
 -- @param {table} settings global settings table:
@@ -295,16 +326,19 @@ end
 -- @param {string} query select query (passed in HTTP body)
 -- @param {function} ok_cb callback to be called in case of success
 -- @param {function} fail_cb callback to be called in case of some error
+-- @param {function} row_cb optional callback to be called on each parsed data row (instead of table insertion)
 -- @return
 --          {string} error message if exists
 --          nil | {rows} | {http_response}
 -- @example
 --
 --]]
-exports.select_sync = function (upstream, settings, params, query, ok_cb, fail_cb)
+exports.select_sync = function(upstream, settings, params, query, row_cb)
   local http_params = {}
 
-  for k,v in pairs(params) do http_params[k] = v end
+  for k, v in pairs(params) do
+    http_params[k] = v
+  end
 
   http_params.gzip = settings.use_gzip
   http_params.mime_type = 'text/plain'
@@ -314,6 +348,7 @@ exports.select_sync = function (upstream, settings, params, query, ok_cb, fail_c
   http_params.password = settings.password
   http_params.body = query
   http_params.log_obj = params.task or params.config
+  http_params.opaque_body = true
 
   lua_util.debugm(N, http_params.log_obj, "clickhouse select request: %s", http_params.body)
 
@@ -336,7 +371,7 @@ exports.select_sync = function (upstream, settings, params, query, ok_cb, fail_c
     return response.content, response
   else
     lua_util.debugm(N, http_params.log_obj, "clickhouse select response: %1", response)
-    local rows = parse_clickhouse_response_json_eachrow(params, response.content)
+    local rows = parse_clickhouse_response_json_eachrow(params, response.content, row_cb)
     return nil, rows
   end
 end
@@ -361,11 +396,13 @@ end
 -- @example
 --
 --]]
-exports.insert = function (upstream, settings, params, query, rows,
-                              ok_cb, fail_cb)
+exports.insert = function(upstream, settings, params, query, rows,
+                          ok_cb, fail_cb)
   local http_params = {}
 
-  for k,v in pairs(params) do http_params[k] = v end
+  for k, v in pairs(params) do
+    http_params[k] = v
+  end
 
   http_params.callback = mk_http_insert_cb(upstream, http_params, ok_cb, fail_cb)
   http_params.gzip = settings.use_gzip
@@ -375,7 +412,7 @@ exports.insert = function (upstream, settings, params, query, rows,
   http_params.user = settings.user
   http_params.password = settings.password
   http_params.method = 'POST'
-  http_params.body = {rspamd_text.fromtable(rows, '\n'), '\n'}
+  http_params.body = { rspamd_text.fromtable(rows, '\n'), '\n' }
   http_params.log_obj = params.task or params.config
 
   if not http_params.url then
@@ -414,11 +451,13 @@ end
 -- @example
 --
 --]]
-exports.generic = function (upstream, settings, params, query,
+exports.generic = function(upstream, settings, params, query,
                            ok_cb, fail_cb)
   local http_params = {}
 
-  for k,v in pairs(params) do http_params[k] = v end
+  for k, v in pairs(params) do
+    http_params[k] = v
+  end
 
   http_params.callback = mk_http_insert_cb(upstream, http_params, ok_cb, fail_cb)
   http_params.gzip = settings.use_gzip
@@ -461,10 +500,12 @@ end
 -- @example
 --
 --]]
-exports.generic_sync = function (upstream, settings, params, query)
+exports.generic_sync = function(upstream, settings, params, query)
   local http_params = {}
 
-  for k,v in pairs(params) do http_params[k] = v end
+  for k, v in pairs(params) do
+    http_params[k] = v
+  end
 
   http_params.gzip = settings.use_gzip
   http_params.mime_type = 'text/plain'
@@ -494,10 +535,10 @@ exports.generic_sync = function (upstream, settings, params, query)
     return response.content, response
   else
     lua_util.debugm(N, http_params.log_obj, "clickhouse generic response: %1", response)
-    local e,obj = parse_clickhouse_response_json(params, response.content)
+    local e, obj = parse_clickhouse_response_json(params, response.content)
 
     if e then
-      return e,nil
+      return e, nil
     end
     return nil, obj
   end

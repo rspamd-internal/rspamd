@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2016, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 Copyright (c) 2016, Alexey Savelyev <info@homeweb.ru>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,19 +40,32 @@ if confighelp then
       "Performs adaptive greylisting using Redis",
       [[
 greylist {
-  expire = 1d; # Buckets expire (1 day by default)
-  timeout = 5m; # Greylisting timeout
-  key_prefix = 'rg'; # Redis prefix
-  max_data_len = 10k; # Use boy hash up to this value of bytes for greylisting
-  message = 'Try again later'; # Default greylisting message
-  symbol = 'GREYLIST'; # Append symbol
-  action = 'soft reject'; # Default action change (for Exim use `greylist`)
-  whitelist_symbols = []; # Skip greylisting if one of the following symbols has been found
-  ipv4_mask = 19; # Mask bits for ipv4
-  ipv6_mask = 64; # Mask bits for ipv6
-  report_time = false; # Tell when greylisting is expired (appended to `message`)
-  check_local = false; # Greylist local messages
-  check_authed = false; # Greylist authenticated users
+  # Buckets expire (1 day by default)
+  expire = 1d;
+  # Greylisting timeout
+  timeout = 5m;
+  # Redis prefix
+  key_prefix = 'rg';
+  # Use body hash up to this value of bytes for greylisting
+  max_data_len = 10k;
+  # Default greylisting message
+  message = 'Try again later';
+  # Append symbol on greylisting
+  symbol = 'GREYLIST';
+  # Default action change (for Exim use `greylist`)
+  action = 'soft reject';
+  # Skip greylisting if one of the following symbols has been found
+  whitelist_symbols = [];
+  # Mask bits for ipv4
+  ipv4_mask = 19;
+  # Mask bits for ipv6
+  ipv6_mask = 64;
+   # Tell when greylisting is expired (appended to `message`)
+  report_time = false;
+  # Greylist local messages
+  check_local = false;
+  # Greylist messages from authenticated users
+  check_authed = false;
 }
   ]])
   return
@@ -75,7 +88,7 @@ local settings = {
   whitelist_symbols = {}, -- whitelist when specific symbols have been found
   ipv4_mask = 19, -- Mask bits for ipv4
   ipv6_mask = 64, -- Mask bits for ipv6
-  report_time = false, -- Tell when greylisting is epired (appended to `message`)
+  report_time = false, -- Tell when greylisting is expired (appended to `message`)
   check_local = false,
   check_authed = false,
 }
@@ -98,7 +111,9 @@ local function data_key(task)
 
   local body = task:get_rawbody()
 
-  if not body then return nil end
+  if not body then
+    return nil
+  end
 
   local len = body:len()
   if len > settings['max_data_len'] then
@@ -162,16 +177,16 @@ local function check_time(task, tm, type, now)
 
   if not t then
     rspamd_logger.errx(task, 'not a valid number: %s', tm)
-    return false,false
+    return false, false
   end
 
   if now - t < settings['timeout'] then
-    return true,true
+    return true, true
   else
     -- We just set variable to pass when in post-filter stage
     task:get_mempool():set_variable("grey_whitelisted", type)
 
-    return true,false
+    return true, false
   end
 end
 
@@ -184,7 +199,7 @@ local function greylist_message(task, end_time, why)
 
   if settings.message_func then
     task:set_pre_result(settings['action'],
-      settings.message_func(task, end_time), N)
+        settings.message_func(task, end_time), N)
   else
     local message = settings['message']
     if settings.report_time then
@@ -224,12 +239,12 @@ local function greylist_check(task)
     local greylisted_meta = false
 
     if data then
-      local end_time_body,end_time_meta
+      local end_time_body, end_time_meta
       local now = rspamd_util.get_time()
 
       if data[1] and type(data[1]) ~= 'userdata' then
         local tm = tonumber(data[1]) or now
-        ret_body,greylisted_body = check_time(task, data[1], 'body', now)
+        ret_body, greylisted_body = check_time(task, data[1], 'body', now)
         if greylisted_body then
           end_time_body = tm + settings['timeout']
           task:get_mempool():set_variable("grey_greylisted_body",
@@ -240,7 +255,7 @@ local function greylist_check(task)
       if data[2] and type(data[2]) ~= 'userdata' then
         if not ret_body or greylisted_body then
           local tm = tonumber(data[2]) or now
-          ret_meta,greylisted_meta = check_time(task, data[2], 'meta', now)
+          ret_meta, greylisted_meta = check_time(task, data[2], 'meta', now)
 
           if greylisted_meta then
             end_time_meta = tm + settings['timeout']
@@ -285,7 +300,7 @@ local function greylist_check(task)
       false, -- is write
       redis_get_cb, --callback
       'MGET', -- command
-      {body_key, meta_key} -- arguments
+      { body_key, meta_key } -- arguments
   )
   if not ret then
     rspamd_logger.errx(task, 'cannot make redis request to check results')
@@ -293,14 +308,16 @@ local function greylist_check(task)
 end
 
 local function greylist_set(task)
-  local action = task:get_metric_action('default')
+  local action = task:get_metric_action()
   local ip = task:get_ip()
 
   -- Don't do anything if pre-result has been already set
-  if task:has_pre_result() then return end
+  if task:has_pre_result() then
+    return
+  end
 
   -- Check whitelist_symbols
-  for _,sym in ipairs(settings.whitelist_symbols) do
+  for _, sym in ipairs(settings.whitelist_symbols) do
     if task:has_symbol(sym) then
       rspamd_logger.infox(task, 'skip greylisting as we have found symbol %s', sym)
       if action == 'greylist' then
@@ -374,7 +391,7 @@ local function greylist_set(task)
   local function redis_set_cb(err)
     if err then
       rspamd_logger.errx(task, 'got error %s when setting greylisting record on server %s',
-        err, upstream:get_addr())
+          err, upstream:get_addr())
     end
   end
 
@@ -389,18 +406,20 @@ local function greylist_set(task)
 
     task:insert_result(settings['symbol'], 0.0, 'pass', is_whitelisted)
     rspamd_logger.infox(task, 'greylisting pass (%s) until %s',
-      is_whitelisted,
-      rspamd_util.time_to_string(rspamd_util.get_time() + settings['expire']))
+        is_whitelisted,
+        rspamd_util.time_to_string(rspamd_util.get_time() + settings['expire']))
 
-    if not settings.check_local and is_rspamc then return end
+    if not settings.check_local and is_rspamc then
+      return
+    end
 
-    ret,conn,upstream = lua_redis.redis_make_request(task,
-      redis_params, -- connect params
-      hash_key, -- hash key
-      true, -- is write
-      redis_set_cb, --callback
-      'EXPIRE', -- command
-      {body_key, tostring(toint(settings['expire']))} -- arguments
+    ret, conn, upstream = lua_redis.redis_make_request(task,
+        redis_params, -- connect params
+        hash_key, -- hash key
+        true, -- is write
+        redis_set_cb, --callback
+        'EXPIRE', -- command
+        { body_key, tostring(toint(settings['expire'])) } -- arguments
     )
     -- Update greylisting record expire
     if ret then
@@ -411,19 +430,21 @@ local function greylist_set(task)
       rspamd_logger.errx(task, 'got error while connecting to redis')
     end
   elseif do_greylisting or do_greylisting_required then
-    if not settings.check_local and is_rspamc then return end
+    if not settings.check_local and is_rspamc then
+      return
+    end
     local t = tostring(toint(rspamd_util.get_time()))
     local end_time = rspamd_util.time_to_string(t + settings['timeout'])
     rspamd_logger.infox(task, 'greylisted until "%s", new record', end_time)
     greylist_message(task, end_time, 'new record')
     -- Create new record
-    ret,conn,upstream = lua_redis.redis_make_request(task,
-      redis_params, -- connect params
-      hash_key, -- hash key
-      true, -- is write
-      redis_set_cb, --callback
-      'SETEX', -- command
-      {body_key, tostring(toint(settings['expire'])), t} -- arguments
+    ret, conn, upstream = lua_redis.redis_make_request(task,
+        redis_params, -- connect params
+        hash_key, -- hash key
+        true, -- is write
+        redis_set_cb, --callback
+        'SETEX', -- command
+        { body_key, tostring(toint(settings['expire'])), t } -- arguments
     )
 
     if ret then
@@ -459,7 +480,7 @@ if opts then
     settings.message_func = assert(load(opts['message_func']))()
   end
 
-  for k,v in pairs(opts) do
+  for k, v in pairs(opts) do
     if k ~= 'message_func' then
       settings[k] = v
     end
@@ -480,9 +501,9 @@ if opts then
   end
 
   whitelisted_ip = lua_map.rspamd_map_add(N, 'whitelisted_ip', 'radix',
-    'Greylist whitelist ip map')
+      'Greylist whitelist ip map')
   whitelist_domains_map = lua_map.rspamd_map_add(N, 'whitelist_domains_url',
-    'map', 'Greylist whitelist domains map')
+      'map', 'Greylist whitelist domains map')
 
   redis_params = lua_redis.parse_redis_server(N)
   if not redis_params then
@@ -501,13 +522,15 @@ if opts then
       name = 'GREYLIST_SAVE',
       type = 'postfilter',
       callback = greylist_set,
-      priority = 6,
+      priority = lua_util.symbols_priorities.medium,
+      augmentations = { string.format("timeout=%f", redis_params.timeout or 0.0) },
     })
     local id = rspamd_config:register_symbol({
       name = 'GREYLIST_CHECK',
       type = 'prefilter',
       callback = greylist_check,
-      priority = 6,
+      priority = lua_util.symbols_priorities.medium,
+      augmentations = { string.format("timeout=%f", redis_params.timeout or 0.0) }
     })
     rspamd_config:register_symbol({
       name = settings.symbol,

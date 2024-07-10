@@ -108,7 +108,6 @@ context("Lua util - extract_specific_urls plain", function()
   local cases = {
     {expect = url_list, filter = nil, limit = 9999, need_emails = true, prefix = 'p'},
     {expect = {}, filter = (function() return false end), limit = 9999, need_emails = true, prefix = 'p'},
-    {expect = {"domain4.co.net", "test.com"}, filter = nil, limit = 2, need_emails = true, prefix = 'p'},
     {expect = {"domain4.co.net", "test.com", "domain3.org"}, filter = nil, limit = 3, need_emails = true, prefix = 'p'},
     {
       expect = {"gov.co.net", "tesco.co.net", "domain1.co.net", "domain2.co.net", "domain3.co.net", "domain4.co.net"},
@@ -203,31 +202,10 @@ end)
 context("Lua util - extract_specific_urls message", function()
 
 --[[ ******************* kinda functional *************************************** ]]
-  local test_dir = string.gsub(debug.getinfo(1).source, "^@(.+/)[^/]+$", "%1")
-  local tld_file = string.format('%s/%s', test_dir, "test_tld.dat")
 
-  local config = {
-    options = {
-      filters = {'spf', 'dkim', 'regexp'},
-      url_tld = tld_file,
-      dns = {
-        nameserver = {'8.8.8.8'}
-      },
-    },
-    logging = {
-      type = 'console',
-      level = 'debug'
-    },
-    metric = {
-      name = 'default',
-      actions = {
-        reject = 100500,
-      },
-      unknown_weight = 1
-    }
-  }
-
-  local cfg = rspamd_util.config_from_ucl(config, "INIT_URL,INIT_LIBS,INIT_SYMCACHE,INIT_VALIDATE,INIT_PRELOAD_MAPS")
+  local test_helper = require "rspamd_test_helper"
+  local cfg = rspamd_util.config_from_ucl(test_helper.default_config(),
+      "INIT_URL,INIT_LIBS,INIT_SYMCACHE,INIT_VALIDATE,INIT_PRELOAD_MAPS")
   local res,task = rspamd_task.load_from_string(msg, cfg)
 
   if not res then

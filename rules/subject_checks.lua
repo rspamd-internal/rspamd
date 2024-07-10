@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2017, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ local subject_re = rspamd_regexp.create('/^(?:(?:Re|Fwd|Fw|Aw|Antwort|Sv):\\s*)+
 
 local function test_subject(task, check_function, rate)
   local function normalize_linear(a, x)
-      local f = a * x
-      return true, (( f < 1 ) and f or 1), tostring(x)
+    local f = a * x
+    return true, ((f < 1) and f or 1), tostring(x)
   end
 
   local sbj = task:get_header('Subject')
@@ -48,12 +48,12 @@ rspamd_config.SUBJ_ALL_CAPS = {
     local caps_test = function(sbj)
       return util.is_uppercase(sbj)
     end
-    return test_subject(task, caps_test, 1.0/40.0)
+    return test_subject(task, caps_test, 1.0 / 40.0)
   end,
   score = 3.0,
   group = 'subject',
   type = 'mime',
-  description = 'All capital letters in subject'
+  description = 'Subject contains mostly capital letters'
 }
 
 rspamd_config.LONG_SUBJ = {
@@ -61,10 +61,10 @@ rspamd_config.LONG_SUBJ = {
     local length_test = function(_, len)
       return len > 200
     end
-    return test_subject(task, length_test, 1.0/400.0)
+    return test_subject(task, length_test, 1.0 / 400.0)
   end,
   score = 3.0,
   group = 'subject',
   type = 'mime',
-  description = 'Subject is too long'
+  description = 'Subject is very long'
 }

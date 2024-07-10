@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ local pdf_patterns = {
     patterns = {
       [[netsh\s]],
       [[echo\s]],
-      [[\/[A-Za-z]*#\d\d(?:[#A-Za-z<>/\s])]], -- Hex encode obfuscation
+      [=[\/[A-Za-z]*#\d\d[#A-Za-z<>/\s]]=], -- Hex encode obfuscation
     }
   },
   start_object = {
@@ -147,10 +147,10 @@ local function compile_tries()
       rspamd_trie.flags.no_start)
   local function compile_pats(patterns, indexes, compile_flags)
     local strs = {}
-    for what,data in pairs(patterns) do
-      for i,pat in ipairs(data.patterns) do
+    for what, data in pairs(patterns) do
+      for i, pat in ipairs(data.patterns) do
         strs[#strs + 1] = pat
-        indexes[#indexes + 1] = {what, data, pat, i}
+        indexes[#indexes + 1] = { what, data, pat, i }
       end
     end
 
@@ -175,23 +175,20 @@ local function generic_grammar_elts()
   local S = lpeg.S
   local V = lpeg.V
   local C = lpeg.C
-  local D = R'09' -- Digits
+  local D = R '09' -- Digits
 
   local grammar_elts = {}
 
   -- Helper functions
   local function pdf_hexstring_unescape(s)
-    local function ue(cc)
-      return string.char(tonumber(cc, 16))
-    end
     if #s % 2 == 0 then
       -- Sane hex string
-      return s:gsub('..', ue)
+      return lua_util.unhex(s)
     end
 
     -- WTF hex string
     -- Append '0' to it and unescape...
-    return s:sub(1, #s - 1):gsub('..' , ue) .. (s:sub(#s) .. '0'):gsub('..' , ue)
+    return lua_util.unhex(s:sub(1, #s - 1)) .. lua_util.unhex((s:sub(#s) .. '0'))
   end
 
   local function pdf_string_unescape(s)
@@ -217,37 +214,37 @@ local function generic_grammar_elts()
   end
 
   local function pdf_id_unescape(s)
-    return (s:gsub('#%d%d', function (cc)
+    return (s:gsub('#%d%d', function(cc)
       return string.char(tonumber(cc:sub(2), 16))
     end))
   end
 
-  local delim = S'()<>[]{}/%'
-  grammar_elts.ws = S'\0 \r\n\t\f'
-  local hex = R'af' + R'AF' + D
+  local delim = S '()<>[]{}/%'
+  grammar_elts.ws = S '\0 \r\n\t\f'
+  local hex = R 'af' + R 'AF' + D
   -- Comments.
-  local eol = P'\r\n' + '\n'
-  local line = (1 - S'\r\n\f')^0 * eol^-1
-  grammar_elts.comment = P'%' * line
+  local eol = P '\r\n' + '\n'
+  local line = (1 - S '\r\n\f') ^ 0 * eol ^ -1
+  grammar_elts.comment = P '%' * line
 
   -- Numbers.
-  local sign = S'+-'^-1
-  local decimal = D^1
-  local float = D^1 * P'.' * D^0 + P'.' * D^1
+  local sign = S '+-' ^ -1
+  local decimal = D ^ 1
+  local float = D ^ 1 * P '.' * D ^ 0 + P '.' * D ^ 1
   grammar_elts.number = C(sign * (float + decimal)) / tonumber
 
   -- String
-  grammar_elts.str = P{ "(" * C(((1 - S"()\\") + (P '\\' * 1) + V(1))^0) / pdf_string_unescape * ")" }
-  grammar_elts.hexstr = P{"<" * C(hex^0) / pdf_hexstring_unescape * ">"}
+  grammar_elts.str = P { "(" * C(((1 - S "()\\") + (P '\\' * 1) + V(1)) ^ 0) / pdf_string_unescape * ")" }
+  grammar_elts.hexstr = P { "<" * C(hex ^ 0) / pdf_hexstring_unescape * ">" }
 
   -- Identifier
-  grammar_elts.id = P{'/' * C((1-(delim + grammar_elts.ws))^1) / pdf_id_unescape}
+  grammar_elts.id = P { '/' * C((1 - (delim + grammar_elts.ws)) ^ 1) / pdf_id_unescape }
 
   -- Booleans (who care about them?)
   grammar_elts.boolean = C(P("true") + P("false"))
 
   -- Stupid references
-  grammar_elts.ref = lpeg.Ct{lpeg.Cc("%REF%") * C(D^1) * " " * C(D^1) * " " * "R"}
+  grammar_elts.ref = lpeg.Ct { lpeg.Cc("%REF%") * C(D ^ 1) * " " * C(D ^ 1) * " " * "R" }
 
   return grammar_elts
 end
@@ -258,16 +255,16 @@ local function gen_outer_grammar()
   local V = lpeg.V
   local gen = generic_grammar_elts()
 
-  return lpeg.P{
+  return lpeg.P {
     "EXPR";
-    EXPR = gen.ws^0 * V("ELT")^0 * gen.ws^0,
+    EXPR = gen.ws ^ 0 * V("ELT") ^ 0 * gen.ws ^ 0,
     ELT = V("ARRAY") + V("DICT") + V("ATOM"),
-    ATOM = gen.ws^0 * (gen.comment + gen.boolean + gen.ref +
-        gen.number + V("STRING") + gen.id) * gen.ws^0,
-    DICT = "<<" * gen.ws^0  * lpeg.Cf(lpeg.Ct("") * V("KV_PAIR")^0, rawset) * gen.ws^0 * ">>",
-    KV_PAIR = lpeg.Cg(gen.id * gen.ws^0 * V("ELT") * gen.ws^0),
-    ARRAY = "[" * gen.ws^0 * lpeg.Ct(V("ELT")^0) * gen.ws^0 * "]",
-    STRING = lpeg.P{gen.str + gen.hexstr},
+    ATOM = gen.ws ^ 0 * (gen.comment + gen.boolean + gen.ref +
+        gen.number + V("STRING") + gen.id) * gen.ws ^ 0,
+    DICT = "<<" * gen.ws ^ 0 * lpeg.Cf(lpeg.Ct("") * V("KV_PAIR") ^ 0, rawset) * gen.ws ^ 0 * ">>",
+    KV_PAIR = lpeg.Cg(gen.id * gen.ws ^ 0 * V("ELT") * gen.ws ^ 0),
+    ARRAY = "[" * gen.ws ^ 0 * lpeg.Ct(V("ELT") ^ 0) * gen.ws ^ 0 * "]",
+    STRING = lpeg.P { gen.str + gen.hexstr },
   }
 end
 
@@ -277,7 +274,7 @@ local function gen_graphics_unary()
   local S = lpeg.S
 
   return P("q") + P("Q") + P("h")
-      + S("WSsFfBb") * P("*")^0 + P("n")
+      + S("WSsFfBb") * P("*") ^ 0 + P("n")
 
 end
 local function gen_graphics_binary()
@@ -320,29 +317,29 @@ local function gen_text_grammar()
   local text_quote_op = P('"')
   local font_op = P("Tf")
 
-  return lpeg.P{
+  return lpeg.P {
     "EXPR";
-    EXPR = gen.ws^0 * lpeg.Ct(V("COMMAND")^0),
+    EXPR = gen.ws ^ 0 * lpeg.Ct(V("COMMAND") ^ 0),
     COMMAND = (V("UNARY") + V("BINARY") + V("TERNARY") + V("NARY") + V("TEXT") +
-        V("FONT") + gen.comment) * gen.ws^0,
+        V("FONT") + gen.comment) * gen.ws ^ 0,
     UNARY = unary_ops,
-    BINARY = V("ARG") / empty * gen.ws^1 * binary_ops,
-    TERNARY = V("ARG") / empty * gen.ws^1 * V("ARG") / empty * gen.ws^1 * ternary_ops,
-    NARY = (gen.number / 0 * gen.ws^1)^1 * (gen.id / empty * gen.ws^0)^-1 * nary_op,
+    BINARY = V("ARG") / empty * gen.ws ^ 1 * binary_ops,
+    TERNARY = V("ARG") / empty * gen.ws ^ 1 * V("ARG") / empty * gen.ws ^ 1 * ternary_ops,
+    NARY = (gen.number / 0 * gen.ws ^ 1) ^ 1 * (gen.id / empty * gen.ws ^ 0) ^ -1 * nary_op,
     ARG = V("ARRAY") + V("DICT") + V("ATOM"),
     ATOM = (gen.comment + gen.boolean + gen.ref +
         gen.number + V("STRING") + gen.id),
-    DICT = "<<" * gen.ws^0  * lpeg.Cf(lpeg.Ct("") * V("KV_PAIR")^0, rawset) * gen.ws^0 * ">>",
-    KV_PAIR = lpeg.Cg(gen.id * gen.ws^0 * V("ARG") * gen.ws^0),
-    ARRAY = "[" * gen.ws^0 * lpeg.Ct(V("ARG")^0) * gen.ws^0 * "]",
-    STRING = lpeg.P{gen.str + gen.hexstr},
-    TEXT = (V("TEXT_ARG") * gen.ws^1 * text_binary_op) +
-        (V("ARG") / 0 * gen.ws^1 * V("ARG") / 0 * gen.ws^1 * V("TEXT_ARG") * gen.ws^1 * text_quote_op),
-    FONT = (V("FONT_ARG") * gen.ws^1 * (gen.number / 0) * gen.ws^1 * font_op),
+    DICT = "<<" * gen.ws ^ 0 * lpeg.Cf(lpeg.Ct("") * V("KV_PAIR") ^ 0, rawset) * gen.ws ^ 0 * ">>",
+    KV_PAIR = lpeg.Cg(gen.id * gen.ws ^ 0 * V("ARG") * gen.ws ^ 0),
+    ARRAY = "[" * gen.ws ^ 0 * lpeg.Ct(V("ARG") ^ 0) * gen.ws ^ 0 * "]",
+    STRING = lpeg.P { gen.str + gen.hexstr },
+    TEXT = (V("TEXT_ARG") * gen.ws ^ 1 * text_binary_op) +
+        (V("ARG") / 0 * gen.ws ^ 1 * V("ARG") / 0 * gen.ws ^ 1 * V("TEXT_ARG") * gen.ws ^ 1 * text_quote_op),
+    FONT = (V("FONT_ARG") * gen.ws ^ 1 * (gen.number / 0) * gen.ws ^ 1 * font_op),
     FONT_ARG = lpeg.Ct(lpeg.Cc("%font%") * gen.id),
     TEXT_ARG = lpeg.Ct(V("STRING")) + V("TEXT_ARRAY"),
     TEXT_ARRAY = "[" *
-        lpeg.Ct(((gen.ws^0 * (gen.ws^0 * (gen.number / 0)^0 * gen.ws^0 * (gen.str + gen.hexstr)))^1)) * gen.ws^0 * "]",
+        lpeg.Ct(((gen.ws ^ 0 * (gen.ws ^ 0 * (gen.number / 0) ^ 0 * gen.ws ^ 0 * (gen.str + gen.hexstr))) ^ 1)) * gen.ws ^ 0 * "]",
   }
 end
 
@@ -396,7 +393,7 @@ local function maybe_apply_filter(dict, data, pdf, task)
   if dict.Filter then
     local filt = dict.Filter
     if type(filt) == 'string' then
-      filt = {filt}
+      filt = { filt }
     end
 
     if dict.DecodeParms then
@@ -404,19 +401,21 @@ local function maybe_apply_filter(dict, data, pdf, task)
 
       if type(decode_params) == 'table' then
         if decode_params.Predictor then
-          return nil,'predictor exists'
+          return nil, 'predictor exists'
         end
       end
     end
 
-    for _,f in ipairs(filt) do
+    for _, f in ipairs(filt) do
       uncompressed = apply_pdf_filter(uncompressed, f)
 
-      if not uncompressed then break end
+      if not uncompressed then
+        break
+      end
     end
   end
 
-  return uncompressed,nil
+  return uncompressed, nil
 end
 
 -- Conditionally extract stream data from object and attach it as obj.uncompressed
@@ -429,22 +428,26 @@ local function maybe_extract_object_stream(obj, pdf, task)
   if dict.Length and type(obj.stream) == 'table' then
     local len = math.min(obj.stream.len,
         tonumber(maybe_dereference_object(dict.Length, pdf, task)) or 0)
-    local real_stream = obj.stream.data:span(1, len)
+    if len > 0 then
+      local real_stream = obj.stream.data:span(1, len)
 
-    local uncompressed,filter_err = maybe_apply_filter(dict, real_stream, pdf, task)
+      local uncompressed, filter_err = maybe_apply_filter(dict, real_stream, pdf, task)
 
-    if uncompressed then
-      obj.uncompressed = uncompressed
-      lua_util.debugm(N, task, 'extracted object %s:%s: (%s -> %s)',
-          obj.major, obj.minor, len, uncompressed:len())
-      return obj.uncompressed
+      if uncompressed then
+        obj.uncompressed = uncompressed
+        lua_util.debugm(N, task, 'extracted object %s:%s: (%s -> %s)',
+            obj.major, obj.minor, len, uncompressed:len())
+        return obj.uncompressed
+      else
+        lua_util.debugm(N, task, 'cannot extract object %s:%s; len = %s; filter = %s: %s',
+            obj.major, obj.minor, len, dict.Filter, filter_err)
+      end
     else
-      lua_util.debugm(N, task, 'cannot extract object %s:%s; len = %s; filter = %s: %s',
-          obj.major, obj.minor, len, dict.Filter, filter_err)
+      lua_util.debugm(N, task, 'cannot extract object %s:%s; len = %s',
+          obj.major, obj.minor, len)
     end
   end
 end
-
 
 local function parse_object_grammar(obj, task, pdf)
   -- Parse grammar
@@ -456,7 +459,7 @@ local function parse_object_grammar(obj, task, pdf)
   end
 
   if obj_dict_span:len() < config.max_processing_size then
-    local ret,obj_or_err = pcall(pdf_outer_grammar.match, pdf_outer_grammar, obj_dict_span)
+    local ret, obj_or_err = pcall(pdf_outer_grammar.match, pdf_outer_grammar, obj_dict_span)
 
     if ret then
       if obj.stream then
@@ -519,7 +522,7 @@ end
 local process_dict
 
 -- This function processes javascript string and returns JS hash and JS rspamd_text
-local function process_javascript(task, pdf, js)
+local function process_javascript(task, pdf, js, obj)
   local rspamd_cryptobox_hash = require "rspamd_cryptobox_hash"
   if type(js) == 'string' then
     js = rspamd_text.fromstring(js):oneline()
@@ -545,6 +548,7 @@ local function process_javascript(task, pdf, js)
     data = js,
     hash = hash:hex(),
     bin_hash = bin_hash,
+    object = obj,
   }
   pdf.scripts[bin_hash] = njs
   return njs
@@ -560,20 +564,20 @@ local function process_action(task, pdf, obj)
         local extracted_js = maybe_extract_object_stream(js, pdf, task)
 
         if not extracted_js then
-          lua_util.debugm(N, task, 'invalid type for javascript from %s:%s: %s',
+          lua_util.debugm(N, task, 'invalid type for JavaScript from %s:%s: %s',
               obj.major, obj.minor, js)
         else
           js = extracted_js
         end
       end
 
-      js = process_javascript(task, pdf, js)
+      js = process_javascript(task, pdf, js, obj)
       if js then
         obj.js = js
         lua_util.debugm(N, task, 'extracted javascript from %s:%s: %s',
             obj.major, obj.minor, obj.js.data)
       else
-        lua_util.debugm(N, task, 'invalid type for javascript from %s:%s: %s',
+        lua_util.debugm(N, task, 'invalid type for JavaScript from %s:%s: %s',
             obj.major, obj.minor, js)
       end
     elseif obj.dict.F then
@@ -614,6 +618,7 @@ local function process_catalog(task, pdf, obj)
           lua_util.debugm(N, task, 'found openaction JS in %s:%s: %s',
               obj.major, obj.minor, action.js)
           pdf.openaction = action.js
+          action.js.object = obj
         elseif action.launch then
           lua_util.debugm(N, task, 'found openaction launch in %s:%s: %s',
               obj.major, obj.minor, action.launch)
@@ -655,7 +660,7 @@ process_dict = function(task, pdf, obj, dict)
 
       if obj.dict.S and obj.dict.JS then
         obj.type = 'Javascript'
-        lua_util.debugm(N, task, 'implicit type for Javascript object %s:%s',
+        lua_util.debugm(N, task, 'implicit type for JavaScript object %s:%s',
             obj.major, obj.minor)
       else
         lua_util.debugm(N, task, 'no type for %s:%s',
@@ -670,11 +675,11 @@ process_dict = function(task, pdf, obj, dict)
     if contents and type(contents) == 'table' then
       if contents[1] == '%REF%' then
         -- Single reference
-        contents = {contents}
+        contents = { contents }
       end
       obj.contents = {}
 
-      for _,c in ipairs(contents) do
+      for _, c in ipairs(contents) do
         local cobj = maybe_dereference_object(c, pdf, task)
         if cobj and type(cobj) == 'table' then
           obj.contents[#obj.contents + 1] = cobj
@@ -720,25 +725,25 @@ process_dict = function(task, pdf, obj, dict)
 
 
 
---[[Disabled fonts extraction
-     local fonts = obj.resources.Font
-     if fonts and type(fonts) == 'table' then
-      obj.fonts = {}
-      for k,v in pairs(fonts) do
-        obj.fonts[k] = maybe_dereference_object(v, pdf, task)
+    --[[Disabled fonts extraction
+         local fonts = obj.resources.Font
+         if fonts and type(fonts) == 'table' then
+          obj.fonts = {}
+          for k,v in pairs(fonts) do
+            obj.fonts[k] = maybe_dereference_object(v, pdf, task)
 
-        if obj.fonts[k] then
-          local font = obj.fonts[k]
+            if obj.fonts[k] then
+              local font = obj.fonts[k]
 
-          if config.text_extraction then
-            process_font(task, pdf, font, k)
-            lua_util.debugm(N, task, 'found font "%s" for object %s:%s -> %s',
-                k, obj.major, obj.minor, font)
+              if config.text_extraction then
+                process_font(task, pdf, font, k)
+                lua_util.debugm(N, task, 'found font "%s" for object %s:%s -> %s',
+                    k, obj.major, obj.minor, font)
+              end
+            end
           end
         end
-      end
-    end
-]]
+    ]]
 
     lua_util.debugm(N, task, 'found resources for object %s:%s (%s): %s',
         obj.major, obj.minor, obj.type, obj.resources)
@@ -758,20 +763,20 @@ process_dict = function(task, pdf, obj, dict)
           local extracted_js = maybe_extract_object_stream(js, pdf, task)
 
           if not extracted_js then
-            lua_util.debugm(N, task, 'invalid type for javascript from %s:%s: %s',
+            lua_util.debugm(N, task, 'invalid type for JavaScript from %s:%s: %s',
                 obj.major, obj.minor, js)
           else
             js = extracted_js
           end
         end
 
-        js = process_javascript(task, pdf, js)
+        js = process_javascript(task, pdf, js, obj)
         if js then
           obj.js = js
           lua_util.debugm(N, task, 'extracted javascript from %s:%s: %s',
               obj.major, obj.minor, obj.js.data)
         else
-          lua_util.debugm(N, task, 'invalid type for javascript from %s:%s: %s',
+          lua_util.debugm(N, task, 'invalid type for JavaScript from %s:%s: %s',
               obj.major, obj.minor, js)
         end
       end
@@ -784,8 +789,8 @@ local compound_obj_grammar
 local function compound_obj_grammar_gen()
   if not compound_obj_grammar then
     local gen = generic_grammar_elts()
-    compound_obj_grammar = gen.ws^0 * (gen.comment * gen.ws^1)^0 *
-        lpeg.Ct(lpeg.Ct(gen.number * gen.ws^1 * gen.number * gen.ws^0)^1)
+    compound_obj_grammar = gen.ws ^ 0 * (gen.comment * gen.ws ^ 1) ^ 0 *
+        lpeg.Ct(lpeg.Ct(gen.number * gen.ws ^ 1 * gen.number * gen.ws ^ 0) ^ 1)
   end
 
   return compound_obj_grammar
@@ -799,8 +804,8 @@ local function pdf_compound_object_unpack(_, uncompressed, pdf, task, first)
     lua_util.debugm(N, task, 'compound elts (chunk length %s): %s',
         #uncompressed, elts)
 
-    for i,pair in ipairs(elts) do
-      local obj_number,offset = pair[1], pair[2]
+    for i, pair in ipairs(elts) do
+      local obj_number, offset = pair[1], pair[2]
 
       offset = offset + first
       if offset < #uncompressed then
@@ -811,7 +816,7 @@ local function pdf_compound_object_unpack(_, uncompressed, pdf, task, first)
           span_len = (elts[i + 1][2] + first) - offset
         end
 
-        if span_len > 0 and offset + span_len < #uncompressed then
+        if span_len > 0 and offset + span_len <= #uncompressed then
           local obj = {
             major = obj_number,
             minor = 0, -- Implicit
@@ -823,6 +828,9 @@ local function pdf_compound_object_unpack(_, uncompressed, pdf, task, first)
           if obj.dict then
             pdf.objects[#pdf.objects + 1] = obj
           end
+        else
+          lua_util.debugm(N, task, 'invalid span_len for compound object %s:%s; offset = %s, len = %s',
+              pair[1], pair[2], offset + span_len, #uncompressed)
         end
       end
     end
@@ -831,7 +839,7 @@ end
 
 -- PDF 1.5 ObjStmt
 local function extract_pdf_compound_objects(task, pdf)
-  for i,obj in ipairs(pdf.objects or {}) do
+  for i, obj in ipairs(pdf.objects or {}) do
     if i > 0 and i % 100 == 0 then
       local now = rspamd_util.get_ticks()
 
@@ -892,7 +900,9 @@ local function extract_outer_objects(task, input, pdf)
 
       -- Also get the starting span and try to match it versus obj re to get numbers
       local obj_line_potential = first - 32
-      if obj_line_potential < 1 then obj_line_potential = 1 end
+      if obj_line_potential < 1 then
+        obj_line_potential = 1
+      end
       local prev_obj_end = pdf.end_objects[end_pos - 1]
       if end_pos > 1 and prev_obj_end >= obj_line_potential and prev_obj_end < first then
         obj_line_potential = prev_obj_end + 1
@@ -939,7 +949,7 @@ local function attach_pdf_streams(task, input, pdf)
     max_start_pos = math.min(config.max_pdf_objects, #pdf.start_streams)
     max_end_pos = math.min(config.max_pdf_objects, #pdf.end_streams)
 
-    for _,obj in ipairs(pdf.objects) do
+    for _, obj in ipairs(pdf.objects) do
       while start_pos <= max_start_pos and end_pos <= max_end_pos do
         local first = pdf.start_streams[start_pos]
         local last = pdf.end_streams[end_pos]
@@ -954,8 +964,10 @@ local function attach_pdf_streams(task, input, pdf)
           end
           -- Strip the first \n
           while first < last do
-            local chr = input:at(first)
-            if chr ~= 13 and chr ~= 10 then break end
+            local chr = input:byte(first)
+            if chr ~= 13 and chr ~= 10 then
+              break
+            end
             first = first + 1
           end
           local len = last - first
@@ -998,7 +1010,7 @@ local function postprocess_pdf_objects(task, input, pdf)
   -- Now we have objects and we need to attach streams that are in bounds
   attach_pdf_streams(task, input, pdf)
   -- Parse grammar for outer objects
-  for i,obj in ipairs(pdf.objects) do
+  for i, obj in ipairs(pdf.objects) do
     if i > 0 and i % 100 == 0 then
       local now = rspamd_util.get_ticks()
 
@@ -1029,7 +1041,7 @@ local function postprocess_pdf_objects(task, input, pdf)
   end
 
   -- Now we might probably have all objects being processed
-  for i,obj in ipairs(pdf.objects) do
+  for i, obj in ipairs(pdf.objects) do
     if obj.dict then
       -- Types processing
       if i > 0 and i % 100 == 0 then
@@ -1074,10 +1086,10 @@ local function offsets_to_blocks(starts, ends, out)
 end
 
 local function search_text(task, pdf)
-  for _,obj in ipairs(pdf.objects) do
+  for _, obj in ipairs(pdf.objects) do
     if obj.type == 'Page' and obj.contents then
       local text = {}
-      for _,tobj in ipairs(obj.contents) do
+      for _, tobj in ipairs(obj.contents) do
         maybe_extract_object_stream(tobj, pdf, task)
         local matches = pdf_text_trie:match(tobj.uncompressed or '')
         if matches then
@@ -1085,20 +1097,20 @@ local function search_text(task, pdf)
           local starts = {}
           local ends = {}
 
-          for npat,matched_positions in pairs(matches) do
+          for npat, matched_positions in pairs(matches) do
             if npat == 1 then
-              for _,pos in ipairs(matched_positions) do
+              for _, pos in ipairs(matched_positions) do
                 starts[#starts + 1] = pos
               end
             else
-              for _,pos in ipairs(matched_positions) do
+              for _, pos in ipairs(matched_positions) do
                 ends[#ends + 1] = pos
               end
             end
           end
 
           offsets_to_blocks(starts, ends, text_blocks)
-          for _,bl in ipairs(text_blocks) do
+          for _, bl in ipairs(text_blocks) do
             if bl.len > 2 then
               -- To remove \s+ET\b pattern (it can leave trailing space or not but it doesn't matter)
               bl.len = bl.len - 2
@@ -1109,7 +1121,7 @@ local function search_text(task, pdf)
             --    tobj.major, tobj.minor, bl.data)
 
             if bl.len < config.max_processing_size then
-              local ret,obj_or_err = pcall(pdf_text_grammar.match, pdf_text_grammar,
+              local ret, obj_or_err = pcall(pdf_text_grammar.match, pdf_text_grammar,
                   bl.data)
 
               if ret then
@@ -1145,13 +1157,13 @@ local function search_urls(task, pdf, mpart)
       return
     end
 
-    for k,v in pairs(dict) do
+    for k, v in pairs(dict) do
       if type(v) == 'table' then
         recursive_object_traverse(obj, v, rec + 1)
       elseif k == 'URI' then
         v = maybe_dereference_object(v, pdf, task)
         if type(v) == 'string' then
-          local url =  rspamd_url.create(task:get_mempool(), v, {'content'})
+          local url = rspamd_url.create(task:get_mempool(), v, { 'content' })
 
           if url then
             lua_util.debugm(N, task, 'found url %s in object %s:%s',
@@ -1163,7 +1175,7 @@ local function search_urls(task, pdf, mpart)
     end
   end
 
-  for _,obj in ipairs(pdf.objects) do
+  for _, obj in ipairs(pdf.objects) do
     if obj.dict and type(obj.dict) == 'table' then
       recursive_object_traverse(obj, obj.dict, 0)
     end
@@ -1191,10 +1203,10 @@ local function process_pdf(input, mpart, task)
     -- Output object that excludes all internal stuff
     local pdf_output = lua_util.shallowcopy(pdf_object)
     local grouped_processors = {}
-    for npat,matched_positions in pairs(matches) do
+    for npat, matched_positions in pairs(matches) do
       local index = pdf_indexes[npat]
 
-      local proc_key,loc_npat = index[1], index[4]
+      local proc_key, loc_npat = index[1], index[4]
 
       if not grouped_processors[proc_key] then
         grouped_processors[proc_key] = {
@@ -1204,16 +1216,18 @@ local function process_pdf(input, mpart, task)
       end
       local proc = grouped_processors[proc_key]
       -- Fill offsets
-      for _,pos in ipairs(matched_positions) do
-        proc.offsets[#proc.offsets + 1] = {pos, loc_npat}
+      for _, pos in ipairs(matched_positions) do
+        proc.offsets[#proc.offsets + 1] = { pos, loc_npat }
       end
     end
 
-    for name,processor in pairs(grouped_processors) do
+    for name, processor in pairs(grouped_processors) do
       -- Sort by offset
       lua_util.debugm(N, task, "pdf: process group %s with %s matches",
           name, #processor.offsets)
-      table.sort(processor.offsets, function(e1, e2) return e1[1] < e2[1] end)
+      table.sort(processor.offsets, function(e1, e2)
+        return e1[1] < e2[1]
+      end)
       processor.processor_func(input, task, processor.offsets, pdf_object, pdf_output)
     end
 
@@ -1240,23 +1254,27 @@ local function process_pdf(input, mpart, task)
           -- OpenAction only
           if pdf_object.openaction and pdf_object.openaction.bin_hash then
             if config.min_js_fuzzy and #pdf_object.openaction.data >= config.min_js_fuzzy then
-              lua_util.debugm(N, task, "pdf: add fuzzy hash from openaction: %s",
-                  pdf_object.openaction.hash)
+              lua_util.debugm(N, task, "pdf: add fuzzy hash from openaction: %s; size = %s; object: %s:%s",
+                  pdf_object.openaction.hash,
+                  #pdf_object.openaction.data,
+                  pdf_object.openaction.object.major, pdf_object.openaction.object.minor)
               table.insert(pdf_output.fuzzy_hashes, pdf_object.openaction.bin_hash)
             else
-              lua_util.debugm(N, task, "pdf: skip fuzzy hash from Javascript: %s, too short: %s",
+              lua_util.debugm(N, task, "pdf: skip fuzzy hash from JavaScript: %s, too short: %s",
                   pdf_object.openaction.hash, #pdf_object.openaction.data)
             end
           end
         else
           -- All hashes
-          for h,sc in pairs(pdf_object.scripts) do
+          for h, sc in pairs(pdf_object.scripts) do
             if config.min_js_fuzzy and #sc.data >= config.min_js_fuzzy then
-              lua_util.debugm(N, task, "pdf: add fuzzy hash from Javascript: %s",
-                  sc.hash)
+              lua_util.debugm(N, task, "pdf: add fuzzy hash from JavaScript: %s; size = %s; object: %s:%s",
+                  sc.hash,
+                  #sc.data,
+                  sc.object.major, sc.object.minor)
               table.insert(pdf_output.fuzzy_hashes, h)
             else
-              lua_util.debugm(N, task, "pdf: skip fuzzy hash from Javascript: %s, too short: %s",
+              lua_util.debugm(N, task, "pdf: skip fuzzy hash from JavaScript: %s, too short: %s",
                   sc.hash, #sc.data)
             end
           end
@@ -1317,22 +1335,39 @@ processors.suspicious = function(input, task, positions, pdf_object, pdf_output)
   local nencoded = 0
   local close_encoded = 0
   local last_encoded
-  for _,match in ipairs(positions) do
+  for _, match in ipairs(positions) do
     if match[2] == 1 then
       -- netsh
       suspicious_factor = suspicious_factor + 0.5
     elseif match[2] == 2 then
       nexec = nexec + 1
-    else
-      nencoded = nencoded + 1
+    elseif match[2] == 3 then
+      local enc_data = input:sub(match[1] - 2, match[1] - 1)
+      local legal_escape = false
 
-      if last_encoded then
-        if match[1] - last_encoded < 8 then
-          -- likely consecutive encoded chars, increase factor
-          close_encoded = close_encoded + 1
+      if enc_data then
+        enc_data = enc_data:strtoul()
+
+        if enc_data then
+          -- Legit encode cases are non printable characters (e.g. spaces)
+          if enc_data < 0x21 or enc_data >= 0x7f then
+            legal_escape = true
+          end
         end
       end
-      last_encoded = match[1]
+
+      if not legal_escape then
+        nencoded = nencoded + 1
+
+        if last_encoded then
+          if match[1] - last_encoded < 8 then
+            -- likely consecutive encoded chars, increase factor
+            close_encoded = close_encoded + 1
+          end
+        end
+        last_encoded = match[1]
+
+      end
     end
   end
 
@@ -1363,7 +1398,7 @@ local function generic_table_inserter(positions, pdf_object, output_key)
     pdf_object[output_key] = {}
   end
   local shift = #pdf_object[output_key]
-  for i,pos in ipairs(positions) do
+  for i, pos in ipairs(positions) do
     pdf_object[output_key][i + shift] = pos[1]
   end
 end

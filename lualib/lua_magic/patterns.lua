@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,13 +27,13 @@ local patterns = {
     matches = {
       {
         string = [[%PDF-[12]\.\d]],
-        position = {'<=', 1024},
+        position = { '<=', 1024 },
         weight = 60,
         heuristic = heuristics.pdf_format_heuristic
       },
       {
         string = [[%FDF-[12]\.\d]],
-        position = {'<=', 1024},
+        position = { '<=', 1024 },
         weight = 60,
         heuristic = heuristics.pdf_format_heuristic
       },
@@ -103,8 +103,9 @@ local patterns = {
       -- PE part
       {
         string = [[PE\x{00}\x{00}]],
-        position = {'>=', 0x3c + 4},
+        position = { '>=', 0x3c + 4 },
         weight = 15,
+        heuristic = heuristics.pe_part_heuristic,
       }
     }
   },
@@ -130,7 +131,7 @@ local patterns = {
     matches = {
       {
         string = [[(?i)@\s*ECHO\s+OFF]],
-        position = {'>=', 0},
+        position = { '>=', 0 },
         weight = 60,
       },
     }
@@ -145,6 +146,24 @@ local patterns = {
         relative_position = 0,
         weight = 60,
       },
+    }
+  },
+  ics = {
+    matches = {
+      {
+        string = [[BEGIN:VCALENDAR]],
+        weight = 60,
+        relative_position = 0,
+      }
+    }
+  },
+  vcf = {
+    matches = {
+      {
+        string = [[BEGIN:VCARD]],
+        weight = 60,
+        relative_position = 0,
+      }
     }
   },
   -- Archives
@@ -170,7 +189,7 @@ local patterns = {
     matches = {
       {
         hex = [[4d53434600000000]], -- Can be anywhere for SFX :(
-        position = {'>=', 8},
+        position = { '>=', 8 },
         weight = 60,
       },
     }
@@ -249,7 +268,7 @@ local patterns = {
     matches = {
       {
         string = [[\x{01}CD001\x{01}]],
-        position = {'>=', 0x8000 + 7}, -- first 32k is unused
+        position = { '>=', 0x8000 + 7 }, -- first 32k is unused
         weight = 60,
       },
     }

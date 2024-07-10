@@ -1,5 +1,5 @@
 --[[
-Copyright (c) 2019, Vsevolod Stakhov <vsevolod@highsecure.ru>
+Copyright (c) 2022, Vsevolod Stakhov <vsevolod@rspamd.com>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,15 +26,21 @@ local lua_util = require "lua_util"
 
 local content_modules = {
   ical = {
-    mime_type = "text/calendar",
+    mime_type = { "text/calendar", "application/calendar" },
     module = require "lua_content/ical",
-    extensions = {'ical'},
+    extensions = { 'ics' },
+    output = "text"
+  },
+  vcf = {
+    mime_type = { "text/vcard", "application/vcard" },
+    module = require "lua_content/vcard",
+    extensions = { 'vcf' },
     output = "text"
   },
   pdf = {
     mime_type = "application/pdf",
     module = require "lua_content/pdf",
-    extensions = {'pdf'},
+    extensions = { 'pdf' },
     output = "table"
   },
 }
@@ -45,13 +51,20 @@ local modules_by_extension
 local function init()
   modules_by_mime_type = {}
   modules_by_extension = {}
-  for k,v in pairs(content_modules) do
+  for k, v in pairs(content_modules) do
     if v.mime_type then
-      modules_by_mime_type[v.mime_type] = {k, v}
+      if type(v.mime_type) == 'table' then
+        for _, mt in ipairs(v.mime_type) do
+          modules_by_mime_type[mt] = { k, v }
+        end
+      else
+        modules_by_mime_type[v.mime_type] = { k, v }
+      end
+
     end
     if v.extensions then
-      for _,ext in ipairs(v.extensions) do
-        modules_by_extension[ext] = {k, v}
+      for _, ext in ipairs(v.extensions) do
+        modules_by_extension[ext] = { k, v }
       end
     end
   end
@@ -92,6 +105,5 @@ exports.maybe_process_mime_part = function(part, task)
   end
 
 end
-
 
 return exports
